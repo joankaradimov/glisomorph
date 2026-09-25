@@ -1,0 +1,68 @@
+"""Diablo 1 sprites as turntable views: one image per facing direction, each with its yaw."""
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from blizzard_common.mpq import MpqArchive
+from diablo1.palette import load_pal
+from diablo1.sprites import Frame, load_cl2
+
+
+@dataclass
+class View:
+    yaw: float                   # degrees, clockwise seen from above; 0 faces the camera (south)
+    indices: np.ndarray          # (H, W) int16 palette indices, -1 where transparent
+    pivot: tuple[float, float]   # pixel position (x right, y down) of the rotation axis at the anchor
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.indices.shape
+
+
+@dataclass
+class Preset:
+    path: str          # MPQ path; "{}" is replaced by 1..16 for missiles split over files
+    width: int
+    layout: str        # "sheet": 8 groups; "files": 16 files; "frames": 16 frames of one list
+    frame: int = 0     # which animation frame to use
+    shadows: bool = False  # index-0 pixels are baked shadows, not part of the model
+    pivot: tuple[float, float] | None = None  # None: (width / 2, height - 16), a character's ground point
+
+
+PRESETS = {
+    "arrow": Preset("missiles/arrows.cl2", 96, "frames", pivot=(46.5, 36.0)),
+    "farrow": Preset("missiles/farrow{}.cl2", 96, "files", pivot=(46.5, 36.0)),
+    "larrow": Preset("missiles/larrow{}.cl2", 96, "files", pivot=(46.5, 36.0)),
+    "fireba": Preset("missiles/fireba{}.cl2", 96, "files", pivot=(46.5, 36.0)),
+    "holy": Preset("missiles/holy{}.cl2", 96, "files", pivot=(46.5, 36.0)),
+    "warrior": Preset("plrgfx/warrior/wls/wlsas.cl2", 96, "sheet", shadows=True),
+    "rogue": Preset("plrgfx/rogue/rls/rlsas.cl2", 96, "sheet", shadows=True),
+    "zombie": Preset("monsters/zombie/zombien.cl2", 128, "sheet", shadows=True),
+    "skeleton": Preset("monsters/skelaxe/sklaxn.cl2", 128, "sheet", shadows=True),
+}
+
+
+def _frame_to_array(frame: Frame) -> np.ndarray:
+    return np.array([-1 if p is None else p for p in frame.pixels], dtype=np.int16).reshape(
+        frame.height, frame.width)
+
+
+def load_views(mpq_path: str, preset: Preset) -> tuple[list[View], np.ndarray]:
+    """The views, in increasing yaw, and the palette (256, 3) as floats in [0, 1]."""
+    with MpqArchive(mpq_path) as mpq:
+        palette = np.array(load_pal(mpq.read("levels/towndata/town.pal")), dtype=np.float32) / 255
+        if preset.layout == "sheet":
+            groups = load_cl2(mpq.read(preset.path), preset.width)
+            frames = [g[preset.frame] for g in groups]
+        elif preset.layout == "files":
+            frames = [load_cl2(mpq.read(preset.path.format(k)), preset.width)[0][preset.frame]
+                      for k in range(1, 17)]
+        else:
+            frames = load_cl2(mpq.read(preset.path), preset.width)[0]
+    step = 360 / len(frames)
+    views = []
+    for i, frame in enumerate(frames):
+        pivot = preset.pivot or (frame.width / 2, frame.height - 16)
+        views.append(View(yaw=i * step, indices=_frame_to_array(frame), pivot=pivot))
+    return views, palette
