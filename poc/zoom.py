@@ -26,8 +26,9 @@ def main():
     tiles = []
     for i in args.views:
         images = [data["gt%d" % i], data["pred%d" % i]]
-        if "rep%d" % i in data:
-            images.append(data["rep%d" % i])
+        for key in ("rep%d" % i, "relit%d" % i):
+            if key in data:
+                images.append(data[key])
         solid = np.any([img >= 0 for img in images], axis=0)
         ys, xs = np.nonzero(solid)
         y0, y1, x0, x1 = max(ys.min() - 3, 0), ys.max() + 4, max(xs.min() - 3, 0), xs.max() + 4

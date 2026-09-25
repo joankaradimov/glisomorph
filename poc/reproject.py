@@ -10,13 +10,15 @@ import torch
 
 
 def reproject(points, valid, target_yaw, sources, tolerance: float = 2.0):
-    """Palette indices (H, W), -1 where transparent or where no source sees the point.
+    """Palette indices (H, W), -1 where transparent or where no source sees the point, and the
+    "view" of the source each index came from (H, W), -1 where none.
 
     points: (H, W, 3) surface points of the new view; valid: (H, W) bool.
-    sources: list of dicts with keys yaw, indices (h, w) long tensor (-1 = not model),
+    sources: list of dicts with keys view, yaw, indices (h, w) long tensor (-1 = not model),
     depth (h, w), right, up, forward, pivot, offset.
     """
     out = torch.full(valid.shape, -1, dtype=torch.long, device=points.device)
+    origin = torch.full(valid.shape, -1, dtype=torch.long, device=points.device)
     todo = valid.clone()
 
     def angle(s):
@@ -37,5 +39,6 @@ def reproject(points, valid, target_yaw, sources, tolerance: float = 2.0):
         where = todo.nonzero(as_tuple=True)
         picked = (where[0][seen], where[1][seen])
         out[picked] = index[seen]
+        origin[picked] = s["view"]
         todo[picked] = False
-    return out
+    return out, origin

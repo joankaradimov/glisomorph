@@ -23,7 +23,7 @@ import torch
 from PIL import Image
 
 from diablo1.palette import RAMPS, ramp_of
-from poc.field import VoxelField, allowed_masks, camera_basis, carve, silhouettes
+from poc.field import LitVoxelField, VoxelField, allowed_masks, camera_basis, carve, silhouettes
 from poc.reproject import reproject
 from poc.views import PRESETS, View, load_views
 
@@ -135,6 +135,12 @@ def main():
     ap.add_argument("--harmonics", type=int, default=0,
                     help="order of a Fourier series in yaw for view-dependent color (0 = none; order 2 "
                          "overfit in tests)")
+    ap.add_argument("--lighting", default="none", choices=["none", "lambert", "phong"],
+                    help="shade albedo with directional lights fixed relative to the camera")
+    ap.add_argument("--lights", type=int, default=1, choices=[1, 2])
+    ap.add_argument("--light-lr", type=float, default=0.01)
+    ap.add_argument("--coupled-normals", action="store_true",
+                    help="let shading gradients reshape the density through the normals")
     ap.add_argument("--frame", type=int, default=None, help="animation frame (default: the preset's)")
     ap.add_argument("--voxel", type=float, default=1.0, help="voxel size in pixels (0.6 suits thin sprites)")
     ap.add_argument("--iters", type=int, default=2000)
@@ -158,7 +164,8 @@ def main():
     palette_u8 = (palette_np * 255).round().astype(np.uint8)
     masks = masks_for(views, preset.shadows, device)
     train, test = split_indices(len(views), args.split)
-    out_dir = Path(args.out) / ("%s-%s-h%d%s" % (args.preset, args.split.replace(":", ""), args.harmonics,
+    color_model = "h%d" % args.harmonics if args.lighting == "none" else "%s%d" % (args.lighting, args.lights)
+    out_dir = Path(args.out) / ("%s-%s-%s%s" % (args.preset, args.split.replace(":", ""), color_model,
                                                 ("-" + args.tag) if args.tag else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -198,7 +205,12 @@ def main():
     right, up, forward = camera_basis(yaws, elev)
 
     # 2. The field, started from the visual hull of the training views.
-    field = VoxelField(box_min, box_max, args.voxel, device, harmonics=args.harmonics)
+    lit = args.lighting != "none"
+    if lit:
+        field = LitVoxelField(box_min, box_max, args.voxel, device, lights=args.lights,
+                              specular=args.lighting == "phong", detach_normals=not args.coupled_normals)
+    else:
+        field = VoxelField(box_min, box_max, args.voxel, device, harmonics=args.harmonics)
     yaw_rad = torch.deg2rad(yaws)
     inside = carve(field, allowed_masks(train_masks), train_views, right[train], up[train], off)
     with torch.no_grad():
@@ -207,7 +219,13 @@ def main():
         field.restrict_to(inside)
     depth = (field.box_max - field.box_min).norm().item()
     samples = int(depth / args.voxel)
-    opt = torch.optim.Adam(field.parameters(), lr=args.lr)
+    if lit:
+        light_ids = {id(p) for p in field.light_parameters()}
+        groups = [{"params": [p for p in field.parameters() if id(p) not in light_ids], "lr": args.lr},
+                  {"params": field.light_parameters(), "lr": args.light_lr}]
+        opt = torch.optim.Adam(groups)
+    else:
+        opt = torch.optim.Adam(field.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=(0.1) ** (1 / args.iters))
     targets = [(palette[torch.as_tensor(views[i].indices, device=device).long().clamp(min=0)], masks[i])
                for i in train]
@@ -215,6 +233,8 @@ def main():
     t0 = time.time()
     for it in range(args.iters):
         opt.zero_grad()
+        if lit:
+            field.begin_step()
         loss = 0.0
         for k, i in enumerate(train):
             h, w = views[i].shape
@@ -238,35 +258,54 @@ def main():
         if it % 500 == 0 or it == args.iters - 1:
             print("iter %5d  loss %.5f  (%.0fs)" % (it, loss.item(), time.time() - t0))
 
-    # 3. Evaluation, with two ways to color a view: the field's own colors (quantized to the palette)
-    #    and colors reprojected from the known directions.
+    # 3. Evaluation. A new view can be colored three ways: the field's own colors (quantized to the
+    #    palette), palette indices reprojected from the known directions, and, with a lighting model,
+    #    those reprojected colors relit from their source direction's lighting to the new one's.
     candidates = torch.tensor(list(range(128, 255)) if preset.shadows else [0] + list(range(128, 255)), device=device)
+    if lit:
+        field.begin_step()
 
     def render_view(h, w, pivot, r, u, f, yaw_deg):
         rgb, alpha = field.render(h, w, pivot, off, r, u, f, samples, jitter=False, yaw_rad=torch.deg2rad(yaw_deg))
         points = field.last_origins + field.last_depth[..., None] * f
-        return quantize(rgb, alpha, palette, candidates), alpha, points
+        return quantize(rgb, alpha, palette, candidates), alpha, points, (field.last_normal if lit else None)
 
-    def colored(pred, alpha, points, yaw_deg, exclude=None):
+    def colored(pred, alpha, points, normal, yaw_deg, basis, exclude=None):
+        """(reprojected, relit) palette indices; relit is None without a lighting model."""
         srcs = [s for s in sources if s["view"] != exclude]
-        rep = reproject(points, alpha >= 0.5, yaw_deg, srcs)
-        return torch.where((alpha >= 0.5) & (rep < 0), pred, rep)  # the field's color where no view sees it
+        solid = alpha >= 0.5
+        rep, origin = reproject(points, solid, yaw_deg, srcs)
+        plain = torch.where(solid & (rep < 0), pred, rep)  # the field's color where no view sees it
+        if not lit:
+            return plain, None
+        rgb = palette[rep.clamp(min=0)]
+        target, _ = field.shading(normal, *basis)
+        for s in srcs:
+            m = origin == s["view"]
+            if m.any():
+                source, _ = field.shading(normal[m], s["right"], s["up"], s["forward"])
+                rgb[m] = rgb[m] * (target[m] / source.clamp(min=1e-3)).clamp(0.5, 2.0)[:, None]
+        relit_view = quantize(rgb, (rep >= 0).float(), palette, candidates)
+        return plain, torch.where(solid & (rep < 0), pred, relit_view)
 
-    results = {"train": [], "test": [], "test_reprojected": [], "baseline": []}
-    predictions, reprojected = {}, {}
+    results = {"train": [], "test": [], "test_reprojected": [], "test_relit": [], "baseline": []}
+    predictions, reprojected, relit = {}, {}, {}
     with torch.no_grad():
         sources = []
         for j in train:
             v = views[j]
-            _, _, _ = render_view(*v.shape, v.pivot, right[j], up[j], forward[j], yaws[j])
+            render_view(*v.shape, v.pivot, right[j], up[j], forward[j], yaws[j])
             idx = torch.as_tensor(v.indices, device=device).long()
             sources.append({"view": j, "yaw": float(yaws[j]), "depth": field.last_depth.clone(),
                             "indices": torch.where(masks[j] == 1, idx, torch.full_like(idx, -1)),
                             "right": right[j], "up": up[j], "forward": forward[j], "pivot": v.pivot, "offset": off})
         for i, v in enumerate(views):
-            pred, alpha, points = render_view(*v.shape, v.pivot, right[i], up[i], forward[i], yaws[i])
+            pred, alpha, points, normal = render_view(*v.shape, v.pivot, right[i], up[i], forward[i], yaws[i])
             predictions[i] = pred
-            reprojected[i] = colored(pred, alpha, points, float(yaws[i]), exclude=i)
+            reprojected[i], relit_i = colored(pred, alpha, points, normal, float(yaws[i]),
+                                              (right[i], up[i], forward[i]), exclude=i)
+            if relit_i is not None:
+                relit[i] = relit_i
             gt = torch.as_tensor(v.indices, device=device).long()
             gt = torch.where(masks[i] == 1, gt, torch.full_like(gt, -1))  # without baked shadows
             if i in train:
@@ -274,6 +313,8 @@ def main():
             if i in test and args.split != "all":
                 results["test"].append(score(pred, gt, palette))
                 results["test_reprojected"].append(score(reprojected[i], gt, palette))
+                if relit_i is not None:
+                    results["test_relit"].append(score(relit_i, gt, palette))
                 # Baseline: reuse the nearest training direction as-is.
                 nearest = min(train, key=lambda j: min(abs(views[j].yaw - v.yaw), 360 - abs(views[j].yaw - v.yaw)))
                 base = torch.as_tensor(views[nearest].indices, device=device).long()
@@ -284,17 +325,29 @@ def main():
         "preset": args.preset, "split": args.split, "frame": preset.frame, "views": len(views),
         "train_views": train, "test_views": test if args.split != "all" else [],
         "elevation_deg": elev_deg, "pivot_offset": off, "calibration_coverage": coverage,
-        "voxel": args.voxel, "iters": args.iters,
+        "voxel": args.voxel, "iters": args.iters, "lighting": args.lighting,
         "train": mean_scores(results["train"]), "test": mean_scores(results["test"]),
         "test_reprojected": mean_scores(results["test_reprojected"]),
+        "test_relit": mean_scores(results["test_relit"]),
         "baseline_nearest_view": mean_scores(results["baseline"]),
     }
+    if lit:
+        with torch.no_grad():
+            summary["lights"] = {
+                "directions_camera_space": torch.nn.functional.normalize(field.light_dirs, dim=-1).tolist(),
+                "power": torch.nn.functional.softplus(field.light_raw).tolist(),
+                "ambient": torch.nn.functional.softplus(field.ambient_raw).item(),
+                "shininess": torch.exp(field.shininess_raw).item(),
+            }
+        print("lights (camera space: x right, y up, z toward the camera):", json.dumps(summary["lights"]))
     (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
     np.savez_compressed(out_dir / "views.npz",
                         **{"gt%d" % i: v.indices for i, v in enumerate(views)},
                         **{"pred%d" % i: p.cpu().numpy().astype(np.int16) for i, p in predictions.items()},
-                        **{"rep%d" % i: p.cpu().numpy().astype(np.int16) for i, p in reprojected.items()})
-    print(json.dumps({k: summary[k] for k in ("train", "test", "test_reprojected", "baseline_nearest_view")}, indent=2))
+                        **{"rep%d" % i: p.cpu().numpy().astype(np.int16) for i, p in reprojected.items()},
+                        **{"relit%d" % i: p.cpu().numpy().astype(np.int16) for i, p in relit.items()})
+    print(json.dumps({k: summary[k] for k in ("train", "test", "test_reprojected", "test_relit",
+                                               "baseline_nearest_view")}, indent=2))
 
     # 4. Pictures. compare.png: ground truth, field colors, reprojected colors, for every view (the
     #    reprojection of a view never uses that view itself).
@@ -304,12 +357,19 @@ def main():
         gt_img = to_rgb(v.indices, palette_u8)
         marker = np.zeros((4, gt_img.shape[1], 3), dtype=np.uint8)
         marker[:] = (0, 160, 0) if i in train else (200, 40, 40)
-        tiles.append(np.concatenate([marker, gt_img, to_rgb(predictions[i].cpu().numpy(), palette_u8),
-                                     to_rgb(reprojected[i].cpu().numpy(), palette_u8)], 0))
+        rows = [marker, gt_img, to_rgb(predictions[i].cpu().numpy(), palette_u8),
+                to_rgb(reprojected[i].cpu().numpy(), palette_u8)]
+        if i in relit:
+            rows.append(to_rgb(relit[i].cpu().numpy(), palette_u8))
+        tiles.append(np.concatenate(rows, 0))
     Image.fromarray(upscale(np.concatenate(tiles, 1), scale)).save(out_dir / "compare.png")
 
-    # turntable.gif: 32 directions, reprojected. in_between.png: the originals with a synthesized
-    # direction between each pair, as the game would use them.
+    def best_colors(pred, alpha, points, normal, yaw_deg, basis):
+        plain, relit_view = colored(pred, alpha, points, normal, yaw_deg, basis)
+        return relit_view if relit_view is not None else plain
+
+    # turntable.gif: 32 directions. in_between.png: the originals with a synthesized direction
+    # between each pair, as the game would use them. Both use relit colors when there's a lighting model.
     pal = palette_u8.copy()
     pal[255] = (64, 64, 64)  # sprites never use 255; it stands for transparent here
     frames = []
@@ -317,8 +377,8 @@ def main():
         yaw32 = sign * torch.arange(32, device=device, dtype=torch.float32) * 11.25
         r32, u32, f32 = camera_basis(yaw32, elev)
         for k in range(32):
-            pred, alpha, points = render_view(*views[0].shape, views[0].pivot, r32[k], u32[k], f32[k], yaw32[k])
-            idx = colored(pred, alpha, points, float(yaw32[k])).cpu().numpy()
+            pred, alpha, points, normal = render_view(*views[0].shape, views[0].pivot, r32[k], u32[k], f32[k], yaw32[k])
+            idx = best_colors(pred, alpha, points, normal, float(yaw32[k]), (r32[k], u32[k], f32[k])).cpu().numpy()
             pixels = upscale(np.where(idx < 0, 255, idx).astype(np.uint8), scale)
             img = Image.frombytes("P", (pixels.shape[1], pixels.shape[0]), pixels.tobytes())
             img.putpalette(pal.flatten().tolist())
@@ -330,8 +390,9 @@ def main():
         mids = sign * (torch.arange(n, device=device, dtype=torch.float32) * (360 / n) + 180 / n)
         rm, um, fm = camera_basis(mids, elev)
         for i, v in enumerate(views):
-            pred, alpha, points = render_view(*v.shape, v.pivot, rm[i], um[i], fm[i], mids[i])
-            synth = to_rgb(colored(pred, alpha, points, float(mids[i])).cpu().numpy(), palette_u8)
+            pred, alpha, points, normal = render_view(*v.shape, v.pivot, rm[i], um[i], fm[i], mids[i])
+            synth = to_rgb(best_colors(pred, alpha, points, normal, float(mids[i]), (rm[i], um[i], fm[i])).cpu().numpy(),
+                           palette_u8)
             bar = np.zeros((4, v.shape[1], 3), dtype=np.uint8)
             strip.append(np.concatenate([np.full_like(bar, (0, 160, 0)), to_rgb(v.indices, palette_u8)], 0))
             strip.append(np.concatenate([np.full_like(bar, (40, 90, 220)), synth], 0))

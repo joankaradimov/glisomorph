@@ -68,14 +68,57 @@ pixels depend on things the other directions don't pin down:
 pose and colors, and slot into the rotation plausibly. Up close there's speckle, thin parts such as
 blades break up, and there are no shadows yet.
 
+## Lighting model
+
+`--lighting phong` (or `lambert`) replaces the field's plain colors with shading (`LitVoxelField` in
+`field.py`):
+
+- **Albedo:** a color per voxel.
+- **Normals:** minus the gradient of the smoothed density.
+- **Lights:** one or two directional lights (`--lights`). Each is a learned direction in *camera*
+  space, with a learned strength, plus an ambient term and a Blinn–Phong highlight.
+
+Diablo's sprites were rendered with lights fixed relative to the camera while the model turned. For
+each view, the lights therefore become world directions through that view's camera basis. Shading
+is deferred: albedo, normal and specular strength are accumulated along each ray, then shaded once
+per pixel.
+
+**Relit reprojection.** With a lighting model, a reprojected pixel's color is multiplied by the
+target view's shading divided by the source view's shading at that surface point, then snapped back to
+the palette. That corrects for the light having moved relative to the model between the two
+directions.
+
+**Results** on held-out directions. "Field" is the field's own colors quantized to the palette; RGB
+error is the mean absolute difference, 0–255.
+
+| Test | Silhouette IoU | Field: exact / RGB error | Best colors: exact / RGB error |
+|------|---------------:|--------------------------|--------------------------------|
+| Warrior, unlit | 0.864 | 14.5% / 20.9 | reprojected: 21.6% / 16.8 |
+| Warrior, lit   | 0.867 | 18.3% / 18.2 | relit: 20.5% / 16.8 |
+| Zombie, unlit  | 0.860 | 17.2% / 19.8 | reprojected: 22.1% / 17.1 |
+| Zombie, lit    | 0.862 | 23.5% / 14.8 | relit: 24.1% / 15.3 |
+| Arrow, unlit (22.5°) | 0.633 | 15.0% / 19.2 | reprojected: 37.1% / 13.2 |
+| Arrow, lit (22.5°)   | 0.633 | 16.5% / 19.4 | reprojected: 38.1% / 12.6 |
+
+- **The light is recovered consistently.** Fitted to each sprite separately, the single light comes
+  out almost the same every time. In camera space (x right, y up, z toward the camera) it's about
+  (0.4, 0.75, 0.5): upper right and in front. That matches the baked shadows, which always fall to the
+  left, and confirms that the lights were fixed to the camera.
+- **Normals mustn't reshape the geometry.** When shading gradients flowed into the density through
+  the normals, the optimizer bent the shape to fake shading, and character silhouettes dropped from
+  0.86 to 0.77–0.80 IoU. Normals are now computed from the density without passing gradients back
+  (`--coupled-normals` restores the old behaviour).
+- **The gain is moderate.** Lighting clearly improves the field's own colors, and relit reprojection
+  is as good as or a little better than plain reprojection. The remaining roughness comes from noisy
+  surfaces, not from lighting.
+
 ## Next steps
 
-- **Shadows:** regenerate them by projecting the model onto the ground along the light, which is fixed
-  relative to the camera and can be measured from the original shadows.
+- **Shadows:** regenerate them by projecting the model onto the ground along the recovered light.
 - **Cleaner surfaces:** a surface representation (2D Gaussian splatting or an SDF) instead of free
   voxels. Now that the cameras are calibrated, gsplat can be tried directly.
 - **Texture:** blend reprojection from both neighbours by visibility and angle, and fill the holes.
-- **Lighting:** model the camera-fixed light explicitly (albedo, normals and one light), so shading
-  moves physically instead of being averaged.
+- **Lighting:** tried; see above. The recovered light could also drive shadow regeneration, and could
+  be fitted once for the whole game and then held fixed.
 - **Evaluation:** only the missiles have real in-between directions. Characters can only be scored
   by hiding a direction, which is a harder, 45°, version of the task.

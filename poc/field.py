@@ -82,8 +82,8 @@ class VoxelField(torch.nn.Module):
             raw = raw + coeffs[2 * k - 1] * torch.cos(k * yaw_rad) + coeffs[2 * k] * torch.sin(k * yaw_rad)
         return sigma, torch.sigmoid(raw.t())
 
-    def render(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool, yaw_rad=None):
-        """Premultiplied color (H, W, 3) and opacity (H, W) of one view."""
+    def _march(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool):
+        """Sample points along every pixel's ray: points (H, W, S, 3), depths t (H, W, S), step length."""
         origins, direction = pixel_rays(height, width, pivot, offset, right, up, forward)
         near, far = ray_box(origins, direction, self.box_min, self.box_max)
         hit = far > near
@@ -95,17 +95,110 @@ class VoxelField(torch.nn.Module):
         span = (far - near)[..., None]
         t = near[..., None] + steps * span / samples                      # (H, W, S)
         points = origins[..., None, :] + t[..., None] * direction           # (H, W, S, 3)
-        sigma, color = self.sample(points.view(-1, 3), yaw_rad)
-        sigma = sigma.view(height, width, samples)
-        color = color.view(height, width, samples, 3)
-        alpha = 1 - torch.exp(-sigma * span / samples)
+        self.last_origins = origins
+        return points, t, span / samples
+
+    def _composite(self, sigma, t, step):
+        """Per-sample weights (H, W, S) from densities; also keeps depth and opacity for later."""
+        alpha = 1 - torch.exp(-sigma * step)
         transmit = torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1 - alpha[..., :-1] + 1e-10], -1), -1)
         weights = alpha * transmit
         self.last_alpha = alpha  # for regularizers
         # Expected depth along the view direction, from the plane through the world origin.
         self.last_depth = (weights * t).sum(-1) / weights.sum(-1).clamp(min=1e-6)
-        self.last_origins = origins
-        return (weights[..., None] * color).sum(-2), weights.sum(-1)
+        return weights
+
+    def render(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool, yaw_rad=None):
+        """Premultiplied color (H, W, 3) and opacity (H, W) of one view."""
+        points, t, step = self._march(height, width, pivot, offset, right, up, forward, samples, jitter)
+        sigma, color = self.sample(points.view(-1, 3), yaw_rad)
+        weights = self._composite(sigma.view(height, width, samples), t, step)
+        return (weights[..., None] * color.view(height, width, samples, 3)).sum(-2), weights.sum(-1)
+
+
+def _inverse_softplus(x: float) -> float:
+    return math.log(math.expm1(x))
+
+
+class LitVoxelField(VoxelField):
+    """Albedo, normals from the density, and directional lights fixed relative to the camera.
+
+    Diablo's sprites were rendered by turning the model under lights that stayed put relative to the
+    camera. So each light is a direction in camera space (x right, y up, z toward the camera); for a
+    view it becomes a world direction through that view's camera basis. Shading is deferred: albedo,
+    normal and specular strength are accumulated along each ray, then shaded once per pixel.
+    """
+
+    def __init__(self, box_min, box_max, voxel: float, device, lights: int = 1, specular: bool = True,
+                 detach_normals: bool = True):
+        super().__init__(box_min, box_max, voxel, device, harmonics=0)
+        # Letting shading gradients flow into the density through the normals lets the optimizer bend
+        # geometry to fake shading, which hurt silhouettes in tests. By default normals follow the
+        # density, but don't push it.
+        self.detach_normals = detach_normals
+        gz, gy, gx = self.density.shape[2:]
+        self.specular = (torch.nn.Parameter(torch.full((1, 1, gz, gy, gx), -3.0, device=device))
+                         if specular else None)
+        start = torch.tensor([[0.6, 0.6, 0.5], [-0.6, 0.3, 0.5]][:lights], device=device)
+        self.light_dirs = torch.nn.Parameter(start)
+        self.light_raw = torch.nn.Parameter(torch.full((lights,), _inverse_softplus(0.8), device=device))
+        self.ambient_raw = torch.nn.Parameter(torch.tensor(_inverse_softplus(0.3), device=device))
+        self.shininess_raw = torch.nn.Parameter(torch.tensor(math.log(16.0), device=device))
+        self._normals = None
+
+    def light_parameters(self):
+        return [self.light_dirs, self.light_raw, self.ambient_raw, self.shininess_raw]
+
+    def begin_step(self) -> None:
+        """Forget cached normals; call whenever the density has changed."""
+        self._normals = None
+
+    def normal_grid(self):
+        """Outward normals (unnormalized) on the voxel grid: minus the gradient of smoothed density."""
+        if self._normals is None:
+            density = self.density.detach() if self.detach_normals else self.density
+            d = F.softplus(density) * self.support
+            d = F.avg_pool3d(d, 3, stride=1, padding=1)
+            gx = F.pad((d[..., 2:] - d[..., :-2]) / 2, (1, 1))
+            gy = F.pad((d[..., 2:, :] - d[..., :-2, :]) / 2, (0, 0, 1, 1))
+            gz = F.pad((d[..., 2:, :, :] - d[..., :-2, :, :]) / 2, (0, 0, 0, 0, 1, 1))
+            self._normals = -torch.cat([gx, gy, gz], 1)
+        return self._normals
+
+    def lights_world(self, right, up, forward):
+        """Unit light directions (L, 3) in world space for a view."""
+        cam = F.normalize(self.light_dirs, dim=-1)
+        return F.normalize(cam[:, :1] * right + cam[:, 1:2] * up - cam[:, 2:3] * forward, dim=-1)
+
+    def shading(self, normals, right, up, forward):
+        """Diffuse-plus-ambient factor (...,) and specular term (...,) for unit normals (..., 3)."""
+        lights = self.lights_world(right, up, forward)
+        power = F.softplus(self.light_raw)
+        diffuse = F.softplus(self.ambient_raw) + (power * torch.relu(normals @ lights.t())).sum(-1)
+        halfway = F.normalize(lights - forward, dim=-1)  # the camera is at -forward
+        specular = (power * torch.relu(normals @ halfway.t()) ** torch.exp(self.shininess_raw)).sum(-1)
+        return diffuse, specular
+
+    def render(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool, yaw_rad=None):
+        points, t, step = self._march(height, width, pivot, offset, right, up, forward, samples, jitter)
+        flat = points.view(-1, 3)
+        grid = ((flat - self.box_min) / (self.box_max - self.box_min) * 2 - 1).view(1, 1, 1, -1, 3)
+        sigma = F.softplus(F.grid_sample(self.density, grid, align_corners=True).view(-1))
+        sigma = sigma * F.grid_sample(self.support, grid, align_corners=True).view(-1)
+        albedo = torch.sigmoid(F.grid_sample(self.color, grid, align_corners=True).view(3, -1).t())
+        normal = F.normalize(F.grid_sample(self.normal_grid(), grid, align_corners=True).view(3, -1).t(), dim=-1)
+        weights = self._composite(sigma.view(height, width, samples), t, step)
+        w = weights[..., None]
+        albedo = (w * albedo.view(height, width, samples, 3)).sum(-2)                  # premultiplied
+        normal = F.normalize((w * normal.view(height, width, samples, 3)).sum(-2), dim=-1)
+        diffuse, specular = self.shading(normal, right, up, forward)
+        rgb = albedo * diffuse[..., None]
+        if self.specular is not None:
+            ks = torch.sigmoid(F.grid_sample(self.specular, grid, align_corners=True).view(-1))
+            ks = (weights * ks.view(height, width, samples)).sum(-1)                     # premultiplied
+            rgb = rgb + (ks * specular)[..., None]
+        self.last_normal = normal
+        return rgb, weights.sum(-1)
 
 
 def allowed_masks(masks, slack: int = 1):
