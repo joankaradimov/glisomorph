@@ -22,13 +22,26 @@ def camera_basis(yaw_deg: torch.Tensor, elevation: torch.Tensor):
     return right, up, forward
 
 
-def pixel_rays(height: int, width: int, pivot, offset, right, up, forward):
-    """Origins (H, W, 3) on the plane through the world origin, and the shared direction (3,)."""
+def pixel_rays(height: int, width: int, pivot, offset, right, up, forward, supersample: int = 1):
+    """Origins on the plane through the world origin, and the shared direction (3,).
+
+    With supersample s, each pixel gets s x s rays at the centers of its sub-pixels, and origins is
+    (H*s, W*s, 3); otherwise it's (H, W, 3) with one ray through each pixel center.
+    """
     device = right.device
-    x = torch.arange(width, device=device) + 0.5 - (pivot[0] + offset[0])
-    y = (pivot[1] + offset[1]) - (torch.arange(height, device=device) + 0.5)
+    s = supersample
+    x = (torch.arange(width * s, device=device) + 0.5) / s - (pivot[0] + offset[0])
+    y = (pivot[1] + offset[1]) - (torch.arange(height * s, device=device) + 0.5) / s
     origins = x[None, :, None] * right + y[:, None, None] * up
     return origins, forward
+
+
+def pool(x: torch.Tensor, s: int) -> torch.Tensor:
+    """Average (H*s, W*s, ...) down to (H, W, ...)."""
+    if s == 1:
+        return x
+    h, w = x.shape[0] // s, x.shape[1] // s
+    return x.reshape(h, s, w, s, *x.shape[2:]).mean(dim=(1, 3))
 
 
 def ray_box(origins, direction, box_min, box_max):
@@ -82,38 +95,49 @@ class VoxelField(torch.nn.Module):
             raw = raw + coeffs[2 * k - 1] * torch.cos(k * yaw_rad) + coeffs[2 * k] * torch.sin(k * yaw_rad)
         return sigma, torch.sigmoid(raw.t())
 
-    def _march(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool):
-        """Sample points along every pixel's ray: points (H, W, S, 3), depths t (H, W, S), step length."""
-        origins, direction = pixel_rays(height, width, pivot, offset, right, up, forward)
+    def _march(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool,
+               supersample: int = 1):
+        """Sample points along every ray: points (h, w, S, 3), depths t (h, w, S), step length (h, w, 1),
+        where (h, w) is the view's size times `supersample`."""
+        origins, direction = pixel_rays(height, width, pivot, offset, right, up, forward, supersample)
+        h, w = origins.shape[:2]
         near, far = ray_box(origins, direction, self.box_min, self.box_max)
         hit = far > near
         near = torch.where(hit, near, torch.zeros_like(near))
         far = torch.where(hit, far, torch.zeros_like(far))
         steps = torch.arange(samples, device=near.device) + 0.5
         if jitter:
-            steps = steps + (torch.rand(height, width, samples, device=near.device) - 0.5)
+            steps = steps + (torch.rand(h, w, samples, device=near.device) - 0.5)
         span = (far - near)[..., None]
-        t = near[..., None] + steps * span / samples                      # (H, W, S)
-        points = origins[..., None, :] + t[..., None] * direction           # (H, W, S, 3)
-        self.last_origins = origins
+        t = near[..., None] + steps * span / samples                      # (h, w, S)
+        points = origins[..., None, :] + t[..., None] * direction           # (h, w, S, 3)
+        # Pixel-center origins, for turning a depth map into surface points.
+        self.last_origins = pixel_rays(height, width, pivot, offset, right, up, forward)[0]
         return points, t, span / samples
 
-    def _composite(self, sigma, t, step):
-        """Per-sample weights (H, W, S) from densities; also keeps depth and opacity for later."""
+    def _composite(self, sigma, t, step, supersample: int = 1):
+        """Per-sample weights (h, w, S) from densities. Keeps the per-pixel depth (weighted by opacity
+        over the sub-pixels) and the per-sample opacity for later."""
         alpha = 1 - torch.exp(-sigma * step)
         transmit = torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1 - alpha[..., :-1] + 1e-10], -1), -1)
         weights = alpha * transmit
-        self.last_alpha = alpha  # for regularizers
+        self.last_alpha = pool(alpha, supersample)  # for regularizers, per pixel
         # Expected depth along the view direction, from the plane through the world origin.
-        self.last_depth = (weights * t).sum(-1) / weights.sum(-1).clamp(min=1e-6)
+        opacity = weights.sum(-1)
+        depth = (weights * t).sum(-1)
+        self.last_depth = pool(depth, supersample) / pool(opacity, supersample).clamp(min=1e-6)
         return weights
 
-    def render(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool, yaw_rad=None):
-        """Premultiplied color (H, W, 3) and opacity (H, W) of one view."""
-        points, t, step = self._march(height, width, pivot, offset, right, up, forward, samples, jitter)
+    def render(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool, yaw_rad=None,
+               supersample: int = 1):
+        """Premultiplied color (H, W, 3) and opacity (H, W) of one view; with supersample s, each
+        pixel is the average of s x s sub-pixel rays."""
+        points, t, step = self._march(height, width, pivot, offset, right, up, forward, samples, jitter, supersample)
+        h, w = points.shape[:2]
         sigma, color = self.sample(points.view(-1, 3), yaw_rad)
-        weights = self._composite(sigma.view(height, width, samples), t, step)
-        return (weights[..., None] * color.view(height, width, samples, 3)).sum(-2), weights.sum(-1)
+        weights = self._composite(sigma.view(h, w, samples), t, step, supersample)
+        rgb = (weights[..., None] * color.view(h, w, samples, 3)).sum(-2)
+        return pool(rgb, supersample), pool(weights.sum(-1), supersample)
 
 
 def _inverse_softplus(x: float) -> float:
@@ -179,26 +203,28 @@ class LitVoxelField(VoxelField):
         specular = (power * torch.relu(normals @ halfway.t()) ** torch.exp(self.shininess_raw)).sum(-1)
         return diffuse, specular
 
-    def render(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool, yaw_rad=None):
-        points, t, step = self._march(height, width, pivot, offset, right, up, forward, samples, jitter)
+    def render(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool, yaw_rad=None,
+               supersample: int = 1):
+        points, t, step = self._march(height, width, pivot, offset, right, up, forward, samples, jitter, supersample)
+        h, w = points.shape[:2]
         flat = points.view(-1, 3)
         grid = ((flat - self.box_min) / (self.box_max - self.box_min) * 2 - 1).view(1, 1, 1, -1, 3)
         sigma = F.softplus(F.grid_sample(self.density, grid, align_corners=True).view(-1))
         sigma = sigma * F.grid_sample(self.support, grid, align_corners=True).view(-1)
         albedo = torch.sigmoid(F.grid_sample(self.color, grid, align_corners=True).view(3, -1).t())
         normal = F.normalize(F.grid_sample(self.normal_grid(), grid, align_corners=True).view(3, -1).t(), dim=-1)
-        weights = self._composite(sigma.view(height, width, samples), t, step)
-        w = weights[..., None]
-        albedo = (w * albedo.view(height, width, samples, 3)).sum(-2)                  # premultiplied
-        normal = F.normalize((w * normal.view(height, width, samples, 3)).sum(-2), dim=-1)
+        weights = self._composite(sigma.view(h, w, samples), t, step, supersample)
+        wts = weights[..., None]
+        albedo = (wts * albedo.view(h, w, samples, 3)).sum(-2)                         # premultiplied
+        normal = F.normalize((wts * normal.view(h, w, samples, 3)).sum(-2), dim=-1)
         diffuse, specular = self.shading(normal, right, up, forward)
         rgb = albedo * diffuse[..., None]
         if self.specular is not None:
             ks = torch.sigmoid(F.grid_sample(self.specular, grid, align_corners=True).view(-1))
-            ks = (weights * ks.view(height, width, samples)).sum(-1)                     # premultiplied
+            ks = (weights * ks.view(h, w, samples)).sum(-1)                              # premultiplied
             rgb = rgb + (ks * specular)[..., None]
-        self.last_normal = normal
-        return rgb, weights.sum(-1)
+        self.last_normal = F.normalize(pool(normal, supersample), dim=-1)
+        return pool(rgb, supersample), pool(weights.sum(-1), supersample)
 
 
 def allowed_masks(masks, slack: int = 1):

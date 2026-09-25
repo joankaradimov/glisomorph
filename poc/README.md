@@ -112,11 +112,47 @@ error is the mean absolute difference, 0–255.
   is as good as or a little better than plain reprojection. The remaining roughness comes from noisy
   surfaces, not from lighting.
 
+## Sub-pixel accuracy
+
+`poc/diagnose.py` showed the largest share of held-out error was placement. Many pixels have the wrong
+color family, but the right one is within a pixel. Two options target that:
+
+- `--refine-camera`: after 300 iterations, the calibrated elevation and pivot offset are refined by
+  gradient along with the field.
+- `--supersample 2`: each pixel is rendered as the average of 2 x 2 sub-pixel rays (area sampling,
+  like an anti-aliased render that was downsampled).
+
+**Results** (reprojected colors, held-out directions):
+
+| Test | Exact | Wrong ramp | Exact within 1 px | Silhouette IoU |
+|------|------:|-----------:|------------------:|---------------:|
+| Warrior, before | 22% | 44% | 51% | 0.864 |
+| Warrior, refined + area-sampled | 20% | 44% | 55% | 0.87 |
+| Zombie, before | 22% | 29% | 66% | 0.860 |
+| Zombie, refined + area-sampled | 22% | 33% | 68% | 0.86 |
+| Arrow, before | 37% | — | — | 0.633 |
+| Arrow, refined + area-sampled | 38% | — | — | 0.732 |
+
+- **The camera was already right.** Refinement moved the elevation by 0.3–0.8° and the pivot by at
+  most 0.1 pixel.
+- **Area sampling helps thin parts.** It lifted the arrow's silhouette overlap by 10 points, and does
+  little for characters.
+- **What misplaces pixels on characters:**
+  - *Surface depth error.* At 45°, a depth error of about 1.4 voxels moves a reprojected pixel by a
+    whole pixel, and the voxel field's surfaces are soft at that scale.
+  - *Resampling itself.* Turning a texture to a new angle makes each output pixel pick one source
+    pixel. That limits exact matches even with perfect geometry, so part of the gap is a ceiling for
+    any method.
+
 ## Next steps
 
 - **Shadows:** regenerate them by projecting the model onto the ground along the recovered light.
 - **Cleaner surfaces:** a surface representation (2D Gaussian splatting or an SDF) instead of free
-  voxels. Now that the cameras are calibrated, gsplat can be tried directly.
+  voxels, for more accurate depth. The cameras are calibrated, so gsplat can be tried directly.
+- **Coherent warps:** smooth the reconstructed depth before reprojecting, so that neighbouring pixels
+  fetch from neighbouring source pixels. That targets the speckle rather than the exact-match score.
+- **A ceiling:** render a known 3D model into 8 + 8 directions and run the pipeline on it. That would
+  show how many exact pixels are achievable at all.
 - **Texture:** blend reprojection from both neighbours by visibility and angle, and fill the holes.
 - **Lighting:** tried; see above. The recovered light could also drive shadow regeneration, and could
   be fitted once for the whole game and then held fixed.

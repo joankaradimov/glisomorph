@@ -141,6 +141,13 @@ def main():
     ap.add_argument("--light-lr", type=float, default=0.01)
     ap.add_argument("--coupled-normals", action="store_true",
                     help="let shading gradients reshape the density through the normals")
+    ap.add_argument("--supersample", type=int, default=1,
+                    help="render each pixel as the average of s x s sub-pixel rays (area sampling)")
+    ap.add_argument("--refine-camera", action="store_true",
+                    help="refine the calibrated elevation and pivot offset by gradient")
+    ap.add_argument("--refine-from", type=int, default=300, help="iteration at which camera refinement starts")
+    ap.add_argument("--camera-lr", type=float, default=1e-3,
+                    help="learning rate of the elevation in radians; the pivot offset's is 20 times this, in pixels")
     ap.add_argument("--frame", type=int, default=None, help="animation frame (default: the preset's)")
     ap.add_argument("--voxel", type=float, default=1.0, help="voxel size in pixels (0.6 suits thin sprites)")
     ap.add_argument("--iters", type=int, default=2000)
@@ -226,37 +233,62 @@ def main():
         opt = torch.optim.Adam(groups)
     else:
         opt = torch.optim.Adam(field.parameters(), lr=args.lr)
+    # The camera found by calibration, refined by gradient once the field has taken shape.
+    elev_param = torch.nn.Parameter(torch.tensor(math.radians(elev_deg), device=device), requires_grad=False)
+    off_param = torch.nn.Parameter(torch.tensor(off, dtype=torch.float32, device=device), requires_grad=False)
+    if args.refine_camera:
+        # Adam steps are about lr in size whatever the gradient, so the rates set the precision:
+        # 1e-3 radians is about 0.06 degrees, 2e-2 pixels is 1/50 of a pixel, both decaying tenfold.
+        opt.add_param_group({"params": [elev_param], "lr": args.camera_lr})
+        opt.add_param_group({"params": [off_param], "lr": args.camera_lr * 20})
     sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=(0.1) ** (1 / args.iters))
     targets = [(palette[torch.as_tensor(views[i].indices, device=device).long().clamp(min=0)], masks[i])
                for i in train]
 
+    def tv(p):
+        return (((p[..., 1:, :, :] - p[..., :-1, :, :]) ** 2).mean() + ((p[..., :, 1:, :] - p[..., :, :-1, :]) ** 2).mean()
+                + ((p[..., :, :, 1:] - p[..., :, :, :-1]) ** 2).mean())
+
     t0 = time.time()
     for it in range(args.iters):
+        if args.refine_camera and it == args.refine_from:
+            elev_param.requires_grad_(True)
+            off_param.requires_grad_(True)
         opt.zero_grad()
-        if lit:
-            field.begin_step()
-        loss = 0.0
+        total = 0.0
+        # One backward pass per view keeps memory to a single view's rays, supersampled or not.
         for k, i in enumerate(train):
+            if lit:
+                field.begin_step()
+            r, u, f = camera_basis(yaws[i:i + 1], elev_param)
             h, w = views[i].shape
-            rgb, alpha = field.render(h, w, views[i].pivot, off, right[i], up[i], forward[i], samples,
-                                      jitter=True, yaw_rad=yaw_rad[i])
+            rgb, alpha = field.render(h, w, views[i].pivot, off_param, r[0], u[0], f[0], samples,
+                                      jitter=True, yaw_rad=yaw_rad[i], supersample=args.supersample)
             color, m = targets[k]
             solid = m == 1
-            loss = loss + ((rgb - color) ** 2)[solid].mean()
+            loss = ((rgb - color) ** 2)[solid].mean()
             loss = loss + 0.5 * torch.nn.functional.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), solid.float())
             if args.sparsity:
                 # Prefer the fewest voxels that explain every view: phantom copies cost extra.
                 loss = loss + args.sparsity * field.last_alpha[solid].sum(-1).mean()
-
-        def tv(p):
-            return (((p[..., 1:, :, :] - p[..., :-1, :, :]) ** 2).mean() + ((p[..., :, 1:, :] - p[..., :, :-1, :]) ** 2).mean()
-                    + ((p[..., :, :, 1:] - p[..., :, :, :-1]) ** 2).mean())
-        loss = loss / len(train) + args.tv * tv(field.density) + args.color_tv * tv(field.color)
-        loss.backward()
+            (loss / len(train)).backward()
+            total += loss.item() / len(train)
+        regularizer = args.tv * tv(field.density) + args.color_tv * tv(field.color)
+        regularizer.backward()
         opt.step()
         sched.step()
         if it % 500 == 0 or it == args.iters - 1:
-            print("iter %5d  loss %.5f  (%.0fs)" % (it, loss.item(), time.time() - t0))
+            print("iter %5d  loss %.5f  (%.0fs)" % (it, total + regularizer.item(), time.time() - t0))
+
+    if args.refine_camera:
+        elev_deg_refined = math.degrees(elev_param.item())
+        off = tuple(off_param.detach().tolist())
+        print("refined camera: elevation %.2f deg (was %.1f), pivot offset (%.2f, %.2f)"
+              % (elev_deg_refined, elev_deg, off[0], off[1]))
+        elev = elev_param.detach()
+        right, up, forward = camera_basis(yaws, elev)
+    else:
+        elev_deg_refined = elev_deg
 
     # 3. Evaluation. A new view can be colored three ways: the field's own colors (quantized to the
     #    palette), palette indices reprojected from the known directions, and, with a lighting model,
@@ -266,7 +298,8 @@ def main():
         field.begin_step()
 
     def render_view(h, w, pivot, r, u, f, yaw_deg):
-        rgb, alpha = field.render(h, w, pivot, off, r, u, f, samples, jitter=False, yaw_rad=torch.deg2rad(yaw_deg))
+        rgb, alpha = field.render(h, w, pivot, off, r, u, f, samples, jitter=False, yaw_rad=torch.deg2rad(yaw_deg),
+                                  supersample=args.supersample)
         points = field.last_origins + field.last_depth[..., None] * f
         return quantize(rgb, alpha, palette, candidates), alpha, points, (field.last_normal if lit else None)
 
@@ -324,7 +357,8 @@ def main():
     summary = {
         "preset": args.preset, "split": args.split, "frame": preset.frame, "views": len(views),
         "train_views": train, "test_views": test if args.split != "all" else [],
-        "elevation_deg": elev_deg, "pivot_offset": off, "calibration_coverage": coverage,
+        "elevation_deg": elev_deg_refined, "elevation_calibrated_deg": elev_deg, "pivot_offset": off,
+        "calibration_coverage": coverage, "refine_camera": args.refine_camera, "supersample": args.supersample,
         "voxel": args.voxel, "iters": args.iters, "lighting": args.lighting,
         "train": mean_scores(results["train"]), "test": mean_scores(results["test"]),
         "test_reprojected": mean_scores(results["test_reprojected"]),
