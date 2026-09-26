@@ -267,6 +267,22 @@ the character and a little to the left. `shadow.py` gives a new direction its sh
 
 `evaluate.py` does this for every sprite with baked shadows, and draws the shadows in all pictures.
 
+**Black texture.** Fits and scores used to treat every index-0 pixel of a character as transparent,
+including the black inside the model: 1.2% of the warrior's pixels, mostly the straps across his
+chest (the zombie and the rogue have none). Now only the baked shadow is transparent (`masks_for` in
+scene.py), and the model's colors can snap to black. A few pixels of shadow, seen through gaps
+between the legs, don't touch the background either, so they count as texture now; counting diagonal
+contacts would catch some of them, but also some of the straps.
+
+| Warrior, SW hidden: IoU / exact / RGB error | Before | After |
+|---------------------------------------------|--------|-------|
+| Stance, voxels' relit copied pixels | 0.865 / 23.3% / 16.0 | 0.869 / 24.5% / 15.7 |
+| Stance, Gaussians' copied pixels | 0.857 / 22.3% / 17.5 | 0.862 / 23.1% / 17.1 |
+| Walk, moving Gaussians' relit copied pixels | 0.805 / 29.2% / 15.4 | 0.814 / 30.5% / 14.9 |
+
+The fitted directions gain most, their silhouettes no longer holed by the straps: 0.977 to 0.987 IoU
+with voxels. The shadows' fit doesn't change. Other tables in this README predate the fix.
+
 **Results** (intersection over union with the originals' shadows; the 11 held-out character
 directions from above):
 

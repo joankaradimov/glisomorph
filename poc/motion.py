@@ -544,7 +544,7 @@ def main():
             print("refine %5d  loss %.5f  (%.0fs)" % (it, loss.item(), time.time() - t0))
 
     # 4. Scores and pictures.
-    candidates = torch.tensor(list(range(128, 255)) if preset.shadows else [0] + list(range(128, 255)), device=device)
+    candidates = torch.tensor([0] + list(range(128, 255)), device=device)
     per_frame = len(frames) / count  # model slots per animation frame
     results = {key: [] for key in ("fitted", "hidden_direction", "hidden_direction_copied", "hidden_frames",
                                    "hidden_frames_copied", "hidden_frames_repeat_previous")}
@@ -604,7 +604,7 @@ def main():
         def shadow_match(frame_phase, d, indices):
             sprite = with_shadow(indices, frame_phase, float(yaws[d]))
             original = torch.as_tensor(all_views[frame_phase][d].indices, device=device).long()
-            return float(iou(sprite == 0, baked_shadow(original)))
+            return float(iou(baked_shadow(sprite), baked_shadow(original)))
 
         def copied(frame_phase, d_yaw, own=None):
             if own is None:

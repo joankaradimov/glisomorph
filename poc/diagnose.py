@@ -7,8 +7,10 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from diablo1.palette import RAMPS
+from poc.shadow import baked_shadow
 
 RAMP_OF = np.zeros(256, dtype=np.int64)
 STEP_OF = np.zeros(256, dtype=np.int64)
@@ -57,7 +59,7 @@ def main():
     args = ap.parse_args()
     data = np.load(Path(args.run) / "views.npz")
     gt = data["gt%d" % args.view].astype(np.int64)
-    gt[gt == 0] = -1  # baked shadows aren't part of the model
+    gt[baked_shadow(torch.as_tensor(gt)).numpy()] = -1  # baked shadows aren't part of the model
     print(Path(args.run).name)
     for key, label in (("pred", "field"), ("rep", "reproj"), ("relit", "relit")):
         name = "%s%d" % (key, args.view)

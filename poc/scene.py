@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 
 from poc.field import LitVoxelField, VoxelField, camera_basis
+from poc.shadow import baked_shadow
 from poc.views import PRESETS, Preset, View, load_views
 
 
@@ -17,14 +18,15 @@ def masks_for(views: list[View], shadows: bool, device) -> list[torch.Tensor]:
     """1 where the model is seen, 0 elsewhere.
 
     A baked shadow (index 0 on a character) is on the ground, and the model doesn't cover it, so it
-    counts as transparent.
+    counts as transparent. Black pixels inside the model (index 0 not touching the background, see
+    shadow.baked_shadow) are part of its texture, and stay.
     """
     out = []
     for v in views:
         idx = torch.as_tensor(v.indices, device=device).long()
         m = (idx >= 0).long()
         if shadows:
-            m[idx == 0] = 0
+            m[baked_shadow(idx)] = 0
         out.append(m)
     return out
 

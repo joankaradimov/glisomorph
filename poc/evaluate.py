@@ -136,9 +136,9 @@ class Renderer:
         self.scene, self.warp = scene, warp
         self.light = None
         self.ramps = Ramps(scene.palette)
-        # Sprites use 0 and 128-254; 0 is a baked shadow on characters, which the model doesn't have.
-        colors = list(range(128, 255)) if scene.preset.shadows else [0] + list(range(128, 255))
-        self.candidates = torch.tensor(colors, device=scene.palette.device)
+        # Sprites use 0 (black) and 128-254. On characters, 0 is also their baked shadow, which the
+        # model doesn't have, but black inside the model is part of its texture.
+        self.candidates = torch.tensor([0] + list(range(128, 255)), device=scene.palette.device)
         if scene.lit:
             scene.field.begin_step()
         right, up, forward = scene.basis(scene.yaws)
