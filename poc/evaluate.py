@@ -5,11 +5,15 @@
 fit.py runs this after fitting. Run by hand, it evaluates a saved fit again, for example with other
 reprojection settings (`--warp`, see reproject.py), without fitting again.
 
-Outputs: metrics.json, views.npz (truth, field colors, reprojected and relit colors per view),
-compare.png, in_between.png and turntable.gif.
+For sprites with baked shadows, it also fits the shadows' light to the known directions (see
+shadow.py), and draws shadows in the new ones.
+
+Outputs: metrics.json, views.npz (truth, field colors, reprojected and relit colors, and shadows per
+view), compare.png, in_between.png and turntable.gif.
 """
 
 import argparse
+import dataclasses
 import json
 from pathlib import Path
 
@@ -21,6 +25,7 @@ from PIL import Image
 from diablo1.palette import ramp_of
 from poc.reproject import Warp, fill, neighbour, reproject, source_depth
 from poc.scene import Scene
+from poc.shadow import baked_shadow, fit_light, iou, shadow_mask, shadow_opacity
 
 WARPS = {"coherent": Warp(), "plain": Warp.plain()}
 # Warp settings that can be changed from the command line, over the chosen warp's.
@@ -121,10 +126,12 @@ def to_rgb(indices: np.ndarray, palette_u8: np.ndarray, background=(64, 64, 64))
 
 class Renderer:
     """Renders any direction of a scene and colors it: with the field's own colors, reprojected from
-    the known directions, and, with a lighting model, reprojected and relit."""
+    the known directions, and, with a lighting model, reprojected and relit. With a shadow light
+    (`light`, see shadow.py), sprites get their baked shadow too."""
 
     def __init__(self, scene: Scene, warp: Warp):
         self.scene, self.warp = scene, warp
+        self.light = None
         # Sprites use 0 and 128-254; 0 is a baked shadow on characters, which the model doesn't have.
         colors = list(range(128, 255)) if scene.preset.shadows else [0] + list(range(128, 255))
         self.candidates = torch.tensor(colors, device=scene.palette.device)
@@ -185,6 +192,24 @@ class Renderer:
         plain, relit = self.colored(r)
         return relit if relit is not None else plain
 
+    def shadow(self, r: dict):
+        """Where the direction shows its baked shadow (H, W): ground in shadow that the model doesn't
+        hide. None without a shadow light."""
+        if self.light is None:
+            return None
+        t = r["target"]
+        opacity = shadow_opacity(self.scene.field, t["origins"], t["forward"], self.light.direction(t["right"])[None],
+                                 self.light.ground, self.scene.samples)[0]
+        return shadow_mask(opacity, t["solid"])
+
+    def sprite(self, r: dict):
+        """The direction as a sprite: its best colors, over its baked shadow (index 0)."""
+        return with_shadow(self.best_colors(r), self.shadow(r))
+
+
+def with_shadow(indices, shadow):
+    return indices if shadow is None else torch.where(shadow, torch.zeros_like(indices), indices)
+
 
 @torch.no_grad()
 def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
@@ -194,18 +219,26 @@ def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
     palette_np = palette.cpu().numpy()
     palette_u8 = (palette_np * 255).round().astype(np.uint8)
     renderer = Renderer(scene, warp)
+    if scene.preset.shadows:
+        renderer.light, _ = fit_light(scene, train)
 
-    # 1. Scores. A known direction's reprojection never uses that direction itself.
-    results = {"train": [], "test": [], "test_reprojected": [], "test_relit": [], "baseline": []}
-    predictions, reprojected, relit = {}, {}, {}
+    # 1. Scores. A known direction's reprojection never uses that direction itself. Colors are scored
+    #    without the baked shadows, which are scored on their own.
+    results = {"train": [], "test": [], "test_reprojected": [], "test_relit": [], "baseline": [],
+               "shadow_train": [], "shadow_test": []}
+    predictions, reprojected, relit, shadows = {}, {}, {}, {}
     for i, v in enumerate(views):
         r = renderer.render(v.shape, v.pivot, scene.yaws[i])
         predictions[i] = r["pred"]
         reprojected[i], relit_i = renderer.colored(r, exclude=i)
         if relit_i is not None:
             relit[i] = relit_i
-        gt = torch.as_tensor(v.indices, device=device).long()
-        gt = torch.where(scene.masks[i] == 1, gt, torch.full_like(gt, -1))  # without baked shadows
+        shadows[i] = renderer.shadow(r)
+        original = torch.as_tensor(v.indices, device=device).long()
+        if shadows[i] is not None:
+            match = float(iou(shadows[i], baked_shadow(original)))
+            results["shadow_train" if i in train else "shadow_test"].append(match)
+        gt = torch.where(scene.masks[i] == 1, original, torch.full_like(original, -1))  # without baked shadows
         if i in train:
             results["train"].append(score(r["pred"], gt, palette))
         if i in test:
@@ -225,6 +258,11 @@ def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
                "test_reprojected": mean_scores(results["test_reprojected"]),
                "test_relit": mean_scores(results["test_relit"]),
                "baseline_nearest_view": mean_scores(results["baseline"])}
+    if renderer.light is not None:
+        summary["shadows"] = {"light": dataclasses.asdict(renderer.light),
+                              "train_iou": float(np.mean(results["shadow_train"])),
+                              "test_iou": float(np.mean(results["shadow_test"])) if results["shadow_test"] else None}
+        print("shadows:", json.dumps(summary["shadows"]))
     if scene.lit:
         f = scene.field
         summary["lights"] = {
@@ -239,32 +277,33 @@ def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
                         **{"gt%d" % i: v.indices for i, v in enumerate(views)},
                         **{"pred%d" % i: p.cpu().numpy().astype(np.int16) for i, p in predictions.items()},
                         **{"rep%d" % i: p.cpu().numpy().astype(np.int16) for i, p in reprojected.items()},
-                        **{"relit%d" % i: p.cpu().numpy().astype(np.int16) for i, p in relit.items()})
+                        **{"relit%d" % i: p.cpu().numpy().astype(np.int16) for i, p in relit.items()},
+                        **{"shadow%d" % i: p.cpu().numpy() for i, p in shadows.items() if p is not None})
     print(json.dumps({k: summary[k] for k in ("train", "test", "test_reprojected", "test_relit",
                                                "baseline_nearest_view")}, indent=2))
 
-    # 2. compare.png: ground truth, field colors, reprojected colors (and relit ones), for every view.
+    # 2. compare.png: ground truth, field colors, reprojected colors (and relit ones), for every view,
+    #    with the baked shadows.
     scale = 3
     tiles = []
     for i, v in enumerate(views):
         gt_img = to_rgb(v.indices, palette_u8)
         marker = np.zeros((4, gt_img.shape[1], 3), dtype=np.uint8)
         marker[:] = (0, 160, 0) if i in train else (200, 40, 40)
-        rows = [marker, gt_img, to_rgb(predictions[i].cpu().numpy(), palette_u8),
-                to_rgb(reprojected[i].cpu().numpy(), palette_u8)]
-        if i in relit:
-            rows.append(to_rgb(relit[i].cpu().numpy(), palette_u8))
+        rows = [marker, gt_img] + [to_rgb(with_shadow(p, shadows[i]).cpu().numpy(), palette_u8)
+                                   for p in (predictions[i], reprojected[i], relit.get(i)) if p is not None]
         tiles.append(np.concatenate(rows, 0))
     Image.fromarray(upscale(np.concatenate(tiles, 1), scale)).save(out_dir / "compare.png")
 
     # 3. turntable.gif: 32 directions. in_between.png: the originals with a synthesized direction
-    #    between each pair, as the game would use them. Both use relit colors when there's a lighting model.
+    #    between each pair, as the game would use them. Both use relit colors when there's a lighting
+    #    model, and draw the baked shadows.
     pal = palette_u8.copy()
     pal[255] = (64, 64, 64)  # sprites never use 255; it stands for transparent here
     frames = []
     for k in range(32):
         r = renderer.render(views[0].shape, views[0].pivot, scene.sign * k * 11.25)
-        idx = renderer.best_colors(r).cpu().numpy()
+        idx = renderer.sprite(r).cpu().numpy()
         pixels = upscale(np.where(idx < 0, 255, idx).astype(np.uint8), scale)
         img = Image.frombytes("P", (pixels.shape[1], pixels.shape[0]), pixels.tobytes())
         img.putpalette(pal.flatten().tolist())
@@ -275,7 +314,7 @@ def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
     strip = []
     for i, v in enumerate(views):
         r = renderer.render(v.shape, v.pivot, scene.sign * (i * 360 / n + 180 / n))
-        synth = to_rgb(renderer.best_colors(r).cpu().numpy(), palette_u8)
+        synth = to_rgb(renderer.sprite(r).cpu().numpy(), palette_u8)
         bar = np.zeros((4, v.shape[1], 3), dtype=np.uint8)
         strip.append(np.concatenate([np.full_like(bar, (0, 160, 0)), to_rgb(v.indices, palette_u8)], 0))
         strip.append(np.concatenate([np.full_like(bar, (40, 90, 220)), synth], 0))

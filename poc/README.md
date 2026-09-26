@@ -22,6 +22,7 @@ Only Diablo 1, only still frames.
    - This keeps the artist's pixels, instead of re-quantizing blended colors.
    - The warp is kept coherent, so that neighbouring pixels fetch neighbouring source pixels, from
      the same direction (see [Coherent warps](#coherent-warps)).
+   - Characters get a baked shadow, cast by the reconstruction (see [Shadows](#shadows)).
 
 ```
 python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior --split all
@@ -40,7 +41,8 @@ renders a saved fit again, for example with other reprojection settings, without
 **Outputs** go to `out/` (gitignored: they're derived from game data):
 - `scene.pt`: the fitted field and its cameras;
 - `metrics.json`;
-- `views.npz`: the palette indices of every direction: truth, field colors, reprojected colors;
+- `views.npz`: the palette indices of every direction (truth, field colors, reprojected colors), and
+  the shadows;
 - `compare.png`: truth, field colors and reprojected colors, for every direction;
 - `in_between.png`: originals with a synthesized direction between each pair;
 - `turntable.gif`: 32 directions.
@@ -74,7 +76,7 @@ pixels depend on things the other directions don't pin down:
 
 **Does it look right? Mostly, at game scale.** The synthesized directions have the right silhouette,
 pose and colors, and slot into the rotation plausibly. Up close there's speckle, thin parts such as
-blades break up, and there are no shadows yet.
+blades break up, and shadows were missing (see [Shadows](#shadows)).
 
 ## Lighting model
 
@@ -110,8 +112,9 @@ error is the mean absolute difference, 0–255.
 
 - **The light is recovered consistently.** Fitted to each sprite separately, the single light comes
   out almost the same every time. In camera space (x right, y up, z toward the camera) it's about
-  (0.4, 0.75, 0.5): upper right and in front. That matches the baked shadows, which always fall to the
-  left, and confirms that the lights were fixed to the camera.
+  (0.4, 0.75, 0.5): upper right and in front. It confirms that the lights were fixed to the camera, as
+  do the baked shadows, which fall the same way in every direction. (The shadows come from another
+  light, though: see [Shadows](#shadows).)
 - **Normals mustn't reshape the geometry.** When shading gradients flowed into the density through
   the normals, the optimizer bent the shape to fake shading, and character silhouettes dropped from
   0.86 to 0.77–0.80 IoU. Normals are now computed from the density without passing gradients back
@@ -204,8 +207,8 @@ pixel count to mean anything.
 - **Colors improve too**, most on the arrow, where exact matches rise by 5 points.
 - **With a lighting model**, relit colors gain the same way. On the zombie, stray pixels fall from
   4.9% to 1.6% (its originals have 1.0%), and the RGB error from 15.2 to 14.1.
-- **At game scale** the in-between directions look cleaner, but not transformed: shadows are still
-  missing, and thin blades still break up.
+- **At game scale** the in-between directions look cleaner, but not transformed: thin blades still
+  break up.
 
 **What each part does** (characters, leaving out one part at a time):
 
@@ -240,9 +243,42 @@ pixel count to mean anything.
 
 With the plain warp, another 16% were the field's own colors, in pixels that no direction sees.
 
+## Shadows
+
+Character sprites carry a baked shadow: solid index 0 on the ground, under the character. The light
+that cast it turned with the camera, so it falls the same way on screen in every direction: behind
+the character and a little to the left. `shadow.py` gives a new direction its shadow the same way:
+
+1. **Casting.** The ground point that a pixel sees is in shadow if the reconstruction blocks its way
+   to the light: a ray is marched through the field, from the ground toward the light.
+2. **Fitting the light.** The light's direction and the ground's height are searched for the shadows
+   that best match the originals'. Black pixels inside the model are part of its texture, not
+   shadow, so only groups of index-0 pixels that touch the background count.
+3. **Drawing.** The shadow's opacity is averaged over 3 x 3 pixels, which cleans ragged edges, and
+   drawn as index 0 wherever the model doesn't cover it.
+
+`evaluate.py` does this for every sprite with baked shadows, and draws the shadows in all pictures.
+
+**Results** (intersection over union with the originals' shadows; the 11 held-out character
+directions from above):
+
+| Shadow | Fitted directions | Held-out directions |
+|--------|------------------:|--------------------:|
+| cast by the reconstruction | 0.58 | 0.52 |
+| the nearest original direction's, as it is | — | 0.26 |
+
+- **The shadows' light is the same for every sprite.** Seen from the character, every fit puts it
+  about 20° to the right of the camera and 55° above the ground (20–22.5° and 54–57°), for all three
+  characters.
+- **It isn't the light that shades the models.** Measured the same way, the lighting model's light is
+  at about 73° and 65°, and shadows cast from it match the originals poorly (IoU under 0.2). The
+  sprites were lit by more than one light, and the shadows come from one of the others.
+- **The shapes match; the edges are off by a pixel or two.** The shadows have the right shapes, down
+  to the streak of the warrior's sword. Most of the disagreement is a shift of a pixel or two along
+  the edges, which costs a lot of overlap on shapes this thin.
+
 ## Next steps
 
-- **Shadows:** regenerate them by projecting the model onto the ground along the recovered light.
 - **Cleaner surfaces:** a surface representation (2D Gaussian splatting or an SDF) instead of free
   voxels, for more accurate depth. The cameras are calibrated, so gsplat can be tried directly.
 - **Thin parts:** blades and bows still break up. They're a pixel or two wide, so a pixel of error in
@@ -252,8 +288,8 @@ With the plain warp, another 16% were the field's own colors, in pixels that no 
 - **Blending:** where two directions see a surface about equally well, blend their colors and snap
   the blend to the palette, instead of picking one. That would trade some crispness for shading
   between the two directions'.
-- **Lighting:** tried; see above. The recovered light could also drive shadow regeneration, and could
-  be fitted once for the whole game and then held fixed.
+- **Lighting:** tried; see above. The lights could be fitted once for the whole game and then held
+  fixed: the shading light and the shadows' light come out the same for every sprite.
 - **Evaluation:** only the arrows have usable in-between directions. The fireball and the holy bolt
   aren't a rigid model turned: their flames trail along the direction of flight, and the
   reconstruction does worse than reusing the nearest direction. Characters can only be scored by

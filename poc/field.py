@@ -84,11 +84,16 @@ class VoxelField(torch.nn.Module):
         zz, yy, xx = torch.meshgrid(axes[2], axes[1], axes[0], indexing="ij")
         return torch.stack([xx, yy, zz], -1)  # (gz, gy, gx, 3)
 
+    def sigma(self, points):
+        """Density (P,) at world points (P, 3)."""
+        grid = ((points - self.box_min) / (self.box_max - self.box_min) * 2 - 1).view(1, 1, 1, -1, 3)
+        sigma = F.softplus(F.grid_sample(self.density, grid, align_corners=True).view(-1))
+        return sigma * F.grid_sample(self.support, grid, align_corners=True).view(-1)
+
     def sample(self, points, yaw_rad=None):
         """Density (P,) and color (P, 3) at world points (P, 3), seen from the given yaw."""
         grid = ((points - self.box_min) / (self.box_max - self.box_min) * 2 - 1).view(1, 1, 1, -1, 3)
-        sigma = F.softplus(F.grid_sample(self.density, grid, align_corners=True).view(-1))
-        sigma = sigma * F.grid_sample(self.support, grid, align_corners=True).view(-1)
+        sigma = self.sigma(points)
         coeffs = F.grid_sample(self.color, grid, align_corners=True).view(-1, 3, points.shape[0])
         raw = coeffs[0]
         for k in range(1, self.harmonics + 1):
