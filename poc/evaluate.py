@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from diablo1.palette import ramp_of
+from poc.ramps import Ramps
 from poc.reproject import Warp, fill, neighbour, reproject, source_depth
 from poc.scene import Scene
 from poc.shadow import baked_shadow, fit_light, iou, shadow_mask, shadow_opacity
@@ -35,6 +36,8 @@ OVERRIDES = {
     "coherence": {"type": float, "help": "cost of switching direction between neighbours inside a surface"},
     "shading": {"type": float, "help": "cost of a direction that shades a surface differently"},
     "fill": {"type": int, "help": "how far pixels that no direction sees take a neighbour's color"},
+    "interpolate": {"type": lambda v: bool(int(v)), "choices": [0, 1],
+                    "help": "1 to interpolate shades between source pixels of the same material"},
 }
 
 
@@ -132,6 +135,7 @@ class Renderer:
     def __init__(self, scene: Scene, warp: Warp):
         self.scene, self.warp = scene, warp
         self.light = None
+        self.ramps = Ramps(scene.palette)
         # Sprites use 0 and 128-254; 0 is a baked shadow on characters, which the model doesn't have.
         colors = list(range(128, 255)) if scene.preset.shadows else [0] + list(range(128, 255))
         self.candidates = torch.tensor(colors, device=scene.palette.device)
@@ -169,7 +173,7 @@ class Renderer:
         s = self.scene
         sources = [src for src in self.sources if src["view"] != exclude]
         t = r["target"]
-        rep, origin = reproject(t, sources, self.warp)
+        rep, origin, shade = reproject(t, sources, self.warp, self.ramps)
 
         def finish(indices):
             indices = fill(indices, t["solid"], self.warp.fill)
@@ -179,13 +183,17 @@ class Renderer:
         if not s.lit:
             return plain, None
         # Relight: scale each color by the new direction's shading over its source direction's.
-        rgb = s.palette[rep.clamp(min=0)]
+        ratio = torch.ones_like(shade)
         target, _ = s.field.shading(r["normal"], t["right"], t["up"], t["forward"])
         for src in sources:
             m = origin == src["view"]
             if m.any():
                 source, _ = s.field.shading(r["normal"][m], src["right"], src["up"], src["forward"])
-                rgb[m] = rgb[m] * (target[m] / source.clamp(min=1e-3)).clamp(0.5, 2.0)[:, None]
+                ratio[m] = (target[m] / source.clamp(min=1e-3)).clamp(0.5, 2.0)
+        if self.warp.interpolate:
+            # Within the ramp: the material stays, only the shade changes.
+            return plain, finish(self.ramps.nearest(rep, shade * ratio))
+        rgb = s.palette[rep.clamp(min=0)] * ratio[..., None]
         return plain, finish(quantize(rgb, (rep >= 0).float(), s.palette, self.candidates))
 
     def best_colors(self, r: dict):

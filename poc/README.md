@@ -22,6 +22,8 @@ Only Diablo 1, only still frames.
    - This keeps the artist's pixels, instead of re-quantizing blended colors.
    - The warp is kept coherent, so that neighbouring pixels fetch neighbouring source pixels, from
      the same direction (see [Coherent warps](#coherent-warps)).
+   - Each pixel's material comes from the nearest source pixel, and its shade is interpolated
+     between source pixels of that material (see [Shades](#shades)).
    - Characters get a baked shadow, cast by the reconstruction (see [Shadows](#shadows)).
 
 ```
@@ -243,6 +245,8 @@ pixel count to mean anything.
 
 With the plain warp, another 16% were the field's own colors, in pixels that no direction sees.
 
+Interpolated shades, added later, remove most of what's left of the speckle: see [Shades](#shades).
+
 ## Shadows
 
 Character sprites carry a baked shadow: solid index 0 on the ground, under the character. The light
@@ -277,8 +281,53 @@ directions from above):
   to the streak of the warrior's sword. Most of the disagreement is a shift of a pixel or two along
   the edges, which costs a lot of overlap on shapes this thin.
 
+## Shades
+
+Even with coherent warps, the new directions looked blotchy. Up close, neighbouring pixels of one
+material (one palette ramp) were too often flat duplicates or abrupt jumps of several shades, and
+too rarely one-step gradients. That's what copying the nearest source pixel does: where a surface is
+magnified, pixels are duplicated, and a pixel of misplacement jumps across a gradient.
+
+| Neighbouring pixels of one material, shades apart | 0 | 1 | 2 | 3+ |
+|---------------------------------------------------|--:|--:|--:|---:|
+| originals | 47% | 35% | 11% | 6% |
+| coherent warp | 49% | 29% | 11% | 10% |
+| coherent warp, interpolated shades | 49% | 34% | 10% | 7% |
+
+(The 11 held-out character directions.)
+
+Diablo 1's palette is organized in ramps: runs of one hue from light to dark (`ramps.py`). So a
+pixel's index says two things, its material (the ramp) and its shade (the step along the ramp), and
+the warp now treats them differently (`Warp.interpolate`):
+
+- **The material** comes from the nearest source pixel, as before.
+- **The shade** is interpolated bilinearly between the neighbouring source pixels of the same material
+  and surface, and snapped to the nearest shade of that ramp.
+- **Relighting**, with a lighting model, changes only the shade too: the relit brightness is snapped
+  to the pixel's own ramp, instead of to any palette color.
+
+**Results** (held-out directions):
+
+| Test | Shade | Exact | RGB error | Blurred RGB error | Stray pixels |
+|------|-------|------:|----------:|------------------:|-------------:|
+| Characters, 11 directions | nearest | 20.8% | 18.5 | 10.2 | 5.5% |
+| | interpolated | 21.4% | 18.1 | 10.1 | 4.6% |
+| Characters with a lighting model, 2 directions (relit colors) | nearest | 23.2% | 15.3 | 8.2 | 1.9% |
+| | interpolated | 25.6% | 14.7 | 8.1 | 1.3% |
+| Arrow, 8 directions | nearest | 42.5% | 12.0 | 6.4 | — |
+| | interpolated | 42.3% | 11.8 | 6.4 | — |
+
+- **The texture now matches the originals'.** Stray pixels are within half a point of the
+  originals' rate (4.2% for the 11 character directions, 1.2% for the 2 lit ones), and the spread of
+  shade steps is close to theirs.
+- **Colors improve a little** on characters; the arrow's stay about the same.
+- **With the lighting model, relit colors are the best so far**: 25.6% exact on the warrior's and the
+  zombie's held-out SW (from 22.4% with the plain warp).
+
 ## Next steps
 
+- **Motion:** every picture so far is a single animation frame. Fit every frame of an animation, and
+  check that a new direction doesn't flicker when it plays.
 - **Cleaner surfaces:** a surface representation (2D Gaussian splatting or an SDF) instead of free
   voxels, for more accurate depth. The cameras are calibrated, so gsplat can be tried directly.
 - **Thin parts:** blades and bows still break up. They're a pixel or two wide, so a pixel of error in
@@ -288,8 +337,10 @@ directions from above):
 - **Blending:** where two directions see a surface about equally well, blend their colors and snap
   the blend to the palette, instead of picking one. That would trade some crispness for shading
   between the two directions'.
-- **Lighting:** tried; see above. The lights could be fitted once for the whole game and then held
-  fixed: the shading light and the shadows' light come out the same for every sprite.
+- **Lighting:** relit colors are now the best (see [Shades](#shades)), but on 2 directions only.
+  If more agree, the lighting model should be the default for characters. The lights could also be
+  fitted once for the whole game and then held fixed: the shading light and the shadows' light come
+  out the same for every sprite.
 - **Evaluation:** only the arrows have usable in-between directions. The fireball and the holy bolt
   aren't a rigid model turned: their flames trail along the direction of flight, and the
   reconstruction does worse than reusing the nearest direction. Characters can only be scored by

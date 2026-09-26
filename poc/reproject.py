@@ -2,8 +2,7 @@
 
 For each pixel of the new view, the field gives the visible surface point. That point is projected
 into the known directions, and takes the palette index of one that can see it (its depth there
-matches). Colors therefore come straight from the artist's pixels: no blending and no
-re-quantization.
+matches). Colors therefore come from the artist's pixels, not from the field.
 
 Done pixel by pixel, that speckles: the field's depth is noisy at the scale of a pixel, so
 neighbouring pixels fetch from scattered places, and they switch between directions at random.
@@ -14,6 +13,10 @@ neighbouring pixels fetch from scattered places, and they switch between directi
   directions that shade the surface differently (the light turned with the camera).
 - *Coherence:* inside a surface, neighbouring pixels also pay for using different directions, so
   that regions copy one direction each. Thin parts, a pixel or two wide, choose pixel by pixel.
+- *Shades:* a pixel's material (its palette ramp) is copied from the nearest source pixel, but its
+  shade is interpolated between the neighbouring source pixels of that material, and snapped back
+  to the ramp. Copying the nearest pixel's shade too duplicates pixels where a surface is magnified,
+  and jumps across gradients where it's misplaced.
 """
 
 from dataclasses import dataclass
@@ -36,10 +39,13 @@ class Warp:
     light: tuple = (0.4, 0.75, 0.5)
     tolerance: float = 2.0    # how far (pixels) a point may be from a direction's depth and still be seen
     fill: int = 4             # pixels that no direction sees take a neighbour's color, up to this far in
+    # Keep each pixel's material (palette ramp) from the nearest source pixel, but interpolate its shade
+    # between the neighbouring source pixels of that material (needs a `Ramps`).
+    interpolate: bool = True
 
     @classmethod
     def plain(cls) -> "Warp":
-        return cls(depth="expected", smooth=0, coherence=0.0, shading=0.0, fill=0)
+        return cls(depth="expected", smooth=0, coherence=0.0, shading=0.0, fill=0, interpolate=False)
 
 
 def _windows(x: torch.Tensor, radius: int) -> torch.Tensor:
@@ -118,17 +124,39 @@ def neighbour(x: torch.Tensor, direction: int, outside=0) -> torch.Tensor:
     return out
 
 
-def fetch(points: torch.Tensor, source: dict, tolerance: float):
-    """Palette index (...) at the points' (..., 3) projections into a known direction, and whether that
-    direction sees them."""
+def fetch(points: torch.Tensor, source: dict, tolerance: float, ramps=None):
+    """Where points (..., 3) project into a known direction: the palette index of the pixel there,
+    whether the direction sees the points, and, with `ramps`, the luminance there. The luminance is
+    interpolated (bilinearly) between the neighbouring pixels of the same ramp and surface; without
+    `ramps` it's None."""
     h, w = source["indices"].shape
-    col = torch.floor(points @ source["right"] + source["pivot"][0] + source["offset"][0]).long()
-    row = torch.floor(source["pivot"][1] + source["offset"][1] - points @ source["up"]).long()
+    x = points @ source["right"] + source["pivot"][0] + source["offset"][0]       # in pixels, across
+    y = source["pivot"][1] + source["offset"][1] - points @ source["up"]         # in pixels, down
+    col, row = torch.floor(x).long(), torch.floor(y).long()
     inside = (col >= 0) & (col < w) & (row >= 0) & (row < h)
     col, row = col.clamp(0, w - 1), row.clamp(0, h - 1)
     index = source["indices"][row, col]
-    seen = inside & (index >= 0) & ((points @ source["forward"] - source["depth"][row, col]).abs() < tolerance)
-    return index, seen
+    depth = source["depth"][row, col]
+    seen = inside & (index >= 0) & ((points @ source["forward"] - depth).abs() < tolerance)
+    if ramps is None:
+        return index, seen, None
+    # Bilinear weights of the four pixels whose centers surround the point.
+    left, top = torch.floor(x - 0.5), torch.floor(y - 0.5)
+    fx, fy = x - 0.5 - left, y - 0.5 - top
+    ramp = ramps.of(index)
+    total = torch.zeros_like(x)
+    weight = torch.zeros_like(x)
+    for dy, dx, share in ((0, 0, (1 - fx) * (1 - fy)), (0, 1, fx * (1 - fy)), (1, 0, (1 - fx) * fy), (1, 1, fx * fy)):
+        c, r = left.long() + dx, top.long() + dy
+        ok = (c >= 0) & (c < w) & (r >= 0) & (r < h)
+        c, r = c.clamp(0, w - 1), r.clamp(0, h - 1)
+        other = source["indices"][r, c]
+        ok &= (ramp >= 0) & (ramps.of(other) == ramp) & ((source["depth"][r, c] - depth).abs() < tolerance)
+        share = torch.where(ok, share, torch.zeros_like(share))
+        total = total + share * ramps.luminance[other.clamp(min=0)]
+        weight = weight + share
+    own = ramps.luminance[index.clamp(min=0)]
+    return index, seen, torch.where(weight > 1e-6, total / weight.clamp(min=1e-6), own)
 
 
 def choose(cost: torch.Tensor, seen: torch.Tensor, links: torch.Tensor, coherence: float, iterations: int = 10):
@@ -178,9 +206,11 @@ def _angle(a: float, b: float) -> float:
     return min(d, 360 - d)
 
 
-def reproject(target: dict, sources: list[dict], warp: Warp):
-    """Palette indices (H, W), -1 where transparent or where no source sees the point, and the view
-    of the source each index came from (H, W), -1 where none.
+def reproject(target: dict, sources: list[dict], warp: Warp, ramps=None):
+    """Palette indices (H, W), -1 where transparent or where no source sees the point; the view of the
+    source each index came from (H, W), -1 where none; and, given the palette's `Ramps`, the luminance
+    of each pixel (H, W), else None. With `warp.interpolate`, the luminance is interpolated between
+    source pixels, and the indices carry it: each is the shade of its ramp nearest to it.
 
     target: origins (H, W, 3) on the plane through the world origin, depth (H, W) along forward (the
     kind `warp.depth` names), solid (H, W) bool, yaw, right, up and forward.
@@ -193,7 +223,8 @@ def reproject(target: dict, sources: list[dict], warp: Warp):
     if warp.smooth:
         depth, slope_c, slope_r = smooth_depth(depth, solid, warp.smooth)
     points = target["origins"] + depth[..., None] * target["forward"]
-    fetched = [fetch(points, s, warp.tolerance) for s in sources]
+    interpolate = ramps is not None and warp.interpolate
+    fetched = [fetch(points, s, warp.tolerance, ramps if interpolate else None) for s in sources]
     index = torch.stack([f[0] for f in fetched])                                  # (S, H, W)
     seen = torch.stack([f[1] for f in fetched]) & solid
 
@@ -229,4 +260,9 @@ def reproject(target: dict, sources: list[dict], warp: Warp):
     out[picked] = index.gather(0, labels.clamp(min=0)[None])[0][picked]
     views = torch.tensor([s["view"] for s in sources], device=labels.device)
     origin = torch.where(picked, views[labels.clamp(min=0)], torch.full_like(labels, -1))
-    return out, origin
+    if ramps is None:
+        return out, origin, None
+    if not interpolate:
+        return out, origin, ramps.luminance[out.clamp(min=0)]
+    luminance = torch.stack([f[2] for f in fetched]).gather(0, labels.clamp(min=0)[None])[0]
+    return ramps.nearest(out, luminance), origin, luminance
