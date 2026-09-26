@@ -46,7 +46,7 @@ from poc.animate import write_gif, write_sheet
 from poc.evaluate import quantize, score
 from poc.field import camera_basis
 from poc.gaussians import intrinsics, viewmat
-from poc.scene import masks_for
+from poc.scene import Scene, masks_for
 from poc.views import PRESETS, frame_count, load_views
 
 
@@ -126,6 +126,14 @@ class MovingGaussians(torch.nn.Module):
         identity = torch.tensor([1.0, 0, 0, 0], device=centers.device)
         self.node_quats = torch.nn.Parameter(identity.repeat(frames, nodes, 1))
         self.node_moves = torch.nn.Parameter(torch.zeros((frames, nodes, 3), device=centers.device))
+        # Small per-frame corrections of each Gaussian's position, on top of the nodes' motion, so that
+        # each frame can match its views as closely as a still; and each Gaussian's nearest neighbours,
+        # whose corrections should be alike.
+        self.residuals = torch.nn.Parameter(torch.zeros((frames, len(self.means0), 3), device=centers.device))
+        with torch.no_grad():
+            near = [torch.cdist(chunk, self.means0).topk(5, largest=False).indices[:, 1:]
+                    for chunk in torch.split(self.means0, 4096)]
+        self.register_buffer("gaussian_links", torch.cat(near))
 
     def node_pose(self, phase: float):
         """The nodes' unit quaternions (M, 4) and translations (M, 3) at a phase in model frames."""
@@ -135,12 +143,17 @@ class MovingGaussians(torch.nn.Module):
         return (catmull_rom(F.normalize(self.node_quats, dim=-1), phase, quaternions=True),
                 catmull_rom(self.node_moves, phase))
 
+    def residual(self, phase: float):
+        if float(phase).is_integer():
+            return self.residuals[int(phase) % self.residuals.shape[0]]
+        return catmull_rom(self.residuals, phase)
+
     def pose(self, phase: float):
         """The Gaussians' means (G, 3) and unit quaternions (G, 4) at a phase."""
         rot, move = self.node_pose(phase)
         idx, w = self.bind_idx, self.bind_w[..., None]
         offsets = self.means0[:, None] - self.centers[idx]
-        means = (w * (quat_rotate(rot[idx], offsets) + self.centers[idx] + move[idx])).sum(1)
+        means = (w * (quat_rotate(rot[idx], offsets) + self.centers[idx] + move[idx])).sum(1) + self.residual(phase)
         turns = rot[idx]
         turn = F.normalize((w * same_hemisphere(turns, turns[:, :1])).sum(1), dim=-1)
         return means, quat_multiply(turn, F.normalize(self.quats0, dim=-1))
@@ -159,6 +172,11 @@ class MovingGaussians(torch.nn.Module):
         predicted = quat_rotate(rot[:, None].expand(-1, n.shape[1], -1), c[n] - c[:, None]) + c[:, None] + move[:, None]
         actual = c[n] + move[n]
         return (self.link_w * (predicted - actual).norm(dim=-1)).mean() / self.spacing
+
+    def correction_cost(self, slot: int):
+        """The per-frame corrections' size, and how much neighbouring Gaussians' differ (pixels squared)."""
+        r = self.residuals[slot]
+        return r.square().sum(-1).mean() + (r[self.gaussian_links] - r[:, None]).square().sum(-1).mean()
 
     def smoothness(self):
         """Node paths around the loop: squared second differences of translations and quaternions."""
@@ -212,8 +230,11 @@ def main():
     ap.add_argument("--track-iters", type=int, default=800, help="iterations per frame while tracking")
     ap.add_argument("--refine-iters", type=int, default=3000, help="iterations of the joint refinement")
     ap.add_argument("--arap", type=float, default=0.1, help="weight of the nodes' rigidity")
+    ap.add_argument("--corrections", type=float, default=0.01,
+                    help="weight of the cost of per-frame corrections (0 = no corrections)")
     ap.add_argument("--matching", type=float, default=0.05,
                     help="weight of the pull toward each frame's own still (0 = images only)")
+    ap.add_argument("--refit-stills", action="store_true", help="fit the frames' stills again, even if saved")
     ap.add_argument("--out", default="out")
     args = ap.parse_args()
     device = torch.device("cuda")
@@ -230,8 +251,12 @@ def main():
 
     # 1. Every fitted frame as a still; frame 0 calibrates the camera, and the others share it.
     def still(k, camera=None):
+        tag = "motion-f%d%s" % (k, test)
+        folder = Path(args.out) / fit.run_name(args.preset, split, tag=tag, model="gaussians")
+        if (folder / "scene.pt").exists() and not args.refit_stills:
+            return Scene.load(folder / "scene.pt", args.mpq), folder
         argv = ["--mpq", args.mpq, "--preset", args.preset, "--split", split, "--frame", str(k), "--model",
-                "gaussians", "--tag", "motion-f%d%s" % (k, test), "--out", args.out, "--no-evaluate"]
+                "gaussians", "--tag", tag, "--out", args.out, "--no-evaluate"]
         return fit.main(argv + (["--camera", str(camera)] if camera else []))
 
     still_scene, still_dir = still(0)
@@ -309,13 +334,16 @@ def main():
     opt = torch.optim.Adam([{"params": [model.node_moves], "lr": 0.02}, {"params": [model.node_quats], "lr": 0.002},
                             {"params": [model.means0], "lr": 0.005}, {"params": [model.quats0], "lr": 0.001},
                             {"params": [model.scales], "lr": 0.002}, {"params": [model.opacities], "lr": 0.01},
-                            {"params": [model.colors], "lr": 0.01}])
+                            {"params": [model.colors], "lr": 0.01}]
+                           + ([{"params": [model.residuals], "lr": 0.01}] if args.corrections else []))
     t0 = time.time()
     for it in range(args.refine_iters):
         j = it % len(frames)
         targets, masks = all_targets[j]
         colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
         loss = image_loss(colors, alphas, targets, masks) + args.arap * model.arap(j) + 0.01 * model.smoothness()
+        if args.corrections:
+            loss = loss + args.corrections * model.correction_cost(j)
         opt.zero_grad()
         loss.backward()
         opt.step()

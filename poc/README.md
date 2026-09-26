@@ -444,7 +444,12 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --hide-fram
    from further: blurred copies of the images, and each Gaussian's nearest same-colored Gaussian in
    that frame's still (a chamfer distance, recomputed now and then, as in ICP).
 3. All frames are refined together, the last tied to the first, with the node paths kept smooth.
-4. A phase between frames interpolates the node poses periodically.
+   Each Gaussian also gets a small correction of its position per frame, on top of the nodes'
+   motion. That lets each frame match its views about as closely as a still, while the nodes carry
+   the motion; the corrections are kept small, and alike between neighbours.
+4. A phase between frames interpolates the node poses (and the corrections) periodically.
+
+The frames' stills are saved, and reused by later runs (`--refit-stills` fits them again).
 
 The output samples the torus at twice the resolution on both axes: 16 directions by twice the
 frames.
@@ -453,19 +458,27 @@ frames.
   neighbours (as in Dynamic 3D Gaussians), smeared the swinging legs: the frames' silhouettes fell to
   0.64–0.83 IoU. With 256 nodes, the walk moves coherently.
 
-| Test (warrior's walk) | Silhouette IoU | Exact | RGB error |
-|-----------------------|---------------:|------:|----------:|
-| Fitted frames and directions | 0.87 | 34% | 11.4 |
-| SW hidden in all frames | 0.78 | 21% | 17.7 |
-| Odd frames hidden, interpolated | 0.72 | 24% | 15.6 |
-| Odd frames hidden, the previous frame repeated | 0.71 | 33% | 13.9 |
+| Test | Nodes only: IoU / RGB error | With corrections: IoU / RGB error |
+|------|----------------------------:|----------------------------------:|
+| Warrior's walk, fitted frames and directions | 0.87 / 11.4 | 0.93 / 9.2 |
+| Warrior's walk, SW hidden in all frames | 0.78 / 17.7 | 0.80 / 15.6 |
+| Warrior's walk, odd frames hidden | 0.72 / 15.6 | 0.72 / 15.0 |
+| Zombie's walk, odd frames hidden | | 0.91 / 13.0 |
 
-- **Interpolation in time doesn't beat repeating the previous frame yet.** The interpolated
-  silhouettes overlap the truth only as well. (Their colors score worse too, but the repeated frame
-  is the artist's own pixels, at the wrong pose.)
-- **The fit is what limits it.** The moving model reproduces even its own frames at 0.87 IoU, where
-  independent stills reach about 0.96, and interpolated frames can't be better than the frames
-  around them.
+The baseline for hidden frames is the previous frame repeated, as a game would show it: 0.71 / 13.9
+on the warrior's walk, 0.79 / 13.1 on the zombie's.
+
+- **The corrections close most of the fit gap.** The hidden direction then matches the stills'
+  silhouettes (0.80), with better colors than theirs (an RGB error of 15.6 against 16.6).
+- **In time, it takes frames close enough together.** With the zombie's 24 frames, hiding every
+  other one leaves 12 per cycle, and the interpolated silhouettes overlap the truth far better than
+  the repeated frame's (0.91 against 0.79), in colors as good as the artist's own pixels at the wrong
+  pose.
+- **The warrior's 8 frames, hiding every other one, are too few.** Between the 4 left, the legs pass
+  each other, and nothing tells them apart: seen from the side, frames 0 and 2 look alike. So the
+  tracker keeps each leg where it is, and the interpolated frames keep the legs apart when they
+  should be passing. Tracking all 8 frames (the real task: 16 from 8), the feet do swing in opposite
+  phase, crossing between frames 0 and 2, about 5 pixels either way.
 
 ## Next steps
 
