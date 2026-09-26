@@ -50,6 +50,16 @@ def _frame_to_array(frame: Frame) -> np.ndarray:
         frame.height, frame.width)
 
 
+def frame_count(mpq_path: str, preset: Preset) -> int:
+    """How many animation frames the preset's sprite has (1 for missiles stored as one frame per
+    direction)."""
+    if preset.layout == "frames":
+        return 1
+    with MpqArchive(mpq_path) as mpq:
+        path = preset.path if preset.layout == "sheet" else preset.path.format(1)
+        return len(load_cl2(mpq.read(path), preset.width)[0])
+
+
 def load_views(mpq_path: str, preset: Preset) -> tuple[list[View], np.ndarray]:
     """The views, in increasing yaw, and the palette (256, 3) as floats in [0, 1]."""
     with MpqArchive(mpq_path) as mpq:

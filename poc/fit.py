@@ -15,6 +15,7 @@ turntable.gif. See poc/README.md.
 """
 
 import argparse
+import dataclasses
 import math
 import time
 from pathlib import Path
@@ -25,6 +26,13 @@ from poc.evaluate import add_warp_arguments, evaluate, warp_from_args
 from poc.field import VoxelField, allowed_masks, camera_basis, carve, silhouettes
 from poc.scene import Scene, make_field, masks_for
 from poc.views import PRESETS, load_views
+
+
+def run_name(preset: str, split: str, lighting: str = "phong", lights: int = 1, harmonics: int = 0,
+             tag: str = "") -> str:
+    """A fit's output folder: <preset>-<split>-<colors>[-<tag>] (see the module's docstring)."""
+    colors = "h%d" % harmonics if lighting == "none" else "%s%d" % (lighting, lights)
+    return "%s-%s-%s%s" % (preset, split.replace(":", ""), colors, ("-" + tag) if tag else "")
 
 
 def split_indices(n: int, split: str) -> tuple[list[int], list[int]]:
@@ -65,7 +73,8 @@ def calibrate(field, views, masks, yaws, device, elevations, offsets):
     return best
 
 
-def main():
+def main(argv=None):
+    """Fit and evaluate, as the command line (or argv) says. Returns the fitted scene and its folder."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
     ap.add_argument("--preset", required=True, choices=sorted(PRESETS))
@@ -102,21 +111,20 @@ def main():
     ap.add_argument("--no-hull", action="store_true", help="don't confine density to the visual hull")
     ap.add_argument("--out", default="out")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-evaluate", action="store_true", help="save the fit without scoring it or drawing pictures")
     add_warp_arguments(ap)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     preset = PRESETS[args.preset]
     if args.frame is not None:
-        preset.frame = args.frame
+        preset = dataclasses.replace(preset, frame=args.frame)
     views, palette_np = load_views(args.mpq, preset)
     palette = torch.as_tensor(palette_np, device=device)
     masks = masks_for(views, preset.shadows, device)
     train, test = split_indices(len(views), args.split)
-    color_model = "h%d" % args.harmonics if args.lighting == "none" else "%s%d" % (args.lighting, args.lights)
-    out_dir = Path(args.out) / ("%s-%s-%s%s" % (args.preset, args.split.replace(":", ""), color_model,
-                                                ("-" + args.tag) if args.tag else ""))
+    out_dir = Path(args.out) / run_name(args.preset, args.split, args.lighting, args.lights, args.harmonics, args.tag)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # A box generous enough for any elevation we try.
@@ -244,7 +252,9 @@ def main():
     scene.save(out_dir / "scene.pt")
 
     # 3. Scores and pictures of the held-out and in-between directions (evaluate.py).
-    evaluate(scene, out_dir, warp_from_args(args))
+    if not args.no_evaluate:
+        evaluate(scene, out_dir, warp_from_args(args))
+    return scene, out_dir
 
 
 if __name__ == "__main__":

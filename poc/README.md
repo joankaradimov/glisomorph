@@ -351,11 +351,22 @@ python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --split all --
   area per frame, against 41% for the originals' baked shadows, although each frame fits its own
   shadow light.
 
+**`animate.py`** does all this for a whole animation. It fits every frame on all 8 directions, with
+frame 0's camera shared, fits the shadows' light once, and writes the animation in 16 directions
+to `out/<preset>-16/`:
+- `sheet.png`: a row per direction (from S clockwise, originals and new ones alternating) and a
+  column per frame, at the frames' own size and anchor, in the palette, with index 255 transparent;
+- `directions.gif`: the 16 directions animated, to watch.
+
+```
+python -m poc.animate --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk
+```
+
 ## Next steps
 
-- **Animations:** checked on one walk so far. A tool that fits every frame of an animation (with a
-  shared camera) and writes its 16 directions would make the others easy to check: the zombie's walk
-  has 24 frames, and the attacks are wider sprites.
+- **Animations:** checked on the warrior's walk so far. The zombie's walk has 24 frames; the attacks
+  are wider sprites (their frames don't load at the preset widths yet); deaths and hits are still to
+  be seen.
 - **Cleaner surfaces:** a surface representation (2D Gaussian splatting or an SDF) instead of free
   voxels, for more accurate depth. The cameras are calibrated, so gsplat can be tried directly.
 - **Thin parts:** blades and bows still break up. A blade's silhouette survives (its opacity stays
