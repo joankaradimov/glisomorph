@@ -29,8 +29,11 @@ def masks_for(views: list[View], shadows: bool, device) -> list[torch.Tensor]:
     return out
 
 
-def make_field(config: dict, device) -> VoxelField:
-    """An empty field of the kind and size that `config` describes."""
+def make_field(config: dict, device, count: int = 0):
+    """An empty field of the kind and size that `config` describes: voxels, or `count` Gaussians."""
+    if config.get("model") == "gaussians":
+        from poc.gaussians import GaussianField  # needs gsplat
+        return GaussianField(count, device)
     if config["lighting"] != "none":
         return LitVoxelField(config["box_min"], config["box_max"], config["voxel"], device,
                              lights=config["lights"], specular=config["lighting"] == "phong",
@@ -40,7 +43,7 @@ def make_field(config: dict, device) -> VoxelField:
 
 @dataclass
 class Scene:
-    field: VoxelField
+    field: torch.nn.Module       # a VoxelField, or a GaussianField (gaussians.py)
     views: list[View]
     masks: list[torch.Tensor]    # per view: 1 where the model is seen, 0 elsewhere
     palette: torch.Tensor        # (256, 3) in [0, 1]
@@ -79,16 +82,22 @@ class Scene:
         return camera_basis(yaw_deg, self.elevation)
 
     def save(self, path: Path) -> None:
-        # Only the grids around the visual hull are saved: elsewhere the density is masked out. Two
-        # voxels of margin keep interpolation at the hull's edge exact.
+        state = self.field.state_dict()
+        corner = [0, 0, 0]
+        if isinstance(self.field, VoxelField):
+            # Only the grids around the visual hull are saved: elsewhere the density is masked out.
+            # Two voxels of margin keep interpolation at the hull's edge exact.
+            state, corner = self._cropped(state)
+        torch.save({"config": self.config, "field": state, "corner": corner,
+                    "elevation": float(self.elevation), "offset": [float(x) for x in self.offset],
+                    "samples": self.samples}, path)
+
+    def _cropped(self, state: dict):
         hull = self.field.support[0, 0].nonzero()
         lo = (hull.min(0).values - 2).clamp(min=0).tolist() if len(hull) else [0, 0, 0]
         hi = (hull.max(0).values + 3).tolist() if len(hull) else list(self.field.support.shape[2:])
-        state = {k: v[..., lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]].clone() if v.dim() == 5 else v
-                 for k, v in self.field.state_dict().items()}
-        torch.save({"config": self.config, "field": state, "corner": lo,
-                    "elevation": float(self.elevation), "offset": [float(x) for x in self.offset],
-                    "samples": self.samples}, path)
+        return {k: v[..., lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]].clone() if v.dim() == 5 else v
+                for k, v in state.items()}, lo
 
     @classmethod
     def load(cls, path, mpq_path: str, device=None) -> "Scene":
@@ -97,17 +106,21 @@ class Scene:
         config = data["config"]
         preset = dataclasses.replace(PRESETS[config["preset"]], frame=config["frame"])
         views, palette = load_views(mpq_path, preset)
-        field = make_field(config, device)
-        # Put the saved part of each grid back in place; outside it, nothing may have density.
-        state = {k: v.clone() for k, v in field.state_dict().items()}
-        state["support"].zero_()
-        z, y, x = data.get("corner", [0, 0, 0])
-        for k, v in data["field"].items():
-            if v.dim() == 5:
-                state[k][..., z:z + v.shape[2], y:y + v.shape[3], x:x + v.shape[4]] = v
-            else:
-                state[k] = v
-        field.load_state_dict(state)
+        if config.get("model") == "gaussians":
+            field = make_field(config, device, len(data["field"]["params.means"]))
+            field.load_state_dict(data["field"])
+        else:
+            field = make_field(config, device)
+            # Put the saved part of each grid back in place; outside it, nothing may have density.
+            state = {k: v.clone() for k, v in field.state_dict().items()}
+            state["support"].zero_()
+            z, y, x = data.get("corner", [0, 0, 0])
+            for k, v in data["field"].items():
+                if v.dim() == 5:
+                    state[k][..., z:z + v.shape[2], y:y + v.shape[3], x:x + v.shape[4]] = v
+                else:
+                    state[k] = v
+            field.load_state_dict(state)
         yaws = config["yaw_sign"] * torch.tensor([v.yaw for v in views], dtype=torch.float32, device=device)
         return cls(field=field, views=views, masks=masks_for(views, preset.shadows, device),
                    palette=torch.as_tensor(palette, device=device), yaws=yaws,

@@ -229,7 +229,7 @@ def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
     palette_np = palette.cpu().numpy()
     palette_u8 = (palette_np * 255).round().astype(np.uint8)
     renderer = Renderer(scene, warp)
-    if scene.preset.shadows:
+    if scene.preset.shadows and hasattr(scene.field, "sigma"):  # shadows need a density to march through
         renderer.light, _ = fit_light(scene, train)
 
     # 1. Scores. A known direction's reprojection never uses that direction itself. Colors are scored

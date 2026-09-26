@@ -29,9 +29,12 @@ from poc.views import PRESETS, load_views
 
 
 def run_name(preset: str, split: str, lighting: str = "phong", lights: int = 1, harmonics: int = 0,
-             tag: str = "") -> str:
+             tag: str = "", model: str = "voxels") -> str:
     """A fit's output folder: <preset>-<split>-<colors>[-<tag>] (see the module's docstring)."""
-    colors = "h%d" % harmonics if lighting == "none" else "%s%d" % (lighting, lights)
+    if model == "gaussians":
+        colors = "gauss"
+    else:
+        colors = "h%d" % harmonics if lighting == "none" else "%s%d" % (lighting, lights)
     return "%s-%s-%s%s" % (preset, split.replace(":", ""), colors, ("-" + tag) if tag else "")
 
 
@@ -83,6 +86,8 @@ def main(argv=None):
     ap.add_argument("--harmonics", type=int, default=0,
                     help="order of a Fourier series in yaw for view-dependent color (0 = none; order 2 "
                          "overfit in tests)")
+    ap.add_argument("--model", default="voxels", choices=["voxels", "gaussians"],
+                    help="what represents the sprite: a voxel field, or 3D Gaussians (gaussians.py; needs gsplat)")
     ap.add_argument("--lighting", default="phong", choices=["none", "lambert", "phong"],
                     help="shade albedo with directional lights fixed relative to the camera; 'none' fits plain "
                          "colors")
@@ -124,7 +129,8 @@ def main(argv=None):
     palette = torch.as_tensor(palette_np, device=device)
     masks = masks_for(views, preset.shadows, device)
     train, test = split_indices(len(views), args.split)
-    out_dir = Path(args.out) / run_name(args.preset, args.split, args.lighting, args.lights, args.harmonics, args.tag)
+    out_dir = Path(args.out) / run_name(args.preset, args.split, args.lighting, args.lights, args.harmonics, args.tag,
+                                        args.model)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # A box generous enough for any elevation we try.
@@ -170,23 +176,36 @@ def main(argv=None):
     elev = torch.tensor(math.radians(elev_deg), device=device)
     right, up, _ = camera_basis(yaws, elev)
 
-    # 2. The field, started from the visual hull of the training views.
-    lit = args.lighting != "none"
+    # 2. The field, started from the visual hull of the training views: voxels, or a Gaussian at each
+    #    voxel of the hull (gaussians.py, unlit for now).
+    gaussians = args.model == "gaussians"
+    lit = args.lighting != "none" and not gaussians
     config = {"preset": args.preset, "frame": preset.frame, "split": args.split, "train_views": train,
-              "test_views": test if args.split != "all" else [], "lighting": args.lighting,
-              "lights": args.lights, "harmonics": args.harmonics, "coupled_normals": args.coupled_normals,
-              "voxel": args.voxel, "box_min": box_min, "box_max": box_max, "supersample": args.supersample,
-              "yaw_sign": sign}
-    field = make_field(config, device)
+              "test_views": test if args.split != "all" else [], "model": args.model,
+              "lighting": args.lighting if lit else "none", "lights": args.lights, "harmonics": args.harmonics,
+              "coupled_normals": args.coupled_normals, "voxel": args.voxel, "box_min": box_min, "box_max": box_max,
+              "supersample": args.supersample, "yaw_sign": sign}
     yaw_rad = torch.deg2rad(yaws)
-    inside = carve(field, allowed_masks(train_masks), train_views, right[train], up[train], off)
-    with torch.no_grad():
-        field.density[0, 0][inside] = 4.0
-    if not args.no_hull:
-        field.restrict_to(inside)
-    depth = (field.box_max - field.box_min).norm().item()
+    if gaussians:
+        from poc.gaussians import GaussianField  # needs gsplat
+        grid = VoxelField(box_min, box_max, args.voxel, device)
+        inside = carve(grid, allowed_masks(train_masks), train_views, right[train], up[train], off)
+        field = GaussianField.from_points(grid.voxel_centers()[inside], args.voxel)
+        print("%d Gaussians, one per voxel of the visual hull" % len(field.params["means"]))
+    else:
+        field = make_field(config, device)
+        inside = carve(field, allowed_masks(train_masks), train_views, right[train], up[train], off)
+        with torch.no_grad():
+            field.density[0, 0][inside] = 4.0
+        if not args.no_hull:
+            field.restrict_to(inside)
+    depth = (torch.tensor(box_max) - torch.tensor(box_min)).norm().item()
     samples = int(depth / args.voxel)
-    if lit:
+    if gaussians:
+        if args.refine_camera:
+            raise SystemExit("--refine-camera isn't supported with --model gaussians")
+        opt = None  # they train with their own optimizers (GaussianField.fit)
+    elif lit:
         light_ids = {id(p) for p in field.light_parameters()}
         groups = [{"params": [p for p in field.parameters() if id(p) not in light_ids], "lr": args.lr},
                   {"params": field.light_parameters(), "lr": args.light_lr}]
@@ -201,7 +220,7 @@ def main(argv=None):
         # 1e-3 radians is about 0.06 degrees, 2e-2 pixels is 1/50 of a pixel, both decaying tenfold.
         opt.add_param_group({"params": [elev_param], "lr": args.camera_lr})
         opt.add_param_group({"params": [off_param], "lr": args.camera_lr * 20})
-    sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=(0.1) ** (1 / args.iters))
+    sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=(0.1) ** (1 / args.iters)) if opt else None
     targets = [(palette[torch.as_tensor(views[i].indices, device=device).long().clamp(min=0)], masks[i])
                for i in train]
 
@@ -209,36 +228,48 @@ def main(argv=None):
         return (((p[..., 1:, :, :] - p[..., :-1, :, :]) ** 2).mean() + ((p[..., :, 1:, :] - p[..., :, :-1, :]) ** 2).mean()
                 + ((p[..., :, :, 1:] - p[..., :, :, :-1]) ** 2).mean())
 
-    t0 = time.time()
-    for it in range(args.iters):
-        if args.refine_camera and it == args.refine_from:
-            elev_param.requires_grad_(True)
-            off_param.requires_grad_(True)
-        opt.zero_grad()
-        total = 0.0
-        # One backward pass per view keeps memory to a single view's rays, supersampled or not.
-        for k, i in enumerate(train):
-            if lit:
-                field.begin_step()
-            r, u, f = camera_basis(yaws[i:i + 1], elev_param)
-            h, w = views[i].shape
-            rgb, alpha = field.render(h, w, views[i].pivot, off_param, r[0], u[0], f[0], samples,
-                                      jitter=True, yaw_rad=yaw_rad[i], supersample=args.supersample)
-            color, m = targets[k]
-            solid = m == 1
-            loss = ((rgb - color) ** 2)[solid].mean()
-            loss = loss + 0.5 * torch.nn.functional.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), solid.float())
-            if args.sparsity:
-                # Prefer the fewest voxels that explain every view: phantom copies cost extra.
-                loss = loss + args.sparsity * field.last_alpha[solid].sum(-1).mean()
-            (loss / len(train)).backward()
-            total += loss.item() / len(train)
-        regularizer = args.tv * tv(field.density) + args.color_tv * tv(field.color)
-        regularizer.backward()
-        opt.step()
-        sched.step()
-        if it % 500 == 0 or it == args.iters - 1:
-            print("iter %5d  loss %.5f  (%.0fs)" % (it, total + regularizer.item(), time.time() - t0))
+    if gaussians:
+        # All training views at once, with densification (gaussians.py).
+        from poc.gaussians import intrinsics, viewmat
+        r, u, f = camera_basis(yaws[train], elev)
+        field.fit(torch.stack([viewmat(r[k], u[k], f[k]) for k in range(len(train))]),
+                  torch.stack([intrinsics(views[i].pivot, off, device) for i in train]),
+                  torch.stack([t[0] for t in targets]), torch.stack([t[1] == 1 for t in targets]),
+                  iters=args.iters, lr=args.lr)
+    else:
+        t0 = time.time()
+        for it in range(args.iters):
+            if args.refine_camera and it == args.refine_from:
+                elev_param.requires_grad_(True)
+                off_param.requires_grad_(True)
+            opt.zero_grad()
+            total = 0.0
+            # One backward pass per view keeps memory to a single view's rays, supersampled or not.
+            for k, i in enumerate(train):
+                if lit:
+                    field.begin_step()
+                r, u, f = camera_basis(yaws[i:i + 1], elev_param)
+                h, w = views[i].shape
+                rgb, alpha = field.render(h, w, views[i].pivot, off_param, r[0], u[0], f[0], samples,
+                                          jitter=True, yaw_rad=yaw_rad[i], supersample=args.supersample)
+                color, m = targets[k]
+                solid = m == 1
+                loss = ((rgb - color) ** 2)[solid].mean()
+                loss = loss + 0.5 * torch.nn.functional.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), solid.float())
+                if args.sparsity and not gaussians:
+                    # Prefer the fewest voxels that explain every view: phantom copies cost extra.
+                    loss = loss + args.sparsity * field.last_alpha[solid].sum(-1).mean()
+                (loss / len(train)).backward()
+                total += loss.item() / len(train)
+            if gaussians:
+                regularizer = field.regularizer()
+            else:
+                regularizer = args.tv * tv(field.density) + args.color_tv * tv(field.color)
+            regularizer.backward()
+            opt.step()
+            sched.step()
+            if it % 500 == 0 or it == args.iters - 1:
+                print("iter %5d  loss %.5f  (%.0fs)" % (it, total + regularizer.item(), time.time() - t0))
 
     if args.refine_camera:
         off = tuple(off_param.detach().tolist())

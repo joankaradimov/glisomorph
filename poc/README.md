@@ -375,12 +375,108 @@ With `animate.py` (and the lighting model), the new directions move and change l
 
 (The attack's frames are 128 pixels wide: `--preset warrior-attack`.)
 
+## Gaussians
+
+The voxel field is soft at the scale of a pixel, and nothing in it is thinner than a voxel. A 3D
+Gaussian can be a fraction of a pixel thick and turned any way. `gaussians.py` represents a sprite
+with them, rendered by [gsplat](https://github.com/nerfstudio-project/gsplat)'s rasterizer in its
+orthographic mode, which is exactly the turntable camera: one pixel per world unit, with the world
+origin at the pivot. It has the voxel field's `render()`, so copying pixels, scores and pictures work
+unchanged.
+
+```
+python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior --split holdout:1 --model gaussians
+```
+
+A Gaussian starts at each voxel of the visual hull. All directions are rendered in one call per
+step, and gsplat's densification clones and splits Gaussians where the views pull hardest. They're
+unlit for now: a color each, no lighting model and no shadows.
+
+**Setup.** gsplat compiles CUDA code, and PyTorch only builds extensions against a CUDA toolkit of
+its own major version. On Windows, this worked:
+- PyTorch built for CUDA 13 (`torch==2.11.0+cu130`), the CUDA 13.2 toolkit, and Visual Studio 2022's
+  compiler (from `vcvars64.bat`);
+- gsplat 1.5.3 installed from a clone of its source, with submodules (`pip install
+  --no-build-isolation .`), so that it compiles once, at install time;
+- `NVCC_FLAGS=-Xcompiler /Zc:preprocessor`, because CUDA 13's headers refuse MSVC's traditional
+  preprocessor;
+- the Python environment's own `ninja` first on `PATH`: MSYS2's runs commands through `/bin/sh`,
+  which mangles Windows paths;
+- `TORCH_CUDA_ARCH_LIST` set to the GPU's architecture, to compile for it alone.
+
+**Still results** (held-out directions):
+
+| Test | Model | Silhouette IoU | Copied pixels: exact / RGB error |
+|------|-------|---------------:|----------------------------------|
+| Warrior's stance, SW hidden | voxels | 0.864 | 22.6% / 16.5 |
+| | Gaussians | 0.854 | 22.5% / 17.5 |
+| Warrior's walk, SW hidden in all 8 frames | voxels (lighting model, relit) | 0.754 | 30.2% / 15.3 |
+| | Gaussians | 0.803 | 26.8% / 16.2 |
+
+- **They fit five times faster:** 19 seconds for 3,000 iterations.
+- **Their silhouettes** are about as good on the stance, and better on the walk.
+- **Their own colors** are much cleaner than the voxels': 4.1% stray pixels against 12.4% on the
+  stance, 2.9% against 6.7% on the walk. Blades stay whole in them. With copied pixels, the blades'
+  zigzag comes back.
+- **Copied pixels are still better colored with voxels**, because only voxels have the lighting
+  model, and so relighting, so far.
+
+### Moving Gaussians
+
+`motion.py` fits a whole looping animation with one set of Gaussians. A looping animation is a
+torus: the directions go around one circle, and the frames around another. A direction is the
+camera turning around the model, which calibration already knows. A frame is the model changing
+pose, which has to be learned. So the Gaussians' shape, opacity and color are shared by every
+frame, and a few hundred nodes move them, as in SC-GS (embedded deformation). Each node has a
+rotation and a translation per frame, each Gaussian follows its 4 nearest nodes, and neighbouring
+nodes are held rigid to each other.
+
+```
+python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk
+python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --hide-direction 1
+python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --hide-frames odd
+```
+
+1. Every frame is fitted as a still. Frame 0 calibrates the camera, and its Gaussians become the
+   moving ones.
+2. Frame by frame, the nodes move the Gaussians to fit the next frame's views. Images only pull a
+   Gaussian from a pixel or so away, and a leg moves several pixels per frame, so two things pull
+   from further: blurred copies of the images, and each Gaussian's nearest same-colored Gaussian in
+   that frame's still (a chamfer distance, recomputed now and then, as in ICP).
+3. All frames are refined together, the last tied to the first, with the node paths kept smooth.
+4. A phase between frames interpolates the node poses periodically.
+
+The output samples the torus at twice the resolution on both axes: 16 directions by twice the
+frames.
+
+- **Nodes are needed.** Moving every Gaussian on its own, held together only by its nearest
+  neighbours (as in Dynamic 3D Gaussians), smeared the swinging legs: the frames' silhouettes fell to
+  0.64–0.83 IoU. With 256 nodes, the walk moves coherently.
+
+| Test (warrior's walk) | Silhouette IoU | Exact | RGB error |
+|-----------------------|---------------:|------:|----------:|
+| Fitted frames and directions | 0.87 | 34% | 11.4 |
+| SW hidden in all frames | 0.78 | 21% | 17.7 |
+| Odd frames hidden, interpolated | 0.72 | 24% | 15.6 |
+| Odd frames hidden, the previous frame repeated | 0.71 | 33% | 13.9 |
+
+- **Interpolation in time doesn't beat repeating the previous frame yet.** The interpolated
+  silhouettes overlap the truth only as well. (Their colors score worse too, but the repeated frame
+  is the artist's own pixels, at the wrong pose.)
+- **The fit is what limits it.** The moving model reproduces even its own frames at 0.87 IoU, where
+  independent stills reach about 0.96, and interpolated frames can't be better than the frames
+  around them.
+
 ## Next steps
 
 - **Animations:** checked on two walks and an attack. Hits, deaths and spells, and the other
   characters, are still to be seen; every animation needs its own preset, with its frame width.
-- **Cleaner surfaces:** a surface representation (2D Gaussian splatting or an SDF) instead of free
-  voxels, for more accurate depth. The cameras are calibrated, so gsplat can be tried directly.
+- **Moving Gaussians' fit:** small per-frame corrections for each Gaussian on top of the nodes'
+  motion, so that each frame can match its views as closely as a still.
+- **Gaussians' colors:** the lighting model, relit copied pixels, and shadows (a render from the
+  light instead of marching through voxels).
+- **Cleaner surfaces:** 2D Gaussians (flat discs) would give sharper depth than 3D ones, but gsplat's
+  2D rasterizer has no orthographic mode.
 - **Thin parts:** blades and bows still break up. A blade's silhouette survives (its opacity stays
   above a half along its length), but its colors don't. The original blade is two lines, light and
   dark, and the warp's fetch positions zigzag between them, because the reconstruction's depth along
