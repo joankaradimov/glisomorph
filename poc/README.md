@@ -362,11 +362,23 @@ to `out/<preset>-16/`:
 python -m poc.animate --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk
 ```
 
+With `animate.py` (and the lighting model), the new directions move and change like the originals:
+
+| Animation | Directions | Sideways per frame | Pixels changing per frame | Shadow changing per frame |
+|-----------|------------|-------------------:|--------------------------:|--------------------------:|
+| Warrior's walk, 8 frames | originals | 0.19 px | 68% | 41% |
+| | new | 0.20 px | 72% | 37% |
+| Zombie's walk, 24 frames | originals | 0.57 px | 66% | 28% |
+| | new | 0.61 px | 71% | 29% |
+| Warrior's attack, 16 frames | originals | 1.44 px | 68% | 45% |
+| | new | 1.41 px | 73% | 47% |
+
+(The attack's frames are 128 pixels wide: `--preset warrior-attack`.)
+
 ## Next steps
 
-- **Animations:** checked on the warrior's walk so far. The zombie's walk has 24 frames; the attacks
-  are wider sprites (their frames don't load at the preset widths yet); deaths and hits are still to
-  be seen.
+- **Animations:** checked on two walks and an attack. Hits, deaths and spells, and the other
+  characters, are still to be seen; every animation needs its own preset, with its frame width.
 - **Cleaner surfaces:** a surface representation (2D Gaussian splatting or an SDF) instead of free
   voxels, for more accurate depth. The cameras are calibrated, so gsplat can be tried directly.
 - **Thin parts:** blades and bows still break up. A blade's silhouette survives (its opacity stays
@@ -375,8 +387,11 @@ python -m poc.animate --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk
   something a pixel or two wide is poor. Blending the source colors across materials in parts under
   3 pixels wide, then snapping them to the palette, helped only a little: the arrow's exact matches
   rose from 42.3% to 43.8%, and the blades still zigzag. Finer voxels (0.6 pixels) didn't help
-  either. Thin parts may need to be drawn rather than warped: a blade's centerline and its two tones,
-  found in the originals, carried over as a line.
+  either. Along the blade, pixels also alternate between source directions (in one new direction,
+  30 of 60 came from one, 16 from another, 10 from a third), and extending one direction per region
+  to thin parts doesn't hold them together: it changes nothing visible on the blades and costs the
+  arrow 4.5 points of exact matches. Thin parts may need to be drawn rather than warped: a blade's
+  centerline and its two tones, found in the originals, carried over as a line.
 - **A ceiling:** render a known 3D model into 8 + 8 directions and run the pipeline on it. That would
   show how many exact pixels are achievable at all.
 - **Blending:** where two directions see a surface about equally well, blend their colors and snap

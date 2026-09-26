@@ -38,6 +38,7 @@ PRESETS = {
     "holy": Preset("missiles/holy{}.cl2", 96, "files", pivot=(46.5, 36.0)),
     "warrior": Preset("plrgfx/warrior/wls/wlsas.cl2", 96, "sheet", shadows=True),
     "warrior-walk": Preset("plrgfx/warrior/wls/wlsaw.cl2", 96, "sheet", shadows=True),  # 8 frames
+    "warrior-attack": Preset("plrgfx/warrior/wls/wlsat.cl2", 128, "sheet", shadows=True),  # 16 frames
     "rogue": Preset("plrgfx/rogue/rls/rlsas.cl2", 96, "sheet", shadows=True),
     "zombie": Preset("monsters/zombie/zombien.cl2", 128, "sheet", shadows=True),
     "zombie-walk": Preset("monsters/zombie/zombiew.cl2", 128, "sheet", shadows=True),  # 24 frames

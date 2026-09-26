@@ -166,6 +166,7 @@ class Renderer:
         return {"pred": quantize(rgb, alpha, s.palette, self.candidates), "alpha": alpha, "target": target,
                 "normal": s.field.last_normal if s.lit else None}
 
+    @torch.no_grad()
     def colored(self, r: dict, exclude=None):
         """(reprojected, relit) palette indices; relit is None without a lighting model. Pixels that no
         known direction sees take a neighbour's color (`Warp.fill`), or else keep the field's.
@@ -200,6 +201,7 @@ class Renderer:
         plain, relit = self.colored(r)
         return relit if relit is not None else plain
 
+    @torch.no_grad()
     def shadow(self, r: dict):
         """Where the direction shows its baked shadow (H, W): ground in shadow that the model doesn't
         hide. None without a shadow light."""
