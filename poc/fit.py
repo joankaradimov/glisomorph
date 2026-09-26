@@ -8,9 +8,10 @@ Splits:
 - "holdout:K" trains on every direction but K;
 - "all" trains on everything (tests how well the training views are reproduced).
 
-Outputs go to out/<preset>-<split>-h<harmonics>[-<tag>]/: the fitted scene (scene.pt), and what
-evaluate.py makes of it: metrics.json, views.npz, compare.png, in_between.png and turntable.gif.
-See poc/README.md.
+Outputs go to out/<preset>-<split>-<colors>[-<tag>]/, where <colors> is the lighting model and its
+number of lights (phong1 by default), or h<harmonics> without one: the fitted scene (scene.pt), and
+what evaluate.py makes of it: metrics.json, views.npz, compare.png, in_between.png and
+turntable.gif. See poc/README.md.
 """
 
 import argparse
@@ -73,8 +74,9 @@ def main():
     ap.add_argument("--harmonics", type=int, default=0,
                     help="order of a Fourier series in yaw for view-dependent color (0 = none; order 2 "
                          "overfit in tests)")
-    ap.add_argument("--lighting", default="none", choices=["none", "lambert", "phong"],
-                    help="shade albedo with directional lights fixed relative to the camera")
+    ap.add_argument("--lighting", default="phong", choices=["none", "lambert", "phong"],
+                    help="shade albedo with directional lights fixed relative to the camera; 'none' fits plain "
+                         "colors")
     ap.add_argument("--lights", type=int, default=1, choices=[1, 2])
     ap.add_argument("--light-lr", type=float, default=0.01)
     ap.add_argument("--coupled-normals", action="store_true",

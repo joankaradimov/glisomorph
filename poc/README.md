@@ -28,8 +28,8 @@ Only Diablo 1, only still frames.
 
 ```
 python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior --split all
-python -m poc.evaluate out/warrior-all-h0 --mpq PATH/TO/DIABDAT.MPQ --warp plain --out out/warrior-plain
-python -m poc.zoom out/warrior-all-h0 --mpq PATH/TO/DIABDAT.MPQ --views 1 3
+python -m poc.evaluate out/warrior-all-phong1 --mpq PATH/TO/DIABDAT.MPQ --warp plain --out out/warrior-plain
+python -m poc.zoom out/warrior-all-phong1 --mpq PATH/TO/DIABDAT.MPQ --views 1 3
 ```
 
 `fit.py` saves the fitted scene and then runs `evaluate.py` on it. Running `evaluate.py` by hand
@@ -82,8 +82,8 @@ blades break up, and shadows were missing (see [Shadows](#shadows)).
 
 ## Lighting model
 
-`--lighting phong` (or `lambert`) replaces the field's plain colors with shading (`LitVoxelField` in
-`field.py`):
+`--lighting phong` (the default; `lambert` leaves out the highlight, and `none` fits plain colors)
+replaces the field's plain colors with shading (`LitVoxelField` in `field.py`):
 
 - **Albedo:** a color per voxel.
 - **Normals:** minus the gradient of the smoothed density.
@@ -124,6 +124,10 @@ error is the mean absolute difference, 0–255.
 - **The gain is moderate.** Lighting clearly improves the field's own colors, and relit reprojection
   is as good as or a little better than plain reprojection. The remaining roughness comes from noisy
   surfaces, not from lighting.
+- **With the later warps, it wins.** Once colors were copied coherently and with interpolated shades
+  (see below), relit colors beat reprojected ones on 9 of the 11 held-out character directions: 24.0%
+  exact against 21.4%, an RGB error of 17.2 against 18.1, and a blurred RGB error of 9.2 against 10.1,
+  with the same speckle. So the lighting model is now the default.
 
 ## Sub-pixel accuracy
 
@@ -333,7 +337,7 @@ directions frame by frame, with the 8 new directions rendered for every frame.
 
 ```
 python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --split all --frame 0 --tag f0
-python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --split all --frame 1 --tag f1 --camera out/warrior-walk-all-h0-f0
+python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --split all --frame 1 --tag f1 --camera out/warrior-walk-all-phong1-f0
 ```
 
 - **Each frame calibrated its own camera, and the new directions wobbled.** Silhouettes pin the
@@ -354,17 +358,21 @@ python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --split all --
   has 24 frames, and the attacks are wider sprites.
 - **Cleaner surfaces:** a surface representation (2D Gaussian splatting or an SDF) instead of free
   voxels, for more accurate depth. The cameras are calibrated, so gsplat can be tried directly.
-- **Thin parts:** blades and bows still break up. They're a pixel or two wide, so a pixel of error in
-  the geometry loses them.
+- **Thin parts:** blades and bows still break up. A blade's silhouette survives (its opacity stays
+  above a half along its length), but its colors don't. The original blade is two lines, light and
+  dark, and the warp's fetch positions zigzag between them, because the reconstruction's depth along
+  something a pixel or two wide is poor. Blending the source colors across materials in parts under
+  3 pixels wide, then snapping them to the palette, helped only a little: the arrow's exact matches
+  rose from 42.3% to 43.8%, and the blades still zigzag. Finer voxels (0.6 pixels) didn't help
+  either. Thin parts may need to be drawn rather than warped: a blade's centerline and its two tones,
+  found in the originals, carried over as a line.
 - **A ceiling:** render a known 3D model into 8 + 8 directions and run the pipeline on it. That would
   show how many exact pixels are achievable at all.
 - **Blending:** where two directions see a surface about equally well, blend their colors and snap
   the blend to the palette, instead of picking one. That would trade some crispness for shading
   between the two directions'.
-- **Lighting:** relit colors are now the best (see [Shades](#shades)), but on 2 directions only.
-  If more agree, the lighting model should be the default for characters. The lights could also be
-  fitted once for the whole game and then held fixed: the shading light and the shadows' light come
-  out the same for every sprite.
+- **Lighting:** the lights could be fitted once for the whole game and then held fixed: the shading
+  light and the shadows' light come out the same for every sprite.
 - **Evaluation:** only the arrows have usable in-between directions. The fireball and the holy bolt
   aren't a rigid model turned: their flames trail along the direction of flight, and the
   reconstruction does worse than reusing the nearest direction. Characters can only be scored by
