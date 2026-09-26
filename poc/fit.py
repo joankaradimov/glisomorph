@@ -8,40 +8,22 @@ Splits:
 - "holdout:K" trains on every direction but K;
 - "all" trains on everything (tests how well the training views are reproduced).
 
-Outputs go to out/<preset>-<split>-h<harmonics>[-<tag>]/: metrics.json, compare.png,
-in_between.png and turntable.gif. See poc/README.md.
+Outputs go to out/<preset>-<split>-h<harmonics>[-<tag>]/: the fitted scene (scene.pt), and what
+evaluate.py makes of it: metrics.json, views.npz, compare.png, in_between.png and turntable.gif.
+See poc/README.md.
 """
 
 import argparse
-import json
 import math
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
-from PIL import Image
 
-from diablo1.palette import RAMPS, ramp_of
-from poc.field import LitVoxelField, VoxelField, allowed_masks, camera_basis, carve, silhouettes
-from poc.reproject import reproject
-from poc.views import PRESETS, View, load_views
-
-
-def masks_for(views: list[View], shadows: bool, device) -> list[torch.Tensor]:
-    """1 where the model is seen, 0 elsewhere.
-
-    A baked shadow (index 0 on a character) is on the ground, and the model doesn't cover it, so it
-    counts as transparent.
-    """
-    out = []
-    for v in views:
-        idx = torch.as_tensor(v.indices, device=device).long()
-        m = (idx >= 0).long()
-        if shadows:
-            m[idx == 0] = 0
-        out.append(m)
-    return out
+from poc.evaluate import add_warp_arguments, evaluate, warp_from_args
+from poc.field import VoxelField, allowed_masks, camera_basis, carve, silhouettes
+from poc.scene import Scene, make_field, masks_for
+from poc.views import PRESETS, load_views
 
 
 def split_indices(n: int, split: str) -> tuple[list[int], list[int]]:
@@ -82,50 +64,6 @@ def calibrate(field, views, masks, yaws, device, elevations, offsets):
     return best
 
 
-def quantize(rgb, alpha, palette, candidates):
-    """Palette index per pixel (-1 where transparent) for premultiplied rgb (H, W, 3)."""
-    color = rgb / alpha.clamp(min=1e-6)[..., None]
-    pal = palette[candidates]                                            # (C, 3)
-    dist = ((color[..., None, :] - pal) ** 2).sum(-1)                   # (H, W, C)
-    idx = candidates[dist.argmin(-1)]
-    return torch.where(alpha >= 0.5, idx, torch.full_like(idx, -1))
-
-
-def score(pred, gt, palette):
-    """Metrics comparing predicted and true palette indices (-1 = transparent)."""
-    p = pred >= 0
-    g = gt >= 0
-    both = p & g
-    union = p | g
-    same = both & (pred == gt)
-    ramp_ids = torch.tensor([ramp_of(i) for i in range(256)], device=pred.device)
-    same_ramp = both & (ramp_ids[pred.clamp(min=0)] == ramp_ids[gt.clamp(min=0)])
-    rgb_err = (palette[pred[both]] - palette[gt[both]]).abs().mean() * 255 if both.any() else torch.tensor(0.0)
-    return {
-        "silhouette_iou": float(both.sum() / union.sum().clamp(min=1)),
-        "exact_index": float(same.sum() / both.sum().clamp(min=1)),
-        "same_ramp": float(same_ramp.sum() / both.sum().clamp(min=1)),
-        "rgb_error": float(rgb_err),
-        "pixels_matching": float(same.sum() / union.sum().clamp(min=1)),
-    }
-
-
-def mean_scores(items):
-    return {k: float(np.mean([s[k] for s in items])) for k in items[0]} if items else {}
-
-
-def upscale(img: np.ndarray, k: int) -> np.ndarray:
-    return img.repeat(k, 0).repeat(k, 1)
-
-
-def to_rgb(indices: np.ndarray, palette_u8: np.ndarray, background=(64, 64, 64)) -> np.ndarray:
-    out = np.empty(indices.shape + (3,), dtype=np.uint8)
-    out[:] = background
-    solid = indices >= 0
-    out[solid] = palette_u8[indices[solid]]
-    return out
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
@@ -159,6 +97,7 @@ def main():
     ap.add_argument("--no-hull", action="store_true", help="don't confine density to the visual hull")
     ap.add_argument("--out", default="out")
     ap.add_argument("--seed", type=int, default=0)
+    add_warp_arguments(ap)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -168,7 +107,6 @@ def main():
         preset.frame = args.frame
     views, palette_np = load_views(args.mpq, preset)
     palette = torch.as_tensor(palette_np, device=device)
-    palette_u8 = (palette_np * 255).round().astype(np.uint8)
     masks = masks_for(views, preset.shadows, device)
     train, test = split_indices(len(views), args.split)
     color_model = "h%d" % args.harmonics if args.lighting == "none" else "%s%d" % (args.lighting, args.lights)
@@ -209,15 +147,16 @@ def main():
                                      elev_deg, off, coverage, time.time() - t0))
     yaws = sign * yaws
     elev = torch.tensor(math.radians(elev_deg), device=device)
-    right, up, forward = camera_basis(yaws, elev)
+    right, up, _ = camera_basis(yaws, elev)
 
     # 2. The field, started from the visual hull of the training views.
     lit = args.lighting != "none"
-    if lit:
-        field = LitVoxelField(box_min, box_max, args.voxel, device, lights=args.lights,
-                              specular=args.lighting == "phong", detach_normals=not args.coupled_normals)
-    else:
-        field = VoxelField(box_min, box_max, args.voxel, device, harmonics=args.harmonics)
+    config = {"preset": args.preset, "frame": preset.frame, "split": args.split, "train_views": train,
+              "test_views": test if args.split != "all" else [], "lighting": args.lighting,
+              "lights": args.lights, "harmonics": args.harmonics, "coupled_normals": args.coupled_normals,
+              "voxel": args.voxel, "box_min": box_min, "box_max": box_max, "supersample": args.supersample,
+              "yaw_sign": sign}
+    field = make_field(config, device)
     yaw_rad = torch.deg2rad(yaws)
     inside = carve(field, allowed_masks(train_masks), train_views, right[train], up[train], off)
     with torch.no_grad():
@@ -281,157 +220,18 @@ def main():
             print("iter %5d  loss %.5f  (%.0fs)" % (it, total + regularizer.item(), time.time() - t0))
 
     if args.refine_camera:
-        elev_deg_refined = math.degrees(elev_param.item())
         off = tuple(off_param.detach().tolist())
         print("refined camera: elevation %.2f deg (was %.1f), pivot offset (%.2f, %.2f)"
-              % (elev_deg_refined, elev_deg, off[0], off[1]))
+              % (math.degrees(elev_param.item()), elev_deg, off[0], off[1]))
         elev = elev_param.detach()
-        right, up, forward = camera_basis(yaws, elev)
-    else:
-        elev_deg_refined = elev_deg
+    config.update({"iters": args.iters, "elevation_calibrated_deg": elev_deg, "calibration_coverage": coverage,
+                   "refine_camera": args.refine_camera})
+    scene = Scene(field=field, views=views, masks=masks, palette=palette, yaws=yaws, elevation=elev, offset=off,
+                  samples=samples, config=config)
+    scene.save(out_dir / "scene.pt")
 
-    # 3. Evaluation. A new view can be colored three ways: the field's own colors (quantized to the
-    #    palette), palette indices reprojected from the known directions, and, with a lighting model,
-    #    those reprojected colors relit from their source direction's lighting to the new one's.
-    candidates = torch.tensor(list(range(128, 255)) if preset.shadows else [0] + list(range(128, 255)), device=device)
-    if lit:
-        field.begin_step()
-
-    def render_view(h, w, pivot, r, u, f, yaw_deg):
-        rgb, alpha = field.render(h, w, pivot, off, r, u, f, samples, jitter=False, yaw_rad=torch.deg2rad(yaw_deg),
-                                  supersample=args.supersample)
-        points = field.last_origins + field.last_depth[..., None] * f
-        return quantize(rgb, alpha, palette, candidates), alpha, points, (field.last_normal if lit else None)
-
-    def colored(pred, alpha, points, normal, yaw_deg, basis, exclude=None):
-        """(reprojected, relit) palette indices; relit is None without a lighting model."""
-        srcs = [s for s in sources if s["view"] != exclude]
-        solid = alpha >= 0.5
-        rep, origin = reproject(points, solid, yaw_deg, srcs)
-        plain = torch.where(solid & (rep < 0), pred, rep)  # the field's color where no view sees it
-        if not lit:
-            return plain, None
-        rgb = palette[rep.clamp(min=0)]
-        target, _ = field.shading(normal, *basis)
-        for s in srcs:
-            m = origin == s["view"]
-            if m.any():
-                source, _ = field.shading(normal[m], s["right"], s["up"], s["forward"])
-                rgb[m] = rgb[m] * (target[m] / source.clamp(min=1e-3)).clamp(0.5, 2.0)[:, None]
-        relit_view = quantize(rgb, (rep >= 0).float(), palette, candidates)
-        return plain, torch.where(solid & (rep < 0), pred, relit_view)
-
-    results = {"train": [], "test": [], "test_reprojected": [], "test_relit": [], "baseline": []}
-    predictions, reprojected, relit = {}, {}, {}
-    with torch.no_grad():
-        sources = []
-        for j in train:
-            v = views[j]
-            render_view(*v.shape, v.pivot, right[j], up[j], forward[j], yaws[j])
-            idx = torch.as_tensor(v.indices, device=device).long()
-            sources.append({"view": j, "yaw": float(yaws[j]), "depth": field.last_depth.clone(),
-                            "indices": torch.where(masks[j] == 1, idx, torch.full_like(idx, -1)),
-                            "right": right[j], "up": up[j], "forward": forward[j], "pivot": v.pivot, "offset": off})
-        for i, v in enumerate(views):
-            pred, alpha, points, normal = render_view(*v.shape, v.pivot, right[i], up[i], forward[i], yaws[i])
-            predictions[i] = pred
-            reprojected[i], relit_i = colored(pred, alpha, points, normal, float(yaws[i]),
-                                              (right[i], up[i], forward[i]), exclude=i)
-            if relit_i is not None:
-                relit[i] = relit_i
-            gt = torch.as_tensor(v.indices, device=device).long()
-            gt = torch.where(masks[i] == 1, gt, torch.full_like(gt, -1))  # without baked shadows
-            if i in train:
-                results["train"].append(score(pred, gt, palette))
-            if i in test and args.split != "all":
-                results["test"].append(score(pred, gt, palette))
-                results["test_reprojected"].append(score(reprojected[i], gt, palette))
-                if relit_i is not None:
-                    results["test_relit"].append(score(relit_i, gt, palette))
-                # Baseline: reuse the nearest training direction as-is.
-                nearest = min(train, key=lambda j: min(abs(views[j].yaw - v.yaw), 360 - abs(views[j].yaw - v.yaw)))
-                base = torch.as_tensor(views[nearest].indices, device=device).long()
-                base = torch.where(masks[nearest] == 1, base, torch.full_like(base, -1))
-                if base.shape == gt.shape:
-                    results["baseline"].append(score(base, gt, palette))
-    summary = {
-        "preset": args.preset, "split": args.split, "frame": preset.frame, "views": len(views),
-        "train_views": train, "test_views": test if args.split != "all" else [],
-        "elevation_deg": elev_deg_refined, "elevation_calibrated_deg": elev_deg, "pivot_offset": off,
-        "calibration_coverage": coverage, "refine_camera": args.refine_camera, "supersample": args.supersample,
-        "voxel": args.voxel, "iters": args.iters, "lighting": args.lighting,
-        "train": mean_scores(results["train"]), "test": mean_scores(results["test"]),
-        "test_reprojected": mean_scores(results["test_reprojected"]),
-        "test_relit": mean_scores(results["test_relit"]),
-        "baseline_nearest_view": mean_scores(results["baseline"]),
-    }
-    if lit:
-        with torch.no_grad():
-            summary["lights"] = {
-                "directions_camera_space": torch.nn.functional.normalize(field.light_dirs, dim=-1).tolist(),
-                "power": torch.nn.functional.softplus(field.light_raw).tolist(),
-                "ambient": torch.nn.functional.softplus(field.ambient_raw).item(),
-                "shininess": torch.exp(field.shininess_raw).item(),
-            }
-        print("lights (camera space: x right, y up, z toward the camera):", json.dumps(summary["lights"]))
-    (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
-    np.savez_compressed(out_dir / "views.npz",
-                        **{"gt%d" % i: v.indices for i, v in enumerate(views)},
-                        **{"pred%d" % i: p.cpu().numpy().astype(np.int16) for i, p in predictions.items()},
-                        **{"rep%d" % i: p.cpu().numpy().astype(np.int16) for i, p in reprojected.items()},
-                        **{"relit%d" % i: p.cpu().numpy().astype(np.int16) for i, p in relit.items()})
-    print(json.dumps({k: summary[k] for k in ("train", "test", "test_reprojected", "test_relit",
-                                               "baseline_nearest_view")}, indent=2))
-
-    # 4. Pictures. compare.png: ground truth, field colors, reprojected colors, for every view (the
-    #    reprojection of a view never uses that view itself).
-    scale = 3
-    tiles = []
-    for i, v in enumerate(views):
-        gt_img = to_rgb(v.indices, palette_u8)
-        marker = np.zeros((4, gt_img.shape[1], 3), dtype=np.uint8)
-        marker[:] = (0, 160, 0) if i in train else (200, 40, 40)
-        rows = [marker, gt_img, to_rgb(predictions[i].cpu().numpy(), palette_u8),
-                to_rgb(reprojected[i].cpu().numpy(), palette_u8)]
-        if i in relit:
-            rows.append(to_rgb(relit[i].cpu().numpy(), palette_u8))
-        tiles.append(np.concatenate(rows, 0))
-    Image.fromarray(upscale(np.concatenate(tiles, 1), scale)).save(out_dir / "compare.png")
-
-    def best_colors(pred, alpha, points, normal, yaw_deg, basis):
-        plain, relit_view = colored(pred, alpha, points, normal, yaw_deg, basis)
-        return relit_view if relit_view is not None else plain
-
-    # turntable.gif: 32 directions. in_between.png: the originals with a synthesized direction
-    # between each pair, as the game would use them. Both use relit colors when there's a lighting model.
-    pal = palette_u8.copy()
-    pal[255] = (64, 64, 64)  # sprites never use 255; it stands for transparent here
-    frames = []
-    with torch.no_grad():
-        yaw32 = sign * torch.arange(32, device=device, dtype=torch.float32) * 11.25
-        r32, u32, f32 = camera_basis(yaw32, elev)
-        for k in range(32):
-            pred, alpha, points, normal = render_view(*views[0].shape, views[0].pivot, r32[k], u32[k], f32[k], yaw32[k])
-            idx = best_colors(pred, alpha, points, normal, float(yaw32[k]), (r32[k], u32[k], f32[k])).cpu().numpy()
-            pixels = upscale(np.where(idx < 0, 255, idx).astype(np.uint8), scale)
-            img = Image.frombytes("P", (pixels.shape[1], pixels.shape[0]), pixels.tobytes())
-            img.putpalette(pal.flatten().tolist())
-            frames.append(img)
-        frames[0].save(out_dir / "turntable.gif", save_all=True, append_images=frames[1:], duration=120, loop=0)
-
-        n = len(views)
-        strip = []
-        mids = sign * (torch.arange(n, device=device, dtype=torch.float32) * (360 / n) + 180 / n)
-        rm, um, fm = camera_basis(mids, elev)
-        for i, v in enumerate(views):
-            pred, alpha, points, normal = render_view(*v.shape, v.pivot, rm[i], um[i], fm[i], mids[i])
-            synth = to_rgb(best_colors(pred, alpha, points, normal, float(mids[i]), (rm[i], um[i], fm[i])).cpu().numpy(),
-                           palette_u8)
-            bar = np.zeros((4, v.shape[1], 3), dtype=np.uint8)
-            strip.append(np.concatenate([np.full_like(bar, (0, 160, 0)), to_rgb(v.indices, palette_u8)], 0))
-            strip.append(np.concatenate([np.full_like(bar, (40, 90, 220)), synth], 0))
-    Image.fromarray(upscale(np.concatenate(strip, 1), scale)).save(out_dir / "in_between.png")
-    print("wrote", out_dir)
+    # 3. Scores and pictures of the held-out and in-between directions (evaluate.py).
+    evaluate(scene, out_dir, warp_from_args(args))
 
 
 if __name__ == "__main__":

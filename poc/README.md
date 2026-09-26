@@ -15,16 +15,22 @@ Only Diablo 1, only still frames.
 3. **Reconstruction.** A voxel radiance field in plain PyTorch (`field.py`), started from the visual
    hull and confined to it. It's fitted to the palette colors and silhouettes of the known directions.
    Baked shadows (index 0) count as transparent, because the model doesn't cover them.
-4. **Rendering a new direction.**
+4. **Rendering a new direction** (`evaluate.py`).
    - The field gives the silhouette and the surface.
-   - Colors are *reprojected* (`reproject.py`): each pixel takes the palette index that the nearest
-     original direction shows at that surface point, if that direction can see it.
+   - Colors are *reprojected* (`reproject.py`): each pixel takes the palette index that an original
+     direction shows at that surface point, from a direction that can see it.
    - This keeps the artist's pixels, instead of re-quantizing blended colors.
+   - The warp is kept coherent, so that neighbouring pixels fetch neighbouring source pixels, from
+     the same direction (see [Coherent warps](#coherent-warps)).
 
 ```
 python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior --split all
+python -m poc.evaluate out/warrior-all-h0 --mpq PATH/TO/DIABDAT.MPQ --warp plain --out out/warrior-plain
 python -m poc.zoom out/warrior-all-h0 --mpq PATH/TO/DIABDAT.MPQ --views 1 3
 ```
+
+`fit.py` saves the fitted scene and then runs `evaluate.py` on it. Running `evaluate.py` by hand
+renders a saved fit again, for example with other reprojection settings, without fitting again.
 
 **Splits:**
 - `all` uses every direction.
@@ -32,7 +38,9 @@ python -m poc.zoom out/warrior-all-h0 --mpq PATH/TO/DIABDAT.MPQ --views 1 3
 - `holdout:K` hides direction K.
 
 **Outputs** go to `out/` (gitignored: they're derived from game data):
+- `scene.pt`: the fitted field and its cameras;
 - `metrics.json`;
+- `views.npz`: the palette indices of every direction: truth, field colors, reprojected colors;
 - `compare.png`: truth, field colors and reprojected colors, for every direction;
 - `in_between.png`: originals with a synthesized direction between each pair;
 - `turntable.gif`: 32 directions.
@@ -144,17 +152,109 @@ color family, but the right one is within a pixel. Two options target that:
     pixel. That limits exact matches even with perfect geometry, so part of the gap is a ceiling for
     any method.
 
+## Coherent warps
+
+Reprojection used to fetch every pixel on its own, and that speckled:
+
+- **Noisy depth.** The field's depth is noisy at the scale of a pixel, so neighbouring pixels fetched
+  from scattered places in the source.
+- **Direction flipping.** Each pixel picked its own source direction. On a surface that two
+  directions see equally well, as they do for an in-between direction, neighbouring pixels
+  alternated between the two at random, and the two textures don't line up.
+
+The warp now keeps neighbours together (`Warp` in `reproject.py`; `--warp plain` restores the old one):
+
+1. **Median depth.** A pixel's depth is where its ray has gathered half its opacity, instead of the
+   opacity-weighted mean. Where a ray grazes two layers, the mean falls between them, in empty space.
+2. **Smoothing.** Every depth map, of the new direction and of the known ones, is replaced by robust
+   local plane fits over 5 x 5 pixels. Depths across an edge get almost no weight, so edges stay
+   sharp.
+3. **A cost for each direction** that sees a surface point. Farther directions cost more, and so do
+   directions that shade the surface differently from the new direction, since the light turned
+   with the camera. The shading uses the light that the lighting model finds for every sprite (see
+   above) and normals from the plane fits, so it works without a lighting model.
+4. **One direction per region.** Inside a surface, neighbouring pixels also pay for using different
+   directions, and iterated conditional modes settles the choice. Parts a pixel or two wide have no
+   inside, and choose pixel by pixel: forcing one direction on the arrow's shaft cost 4 points of
+   exact matches.
+5. **Filling.** Pixels that no direction sees take a neighbour's color, instead of the field's own
+   color, which nothing constrains there.
+
+**Speckle metrics.**
+- *Stray pixels*: pixels inside the silhouette whose color differs from all four neighbours' by
+  more than 20 levels (0–255, mean over R, G and B). The originals have some too.
+- *Blurred RGB error*: the RGB error after blurring both images slightly (σ = 1 pixel). It forgives a
+  pixel of misplacement, and asks whether regions have the right colors.
+
+**Results** (reprojected colors, held-out directions, averaged):
+
+| Test | Warp | Exact | Same ramp | RGB error | Blurred RGB error | Stray pixels |
+|------|------|------:|----------:|----------:|------------------:|-------------:|
+| Characters, 11 directions (45°) | plain | 19.4% | 57.5% | 19.9 | 11.4 | 7.1% |
+| | coherent | 20.8% | 58.4% | 18.5 | 10.2 | 5.5% |
+| Arrow, 8 directions (22.5°) | plain | 37.1% | 55.5% | 13.2 | 7.1 | — |
+| | coherent | 42.5% | 59.3% | 12.0 | 6.4 | — |
+
+The characters are the warrior and the zombie with each diagonal direction held out in turn, and the
+rogue with three of them. Their originals have 4.2% stray pixels. The arrow is too thin for the stray
+pixel count to mean anything.
+
+- **Speckle:** the stray pixels above the originals' rate fall by more than half, from 2.9 to 1.3
+  points.
+- **Colors improve too**, most on the arrow, where exact matches rise by 5 points.
+- **With a lighting model**, relit colors gain the same way. On the zombie, stray pixels fall from
+  4.9% to 1.6% (its originals have 1.0%), and the RGB error from 15.2 to 14.1.
+- **At game scale** the in-between directions look cleaner, but not transformed: shadows are still
+  missing, and thin blades still break up.
+
+**What each part does** (characters, leaving out one part at a time):
+
+| Warp | Exact | Same ramp | RGB error | Blurred RGB error | Stray pixels |
+|------|------:|----------:|----------:|------------------:|-------------:|
+| coherent | 20.8% | 58.4% | 18.5 | 10.2 | 5.5% |
+| without the shading cost | 20.4% | 59.6% | 18.8 | 11.1 | 5.5% |
+| without one direction per region | 20.7% | 57.9% | 18.5 | 9.9 | 5.9% |
+| without smoothing (so without the shading cost) | 19.8% | 58.1% | 19.4 | 11.0 | 5.7% |
+| with the expected depth | 20.5% | 58.1% | 18.7 | 10.3 | 5.4% |
+| without filling | 20.6% | 58.1% | 18.9 | 10.5 | 6.2% |
+
+- **Smoothing and the median depth** matter most on the arrow. Its exact matches fall from 42.5% to
+  36.5% without smoothing, and to 40.8% with the expected depth.
+- **The shading cost** brings the largest color gain.
+- **One direction per region** removes speckle, at a small cost in blurred error. Where neighbouring
+  pixels alternate between two directions, a blur averages the two directions' shading, and that
+  average is close to the new direction's.
+- **Filling** removes the field's stray colors.
+
+**Tried and dropped:**
+- *Preferring the direction that sees a surface most squarely* (the least foreshortened): worse on
+  exact matches and speckle, and the arrow lost about 4 points of exact matches.
+- *A cost for source pixels on an outline*, next to the silhouette or a jump in depth: it traded
+  exact matches and color error for ramp matches, and left speckle as it was.
+
+**What's left.** Of the remaining stray pixels:
+- about a third are copied from the originals, whose textures have stray pixels of their own;
+- about 40% come from source pixels on an outline, where the colors are shaded for a grazing view
+  or bleed from what's behind;
+- the rest lie where the source direction switches (14%), or come from resampling (13%).
+
+With the plain warp, another 16% were the field's own colors, in pixels that no direction sees.
+
 ## Next steps
 
 - **Shadows:** regenerate them by projecting the model onto the ground along the recovered light.
 - **Cleaner surfaces:** a surface representation (2D Gaussian splatting or an SDF) instead of free
   voxels, for more accurate depth. The cameras are calibrated, so gsplat can be tried directly.
-- **Coherent warps:** smooth the reconstructed depth before reprojecting, so that neighbouring pixels
-  fetch from neighbouring source pixels. That targets the speckle rather than the exact-match score.
+- **Thin parts:** blades and bows still break up. They're a pixel or two wide, so a pixel of error in
+  the geometry loses them.
 - **A ceiling:** render a known 3D model into 8 + 8 directions and run the pipeline on it. That would
   show how many exact pixels are achievable at all.
-- **Texture:** blend reprojection from both neighbours by visibility and angle, and fill the holes.
+- **Blending:** where two directions see a surface about equally well, blend their colors and snap
+  the blend to the palette, instead of picking one. That would trade some crispness for shading
+  between the two directions'.
 - **Lighting:** tried; see above. The recovered light could also drive shadow regeneration, and could
   be fitted once for the whole game and then held fixed.
-- **Evaluation:** only the missiles have real in-between directions. Characters can only be scored
-  by hiding a direction, which is a harder, 45°, version of the task.
+- **Evaluation:** only the arrows have usable in-between directions. The fireball and the holy bolt
+  aren't a rigid model turned: their flames trail along the direction of flight, and the
+  reconstruction does worse than reusing the nearest direction. Characters can only be scored by
+  hiding a direction, which is a harder, 45°, version of the task.

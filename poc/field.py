@@ -116,16 +116,27 @@ class VoxelField(torch.nn.Module):
         return points, t, span / samples
 
     def _composite(self, sigma, t, step, supersample: int = 1):
-        """Per-sample weights (h, w, S) from densities. Keeps the per-pixel depth (weighted by opacity
-        over the sub-pixels) and the per-sample opacity for later."""
+        """Per-sample weights (h, w, S) from densities. Keeps the per-pixel depths and the per-sample
+        opacity for later."""
         alpha = 1 - torch.exp(-sigma * step)
         transmit = torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1 - alpha[..., :-1] + 1e-10], -1), -1)
         weights = alpha * transmit
         self.last_alpha = pool(alpha, supersample)  # for regularizers, per pixel
-        # Expected depth along the view direction, from the plane through the world origin.
+        # Depths along the view direction, from the plane through the world origin: the expected depth
+        # (weighted by opacity over the sub-pixels), and the median one, where the ray has gathered half
+        # its opacity. Where a ray grazes two layers, the expected depth falls between them, and the
+        # median depth stays on one.
         opacity = weights.sum(-1)
         depth = (weights * t).sum(-1)
         self.last_depth = pool(depth, supersample) / pool(opacity, supersample).clamp(min=1e-6)
+        if not torch.is_grad_enabled():  # rendering, not training
+            gathered = weights.cumsum(-1)
+            half = gathered[..., -1:] / 2
+            k = (gathered < half).sum(-1, keepdim=True).clamp(max=t.shape[-1] - 1)
+            before = torch.where(k > 0, gathered.gather(-1, (k - 1).clamp(min=0)), torch.zeros_like(half))
+            share = ((half - before) / (gathered.gather(-1, k) - before).clamp(min=1e-9)).clamp(0, 1)
+            median = (t.gather(-1, k) + (share - 0.5) * step)[..., 0]  # sample k spans its t +- step / 2
+            self.last_surface = pool(median, supersample)
         return weights
 
     def render(self, height, width, pivot, offset, right, up, forward, samples: int, jitter: bool, yaw_rad=None,
