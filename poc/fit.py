@@ -87,6 +87,9 @@ def main():
     ap.add_argument("--camera-lr", type=float, default=1e-3,
                     help="learning rate of the elevation in radians; the pivot offset's is 20 times this, in pixels")
     ap.add_argument("--frame", type=int, default=None, help="animation frame (default: the preset's)")
+    ap.add_argument("--camera", default=None,
+                    help="take the camera from another fit (its output folder) instead of calibrating: for the "
+                         "frames of one animation, so that they share it")
     ap.add_argument("--voxel", type=float, default=1.0, help="voxel size in pixels (0.6 suits thin sprites)")
     ap.add_argument("--iters", type=int, default=2000)
     ap.add_argument("--lr", type=float, default=0.05)
@@ -128,23 +131,31 @@ def main():
     train_masks = [masks[i] for i in train]
     train_yaws = yaws[train]
 
-    # 1. Calibration on a coarse grid, for both senses of rotation.
+    # 1. The camera: calibrated on a coarse grid, for both senses of rotation, or taken from another fit.
+    #    Silhouettes pin the camera down to about a pixel, so the frames of one animation, calibrated
+    #    each on its own, would jitter.
     t0 = time.time()
-    coarse = VoxelField(box_min, box_max, 1.0, device)
-    offsets = [(dx, dy) for dx in (-2, -1, 0, 1, 2) for dy in range(-6, 7, 2)]
-    candidates_by_sign = {}
-    for sign in (1, -1):
-        candidates_by_sign[sign] = calibrate(coarse, train_views, train_masks, sign * train_yaws, device,
-                                             range(20, 41, 2), offsets)
-    sign = max(candidates_by_sign, key=lambda s: candidates_by_sign[s][0])
-    _, elev_deg, off = candidates_by_sign[sign]
-    fine_offsets = [(off[0] + dx, off[1] + dy) for dx in (-0.5, 0, 0.5) for dy in (-1, 0, 1)]
-    best = calibrate(coarse, train_views, train_masks, sign * train_yaws, device,
-                     [elev_deg + d for d in (-1.5, -1, -0.5, 0, 0.5, 1, 1.5)], fine_offsets)
-    coverage, elev_deg, off = best
-    print("calibration: yaw sign %+d (coverage %.3f vs %.3f mirrored), elevation %.1f deg, pivot offset %s, "
-          "coverage %.3f (%.0fs)" % (sign, candidates_by_sign[sign][0], candidates_by_sign[-sign][0],
-                                     elev_deg, off, coverage, time.time() - t0))
+    if args.camera:
+        saved = torch.load(Path(args.camera) / "scene.pt", map_location="cpu")
+        sign, elev_deg, off = saved["config"]["yaw_sign"], math.degrees(saved["elevation"]), tuple(saved["offset"])
+        coverage = None
+        print("camera from %s: yaw sign %+d, elevation %.1f deg, pivot offset %s" % (args.camera, sign, elev_deg, off))
+    else:
+        coarse = VoxelField(box_min, box_max, 1.0, device)
+        offsets = [(dx, dy) for dx in (-2, -1, 0, 1, 2) for dy in range(-6, 7, 2)]
+        candidates_by_sign = {}
+        for sign in (1, -1):
+            candidates_by_sign[sign] = calibrate(coarse, train_views, train_masks, sign * train_yaws, device,
+                                                 range(20, 41, 2), offsets)
+        sign = max(candidates_by_sign, key=lambda s: candidates_by_sign[s][0])
+        _, elev_deg, off = candidates_by_sign[sign]
+        fine_offsets = [(off[0] + dx, off[1] + dy) for dx in (-0.5, 0, 0.5) for dy in (-1, 0, 1)]
+        best = calibrate(coarse, train_views, train_masks, sign * train_yaws, device,
+                         [elev_deg + d for d in (-1.5, -1, -0.5, 0, 0.5, 1, 1.5)], fine_offsets)
+        coverage, elev_deg, off = best
+        print("calibration: yaw sign %+d (coverage %.3f vs %.3f mirrored), elevation %.1f deg, pivot offset %s, "
+              "coverage %.3f (%.0fs)" % (sign, candidates_by_sign[sign][0], candidates_by_sign[-sign][0],
+                                         elev_deg, off, coverage, time.time() - t0))
     yaws = sign * yaws
     elev = torch.tensor(math.radians(elev_deg), device=device)
     right, up, _ = camera_basis(yaws, elev)
@@ -225,7 +236,7 @@ def main():
               % (math.degrees(elev_param.item()), elev_deg, off[0], off[1]))
         elev = elev_param.detach()
     config.update({"iters": args.iters, "elevation_calibrated_deg": elev_deg, "calibration_coverage": coverage,
-                   "refine_camera": args.refine_camera})
+                   "camera_from": args.camera, "refine_camera": args.refine_camera})
     scene = Scene(field=field, views=views, masks=masks, palette=palette, yaws=yaws, elevation=elev, offset=off,
                   samples=samples, config=config)
     scene.save(out_dir / "scene.pt")

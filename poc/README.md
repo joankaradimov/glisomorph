@@ -324,10 +324,34 @@ the warp now treats them differently (`Warp.interpolate`):
 - **With the lighting model, relit colors are the best so far**: 25.6% exact on the warrior's and the
   zombie's held-out SW (from 22.4% with the plain warp).
 
+## Motion
+
+Every test above is a single frame. In the game, a new direction plays whole animations, so each
+frame is fitted on its own and the new directions must not flicker or wobble as they play. The
+check: the warrior's walk in the dungeon (`--preset warrior-walk`, 8 frames), fitted on all 8
+directions frame by frame, with the 8 new directions rendered for every frame.
+
+```
+python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --split all --frame 0 --tag f0
+python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --split all --frame 1 --tag f1 --camera out/warrior-walk-all-h0-f0
+```
+
+- **Each frame calibrated its own camera, and the new directions wobbled.** Silhouettes pin the
+  camera down to about a pixel: across the 8 frames, the elevation came out between 25° and 26°,
+  and the pivot offset varied by a pixel sideways. The new directions moved sideways by 0.39 pixels
+  per frame on average, twice as much as the originals (0.19).
+- **`--camera` shares one camera.** Frames 1–7 take frame 0's camera instead of calibrating, and the
+  new directions then move like the originals: 0.18 pixels per frame.
+- **Nothing flickers.** From one frame to the next, 72% of the new directions' pixels change color,
+  against 68% for the originals (walking moves most pixels). Their shadows change by 38% of their
+  area per frame, against 41% for the originals' baked shadows, although each frame fits its own
+  shadow light.
+
 ## Next steps
 
-- **Motion:** every picture so far is a single animation frame. Fit every frame of an animation, and
-  check that a new direction doesn't flicker when it plays.
+- **Animations:** checked on one walk so far. A tool that fits every frame of an animation (with a
+  shared camera) and writes its 16 directions would make the others easy to check: the zombie's walk
+  has 24 frames, and the attacks are wider sprites.
 - **Cleaner surfaces:** a surface representation (2D Gaussian splatting or an SDF) instead of free
   voxels, for more accurate depth. The cameras are calibrated, so gsplat can be tried directly.
 - **Thin parts:** blades and bows still break up. They're a pixel or two wide, so a pixel of error in
