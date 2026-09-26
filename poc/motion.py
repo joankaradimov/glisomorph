@@ -12,21 +12,26 @@ whose shape, opacity and color are shared by every frame, moved per frame by a f
 Gaussian follows its nearest nodes, and neighbouring nodes are held rigid to each other. Moving
 whole limbs through a few nodes is far better posed than moving every Gaussian on its own.
 
-1. Every frame is fitted like a still (fit.py --model gaussians). Frame 0 calibrates the camera, and
-   its Gaussians become the moving ones; the other stills are targets.
+1. Every frame is fitted like a still (fit.py --model gaussians); the stills are saved and reused.
+   Frame 0 calibrates the camera, and its Gaussians become the moving ones; the other stills are
+   targets.
 2. Each next frame starts from the previous one's node poses and moves them to fit its views. Two
    things pull from afar, where the images' gradients don't reach: the Gaussians are drawn to the
    nearest same-colored Gaussians of that frame's still (a chamfer distance, recomputed now and then
    as in ICP), and blurred copies of the images are compared first.
-3. All frames are then refined together, the last one tied to the first, with node paths kept smooth.
+3. All frames are then refined together, the last one tied to the first, with node paths kept smooth,
+   and with small per-frame corrections of each Gaussian's position on top of the nodes' motion.
+   With the lighting model (the default), colors are albedo, shaded by a light fixed to the camera.
 
-A phase between frames interpolates the node poses periodically (Catmull-Rom). --hide-direction and
---hide-frames keep a direction or every other frame out of the fit, to score the in-betweens against
-the originals.
+A phase between frames interpolates the node poses and corrections periodically (Catmull-Rom). A new
+cell of the torus takes the artist's pixels (PixelCopier): its surface points are moved to nearby
+original frames and directions, and copied from there, relit. Shadows come from a shadow map of the
+posed Gaussians, with the light fitted to frame 0's baked shadows. --hide-direction and --hide-frames
+keep a direction or every other frame out of the fit, to score the in-betweens against the originals.
 
 Outputs, in out/<preset>-motion[-<test>]/: metrics.json, sheet.png (16 directions by twice the frames,
-in the palette; originals without their baked shadows, which the model doesn't cast yet),
-directions.gif and motion.pt.
+in the palette: the originals, and copied pixels over generated shadows in between), directions.gif
+and motion.pt.
 """
 
 import argparse
@@ -44,10 +49,10 @@ from gsplat import rasterization
 from poc import fit
 from poc.animate import write_gif, write_sheet
 from poc.evaluate import quantize, score
-from poc.ramps import Ramps
-from poc.reproject import Warp, choose, fetch, fill, neighbour, smooth_depth, source_depth
 from poc.field import camera_basis, pixel_rays
 from poc.gaussians import DISTANCE, intrinsics, shadow_map_opacity, viewmat
+from poc.ramps import Ramps
+from poc.reproject import Warp, choose, fetch, fill, neighbour, smooth_depth, source_depth
 from poc.scene import Scene, masks_for
 from poc.shadow import baked_shadow, fit_light, iou, shadow_mask
 from poc.views import PRESETS, frame_count, load_views
