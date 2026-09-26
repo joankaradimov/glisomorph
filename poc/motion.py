@@ -16,22 +16,22 @@ whole limbs through a few nodes is far better posed than moving every Gaussian o
    Frame 0 calibrates the camera, and its Gaussians become the moving ones; the other stills are
    targets.
 2. Each next frame starts from the previous one's node poses and moves them to fit its views. Two
-   things pull from afar, where the images' gradients don't reach: the Gaussians are drawn to the
-   nearest same-colored Gaussians of that frame's still (a chamfer distance, recomputed now and then
-   as in ICP), and blurred copies of the images are compared first.
-3. All frames are then refined together, the last one tied to the first, with node paths kept smooth,
-   and with small per-frame corrections of each Gaussian's position on top of the nodes' motion.
-   With the lighting model (the default), colors are albedo, shaded by a light fixed to the camera.
+   things pull from afar, where the images' gradients don't reach: blurred copies of the images are
+   compared first, and each Gaussian is drawn to where optimal transport takes the surface around it,
+   from the model as it is to the surface of that frame's still (transported again now and then, as
+   in ICP). Transport, unlike nearest neighbours, follows a sword through its swing.
+3. The colors are then fitted to all frames at once. With the lighting model (the default), they're
+   albedo, shaded by a light fixed to the camera, held where the voxel fits find it.
 
-A phase between frames interpolates the node poses and corrections periodically (Catmull-Rom). A new
-cell of the torus takes the artist's pixels (PixelCopier): its surface points are moved to nearby
-original frames and directions, and copied from there, relit. Shadows come from a shadow map of the
-posed Gaussians, with the light fitted to frame 0's baked shadows. --hide-direction and --hide-frames
-keep a direction or every other frame out of the fit, to score the in-betweens against the originals.
+A phase between frames interpolates the node poses periodically (Catmull-Rom). A new cell of the
+torus takes the artist's pixels (PixelCopier): its surface points are moved to nearby original frames
+and directions, and copied from there, relit. Shadows come from a shadow map of the posed Gaussians,
+with the light fitted to frame 0's baked shadows. --hide-direction and --hide-frames keep a direction
+or every other frame out of the fit, to score the in-betweens against the originals.
 
-Outputs, in out/<preset>-motion[-<test>]/: metrics.json, sheet.png (16 directions by twice the frames,
-in the palette: the originals, and copied pixels over generated shadows in between), directions.gif
-and motion.pt.
+Outputs, in out/<preset>-motion[-<test>][-<tag>]/: metrics.json, sheet.png (16 directions by twice the
+frames, in the palette: the originals, and copied pixels over generated shadows in between),
+directions.gif and motion.pt.
 """
 
 import argparse
@@ -144,15 +144,17 @@ class MovingGaussians(torch.nn.Module):
         self.register_buffer("gaussian_links", torch.cat(near))
         # The lighting model, as field.py's LitVoxelField: colors become albedo, shaded by a light
         # fixed to the camera (x right, y up, z toward it), with an ambient term and a Blinn-Phong
-        # highlight of per-Gaussian strength. It starts where fits of Diablo's sprites end up.
+        # highlight of per-Gaussian strength. The light is held where the voxel fits of Diablo's sprites
+        # find it: fitted along with a color per Gaussian, it drifts anywhere, down to no light at all
+        # (the colors can explain the shading), and relighting copied pixels suffers.
         self.lit = lit
         if lit:
             device = centers.device
             self.specular = torch.nn.Parameter(torch.full((len(self.means0),), -3.0, device=device))
-            self.light_dirs = torch.nn.Parameter(torch.tensor([[0.4, 0.75, 0.5]], device=device))
-            self.light_raw = torch.nn.Parameter(torch.tensor([math.log(math.expm1(0.6))], device=device))
-            self.ambient_raw = torch.nn.Parameter(torch.tensor(math.log(math.expm1(0.6)), device=device))
             self.shininess_raw = torch.nn.Parameter(torch.tensor(math.log(16.0), device=device))
+            self.register_buffer("light_dirs", torch.tensor([[0.4, 0.75, 0.5]], device=device))
+            self.register_buffer("light_raw", torch.tensor([math.log(math.expm1(0.6))], device=device))
+            self.register_buffer("ambient_raw", torch.tensor(math.log(math.expm1(0.6)), device=device))
 
     def node_pose(self, phase: float):
         """The nodes' unit quaternions (M, 4) and translations (M, 3) at a phase in model frames."""
@@ -177,8 +179,8 @@ class MovingGaussians(torch.nn.Module):
         turn = F.normalize((w * same_hemisphere(turns, turns[:, :1])).sum(1), dim=-1)
         return means, quat_multiply(turn, F.normalize(self.quats0, dim=-1))
 
-    def light_parameters(self):
-        return [self.specular, self.light_dirs, self.light_raw, self.ambient_raw, self.shininess_raw]
+    def highlight_parameters(self):
+        return [self.specular, self.shininess_raw]
 
     def normals(self, quats, forward):
         """Unit normals (G, 3) of posed Gaussians: each one's thinnest axis, turned to face the camera."""
@@ -382,19 +384,46 @@ def nearest(a, b):
     return torch.cat([torch.cdist(chunk, b).argmin(-1) for chunk in torch.split(a, 4096)])
 
 
-def matching(means, colors, weight, target_means, target_colors, pairs=None, color_scale: float = 10.0):
-    """A chamfer distance from the moving Gaussians (means, colors, weight: how opaque) to a frame's own
-    still (target means and colors), in position and color: each side pulled to its nearest point on
-    the other. `pairs` are the nearest-neighbour indices, recomputed now and then (as in ICP); pass
-    None to compute them. Returns the loss and the pairs."""
-    a = torch.cat([means, color_scale * colors], -1)
-    b = torch.cat([target_means, color_scale * target_colors], -1)
-    if pairs is None:
-        with torch.no_grad():
-            pairs = (nearest(a, b), nearest(b, a))
-    to_target = (weight * (a - b[pairs[0]]).norm(dim=-1)).sum() / weight.sum()
-    from_target = (b - a[pairs[1]]).norm(dim=-1).mean()
-    return to_target + from_target, pairs
+def surface_points(colors, alphas, origins, forward, color_scale: float = 60.0):
+    """The surface that renders show, as points: for each pixel seen solid in each of C views, the point
+    at its expected depth, with its color scaled into the same units (N, 6). colors (C, H, W, 4) hold
+    premultiplied colors and expected depth, origins (C, H, W, 3) are the pixels' ray origins and
+    forward (C, 3) the views' directions. Every pixel counts once, so a thin blade, made of many faint
+    Gaussians, weighs as much as its pixels."""
+    solid = alphas[..., 0] > 0.5
+    points = origins + (colors[..., 3] - DISTANCE)[..., None] * forward[:, None, None]
+    color = (colors[..., :3] / alphas.clamp(min=1e-6)).clamp(0, 1)
+    return torch.cat([points, color_scale * color], -1)[solid]
+
+
+def transport(x, y, rho: float = 1000.0, eps_start: float = 1024.0, eps_end: float = 4.0, iterations: int = 30):
+    """Where each point of x (N, D) goes among the points of y (M, D) under unbalanced optimal
+    transport with a squared-distance cost: its barycentric match (N, D). Unlike nearest neighbours,
+    transport has to send each part somewhere with room for it, so a sword that swung far goes to where
+    the sword is now, rather than to the body next to it. Solved by log-domain Sinkhorn iterations
+    while the blur eps is annealed; rho is what creating or destroying mass costs, so that points
+    without a counterpart (hidden in one frame, say) needn't go anywhere far."""
+    cost = torch.cdist(x, y) ** 2 / 2
+    log_a = torch.full((len(x),), -math.log(len(x)), device=x.device)
+    log_b = torch.full((len(y),), -math.log(len(y)), device=x.device)
+    f, g = torch.zeros_like(log_a), torch.zeros_like(log_b)
+    eps = eps_start
+    while True:
+        tau = rho / (rho + eps)
+        for _ in range(iterations):
+            f = -tau * eps * torch.logsumexp(log_b + (g - cost) / eps, 1)
+            g = -tau * eps * torch.logsumexp(log_a[:, None] + (f[:, None] - cost) / eps, 0)
+        if eps <= eps_end:
+            break
+        eps = max(eps / 2, eps_end)
+    return torch.softmax(log_a[:, None] + log_b + (f[:, None] + g - cost) / eps, 1) @ y
+
+
+def follow(means, points, moves, k: int = 4):
+    """Each Gaussian's share (G, 3) of a motion given at surface points (N, 3): the mean move of its k
+    nearest points."""
+    near = torch.cat([torch.cdist(c, points).topk(k, largest=False).indices for c in torch.split(means, 4096)])
+    return moves[near].mean(1)
 
 
 def image_loss(colors, alphas, targets, masks, blur: int = 1):
@@ -423,10 +452,17 @@ def main():
     ap.add_argument("--refine-iters", type=int, default=3000, help="iterations of the joint refinement")
     ap.add_argument("--arap", type=float, default=0.1, help="weight of the nodes' rigidity")
     ap.add_argument("--corrections", type=float, default=0.01,
-                    help="weight of the cost of per-frame corrections (0 = no corrections)")
+                    help="with --refine all, the weight of the cost of per-frame corrections (0 = no corrections)")
     ap.add_argument("--matching", type=float, default=0.05,
-                    help="weight of the pull toward each frame's own still (0 = images only)")
+                    help="weight of the pull toward where optimal transport takes the surface in each frame's "
+                         "still (0 = images only)")
+    ap.add_argument("--rematch", type=int, default=200, help="iterations between transports while tracking")
     ap.add_argument("--refit-stills", action="store_true", help="fit the frames' stills again, even if saved")
+    ap.add_argument("--refine", default="colors", choices=["colors", "all"],
+                    help="what the joint refinement changes: the colors (and highlights), or also the motion, the "
+                         "rest shape and per-frame corrections, which fit the known cells closer but copy worse")
+    ap.add_argument("--no-sheet", action="store_true", help="score, but skip the 16-direction sheet and GIF")
+    ap.add_argument("--tag", default="", help="suffix for the output folder")
     ap.add_argument("--out", default="out")
     args = ap.parse_args()
     device = torch.device("cuda")
@@ -438,7 +474,7 @@ def main():
     split = "all" if args.hide_direction is None else "holdout:%d" % args.hide_direction
     test = "" if args.hide_direction is None and args.hide_frames is None else (
         "-hide%d" % args.hide_direction if args.hide_direction is not None else "-hideodd")
-    out_dir = Path(args.out) / ("%s-motion%s" % (args.preset, test))
+    out_dir = Path(args.out) / ("%s-motion%s%s" % (args.preset, test, "-" + args.tag if args.tag else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Every fitted frame as a still; frame 0 calibrates the camera, and the others share it.
@@ -475,11 +511,10 @@ def main():
         idx = [torch.as_tensor(v.indices, device=device).long().clamp(min=0) for v in views]
         return torch.stack([palette[i] for i in idx]), torch.stack([m == 1 for m in masks])
 
-    def cloud(field):
-        """The opaque Gaussians of a still: means and colors."""
-        p = field.params
-        keep = torch.sigmoid(p["opacities"]) > 0.5
-        return p["means"][keep].detach(), torch.sigmoid(p["colors"][keep]).detach()
+    origins = torch.stack([pixel_rays(h, w, pivot, offset, right[d], up[d], forward[d])[0] for d in train_dirs])
+
+    def surface_of(colors, alphas):
+        return surface_points(colors, alphas, origins, forward[dirs])
 
     model = MovingGaussians(still_scene.field, len(frames), nodes=args.nodes, lit=args.lighting != "none")
     print("%d Gaussians, %d nodes %.1f pixels apart" % (len(model.means0), args.nodes, model.spacing))
@@ -491,29 +526,33 @@ def main():
             keep[j] = False
             p.grad[keep] = 0
 
-    # 2. Tracking, frame by frame (slot j holds frame frames[j]).
-    colors_now = torch.sigmoid(model.colors).detach()
-    weight = torch.sigmoid(model.opacities).detach()
+    # 2. Tracking, frame by frame (slot j holds frame frames[j]). Images only pull a Gaussian from a
+    #    pixel or so away; a blade can swing tens of pixels between frames. So each Gaussian is also
+    #    pulled to where optimal transport takes the surface around it, from the model as it is to the
+    #    surface of the frame's own still, transported again every `rematch` iterations (as in ICP).
     for j in range(1, len(frames)):
         t0 = time.time()
         with torch.no_grad():
             model.node_quats[j] = model.node_quats[j - 1]
             model.node_moves[j] = model.node_moves[j - 1]
+            goal_surface = surface_of(*stills[frames[j]].rasterize(viewmats[dirs], Ks[dirs], w, h)[:2])
         targets, masks = targets_of(frames[j])
-        target_means, target_colors = cloud(stills[frames[j]])
-        pairs = None
+        goal = None
         opt = torch.optim.Adam([{"params": [model.node_moves], "lr": 0.1}, {"params": [model.node_quats], "lr": 0.01}])
         for it in range(args.track_iters):
+            if args.matching and it % args.rematch == 0:
+                with torch.no_grad():
+                    here = surface_of(*model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)[:2])
+                    there = transport(here, goal_surface)
+                    means, _ = model.pose(j)
+                    goal = means + follow(means, here[:, :3], there[:, :3] - here[:, :3])
             colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
             blur = 4 if it < args.track_iters // 3 else 2 if it < 2 * args.track_iters // 3 else 1
             loss = image_loss(colors, alphas, targets, masks, blur) + args.arap * model.arap(j)
-            if args.matching:
-                # The pull toward the frame's own still fades out, leaving the images the last word.
-                if it % 20 == 0:
-                    pairs = None
+            if goal is not None:
+                # The pull fades out, leaving the images the last word.
                 means, _ = model.pose(j)
-                match, pairs = matching(means, colors_now, weight, target_means, target_colors, pairs)
-                loss = loss + args.matching * (1 - it / args.track_iters) * match
+                loss = loss + args.matching * (1 - it / args.track_iters) * (means - goal).norm(dim=-1).mean()
             opt.zero_grad()
             loss.backward()
             only_slot(j)
@@ -521,22 +560,32 @@ def main():
         print("tracked frame %d (%d of %d): loss %.5f (%.0fs)" % (frames[j], j, len(frames) - 1, loss.item(),
                                                                    time.time() - t0))
 
-    # 3. Joint refinement of every frame, the loop closed by the smoothness of the node paths.
+    # 3. Colors: the albedo and highlights are fitted to every frame at once. The motion and the shape
+    #    stay as tracked. Refining them too (--refine all: every frame together, the loop closed by the
+    #    smoothness of the node paths, with small per-frame corrections of each Gaussian) fits the known
+    #    cells closer, but at the cost of consistency between frames, which copying pixels relies on;
+    #    and a thin blade that's a pixel off in some frames fades out in all of them.
     all_targets = [targets_of(k) for k in frames]
-    opt = torch.optim.Adam([{"params": [model.node_moves], "lr": 0.02}, {"params": [model.node_quats], "lr": 0.002},
-                            {"params": [model.means0], "lr": 0.005}, {"params": [model.quats0], "lr": 0.001},
-                            {"params": [model.scales], "lr": 0.002}, {"params": [model.opacities], "lr": 0.01},
-                            {"params": [model.colors], "lr": 0.01}]
-                           + ([{"params": [model.residuals], "lr": 0.01}] if args.corrections else [])
-                           + ([{"params": model.light_parameters(), "lr": 0.01}] if model.lit else []))
+    groups = [{"params": [model.colors], "lr": 0.01}]
+    if model.lit:
+        groups.append({"params": model.highlight_parameters(), "lr": 0.01})
+    if args.refine == "all":
+        groups += [{"params": [model.node_moves], "lr": 0.02}, {"params": [model.node_quats], "lr": 0.002},
+                   {"params": [model.means0], "lr": 0.005}, {"params": [model.quats0], "lr": 0.001},
+                   {"params": [model.scales], "lr": 0.002}, {"params": [model.opacities], "lr": 0.01}]
+        if args.corrections:
+            groups.append({"params": [model.residuals], "lr": 0.01})
+    opt = torch.optim.Adam(groups)
     t0 = time.time()
     for it in range(args.refine_iters):
         j = it % len(frames)
         targets, masks = all_targets[j]
         colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
-        loss = image_loss(colors, alphas, targets, masks) + args.arap * model.arap(j) + 0.01 * model.smoothness()
-        if args.corrections:
-            loss = loss + args.corrections * model.correction_cost(j)
+        loss = image_loss(colors, alphas, targets, masks)
+        if args.refine == "all":
+            loss = loss + args.arap * model.arap(j) + 0.01 * model.smoothness()
+            if args.corrections:
+                loss = loss + args.corrections * model.correction_cost(j)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -660,7 +709,7 @@ def main():
         # shadows), copied pixels over generated shadows elsewhere.
         pal = (palette.cpu().numpy() * 255).round().astype(np.uint8)
         sheet = []
-        for step in range(2 * count):
+        for step in range(0 if args.no_sheet else 2 * count):
             column = []
             for n in range(16):
                 known = n % 2 == 0 and step % 2 == 0 and n // 2 != args.hide_direction and step // 2 in frames
@@ -670,8 +719,9 @@ def main():
                     cell = copied(step / 2, sign * n * 22.5)
                     column.append(with_shadow(cell, step / 2, sign * n * 22.5).cpu().numpy())
             sheet.append(column)
-        write_sheet(sheet, pal, out_dir / "sheet.png")
-        write_gif(sheet, pal, out_dir / "directions.gif")
+        if sheet:
+            write_sheet(sheet, pal, out_dir / "sheet.png")
+            write_gif(sheet, pal, out_dir / "directions.gif")
     torch.save({"model": model.state_dict(), "frames": frames}, out_dir / "motion.pt")
     print("wrote", out_dir, "(%.0fs)" % (time.time() - t_start))
 

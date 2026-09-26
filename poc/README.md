@@ -456,16 +456,17 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --hide-fram
 1. Every frame is fitted as a still. Frame 0 calibrates the camera, and its Gaussians become the
    moving ones.
 2. Frame by frame, the nodes move the Gaussians to fit the next frame's views. Images only pull a
-   Gaussian from a pixel or so away, and a leg moves several pixels per frame, so two things pull
-   from further: blurred copies of the images, and each Gaussian's nearest same-colored Gaussian in
-   that frame's still (a chamfer distance, recomputed now and then, as in ICP).
-3. All frames are refined together, the last tied to the first, with the node paths kept smooth.
-   Each Gaussian also gets a small correction of its position per frame, on top of the nodes'
-   motion. That lets each frame match its views about as closely as a still, while the nodes carry
-   the motion; the corrections are kept small, and alike between neighbours.
-4. A phase between frames interpolates the node poses (and the corrections) periodically.
+   Gaussian from a pixel or so away, and a leg moves several pixels per frame (a sword, tens), so
+   two things pull from further: blurred copies of the images, and optimal transport from the
+   model's surface to the surface of that frame's still (see [Fast motion](#fast-motion), below).
+3. The colors are fitted to all frames at once; the motion and the shape stay as tracked.
+4. A phase between frames interpolates the node poses periodically.
 
-The frames' stills are saved, and reused by later runs (`--refit-stills` fits them again).
+The frames' stills are saved, and reused by later runs (`--refit-stills` fits them again). The
+tables before [Fast motion](#fast-motion) were measured with the first tracker, which matched
+nearest neighbours instead, and a refinement of everything (now `--refine all`): all frames
+together, the last tied to the first, the node paths kept smooth, and each Gaussian given a small
+correction of its position per frame, on top of the nodes' motion.
 
 The output samples the torus at twice the resolution on both axes: 16 directions by twice the
 frames.
@@ -530,7 +531,8 @@ baked shadows, and the new cells over generated ones.
 
 **Lighting.** The moving Gaussians have the voxel field's lighting model too (on by default,
 `--lighting none` to leave it out): colors become albedo, shaded by a light fixed to the camera, with
-an ambient term and a highlight. A Gaussian's normal is its thinnest axis (they're mostly flat),
+an ambient term and a highlight. The light is held where the voxel fits find it (see Fast motion,
+below, for why). A Gaussian's normal is its thinnest axis (they're mostly flat),
 turned to face the camera, and shading is deferred: albedo, normal and highlight strength are
 rendered, then shaded per pixel. The copier relights each copied pixel, from its source's shading
 (the surface's normal turned back to the source frame by the nodes) to the new cell's, within its
@@ -545,10 +547,58 @@ ramp, and prefers sources that shade the point alike.
 Relit, the moving Gaussians color a hidden direction almost as well as the voxel pipeline, with
 better silhouettes. Their fit to the known cells improves too: 52% exact against 43% unlit.
 
+#### Fast motion
+
+The warrior's attack (16 frames) swings a sword: between frames 7 and 9, its tip moves more than
+30 pixels a frame. The first tracker drew each Gaussian to its nearest same-colored Gaussian in the
+frame's still, and lost the sword at the swing: its Gaussians were pulled onto the body next to
+them, and the refinement then faded it out in every frame. Three changes keep it.
+
+- **Optimal transport instead of nearest neighbours.** The model as it is and the frame's still both
+  become surface points: one per solid pixel of each known direction, at its depth, with its color.
+  Unbalanced optimal transport (entropic, by Sinkhorn iterations) matches the two, and each Gaussian
+  is pulled to where the surface around it goes, matched again every 200 iterations. Transport has
+  to send each part somewhere with room for it, so the sword goes to where the sword is now, not
+  onto the body. Counting pixels rather than Gaussians matters too: a still's blade is many faint
+  Gaussians, which the old matching, taking only opaque ones, didn't see at all.
+- **Only colors are refined.** Refining everything after tracking faded the sword anyway: opacity
+  is shared by all frames, and a blade a pixel off in some of them is only ever pushed toward
+  transparent. It also made the copied pixels worse (the table's "refining everything"). The known
+  cells fit closer, but the frames agree less on where each surface point is, which is what copying
+  relies on.
+- **A fixed light.** Fitted along with a color per Gaussian, the light drifted anywhere, from straight
+  overhead to almost none (the colors can explain the shading), and relighting suffered: 27.8% exact
+  against 30.9% on the walk. It's now held where the voxel fits of every sprite find it.
+
+| Copied pixels: IoU / exact / RGB error | Before | Now | Refining everything | Baseline: the previous frame |
+|---|---|---|---|---|
+| Attack, odd frames hidden | 0.770 / 29.6% / 18.5 | 0.791 / 38.2% / 15.8 | | 0.649 / 29.3% / 18.5 |
+| Attack, SW hidden | 0.811 / 23.1% / 18.2 | 0.848 / 26.7% / 18.1 | | |
+| Warrior's walk, SW hidden | 0.814 / 30.5% / 14.9 | 0.823 / 30.9% / 14.7 | 0.815 / 28.5% / 15.3 | |
+| Zombie's walk, odd frames hidden | 0.913 / 36.1% / 12.9 | 0.877 / 49.8% / 9.0 | 0.913 / 36.2% / 12.6 | 0.791 / 35.4% / 13.1 |
+
+"Before" is the first tracker with everything refined (the zombie's, unlit); "refining everything"
+is the new tracker with `--refine all` and the fixed light. The same settings vary by about half a
+point of exact pixels from run to run.
+
+- **The attack keeps its sword,** and in the in-between frames it sweeps through the swing. With
+  every other frame hidden, the in-between frames beat repeating the previous one by 9 points of
+  exact pixels, with far better silhouettes. The blade breaks up in copied pixels, as thin parts do
+  everywhere (see Next steps).
+- **The colors gain most:** 14 points of exact pixels on the zombie.
+- **Refining everything still gives better silhouettes on the zombie** (0.913 against 0.877), and
+  the known cells' own colors fit closer (the walk's: 53% exact against 44%); but its copied pixels
+  are worse, and those are what the sheets show.
+
 ## Next steps
 
-- **Animations:** checked on two walks and an attack. Hits, deaths and spells, and the other
-  characters, are still to be seen; every animation needs its own preset, with its frame width.
+- **Animations:** checked on two walks and an attack; the attack's sword swing needed the tracking
+  of [Fast motion](#fast-motion). Hits, deaths and spells, and the other characters, are still to
+  be seen; every animation needs its own preset, with its frame width.
+- **Silhouettes and thin parts together:** refining the motion and shape tightens silhouettes (the
+  zombie's in-between frames: 0.913 against 0.877), but fades thin parts and costs copied pixels
+  their consistency. Refining them with opacities held, and with the transport's pull kept on,
+  might keep both.
 - **Few frames:** with every other frame of the warrior's walk hidden, the legs pass each other
   between the frames left, and tracking can't tell them apart (see Moving Gaussians). The real task,
   16 frames from 8, has enough of them; fewer would need some prior on how legs swing.
