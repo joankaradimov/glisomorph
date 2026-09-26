@@ -44,8 +44,10 @@ from gsplat import rasterization
 from poc import fit
 from poc.animate import write_gif, write_sheet
 from poc.evaluate import quantize, score
-from poc.field import camera_basis
-from poc.gaussians import intrinsics, viewmat
+from poc.ramps import Ramps
+from poc.reproject import Warp, choose, fetch, fill, neighbour, smooth_depth, source_depth
+from poc.field import camera_basis, pixel_rays
+from poc.gaussians import DISTANCE, intrinsics, viewmat
 from poc.scene import Scene, masks_for
 from poc.views import PRESETS, frame_count, load_views
 
@@ -164,6 +166,45 @@ class MovingGaussians(torch.nn.Module):
                              torch.sigmoid(self.colors), viewmats, Ks, width, height, camera_model="ortho",
                              render_mode="RGB+ED", packed=False)
 
+    def rest_points(self, phase, viewmat_, K, width, height):
+        """What each pixel shows at a phase, as a point of the rest pose (H, W, 3), with the opacity
+        (H, W) and expected depth (H, W) there: the rest positions, rendered as colors."""
+        means, quats = self.pose(phase)
+        out, alpha, _ = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities), self.means0,
+                                      viewmat_[None], K[None], width, height, camera_model="ortho",
+                                      render_mode="RGB+ED", packed=False)
+        a = alpha[0, ..., 0]
+        return out[0, ..., :3] / a.clamp(min=1e-6)[..., None], a, out[0, ..., 3] - DISTANCE
+
+    def unpose_points(self, points, phase):
+        """Points (..., 3) of the model posed at a phase, moved back to the rest pose: each by the
+        inverse of its nearest nodes' poses, weighted by closeness to where those nodes are then.
+        (The Gaussians' own per-frame corrections, a fraction of a pixel, are left out.)"""
+        rot, move = self.node_pose(phase)
+        posed = self.centers + move
+        flat = points.reshape(-1, 3)
+        d, idx = torch.cat([torch.cdist(c, posed) for c in torch.split(flat, 8192)]).topk(
+            self.bind_idx.shape[1], largest=False)
+        w = torch.exp(-d ** 2 / (2 * self.spacing ** 2)) + 1e-6
+        w = (w / w.sum(-1, keepdim=True))[..., None]
+        back = rot[idx] * torch.tensor([1.0, -1, -1, -1], device=rot.device)  # inverse rotations
+        rest = (w * (quat_rotate(back, flat[:, None] - posed[idx]) + self.centers[idx])).sum(1)
+        return rest.reshape(points.shape)
+
+    def deform_points(self, rest, slot: int, nearest_gaussian=None):
+        """Rest-pose points (..., 3) moved to a frame by the nodes, plus the per-frame correction of
+        each point's nearest Gaussian (indices, if given)."""
+        rot, move = self.node_pose(slot)
+        flat = rest.reshape(-1, 3)
+        d, idx = torch.cat([torch.cdist(c, self.centers) for c in torch.split(flat, 8192)]).topk(
+            self.bind_idx.shape[1], largest=False)
+        w = torch.exp(-d ** 2 / (2 * self.spacing ** 2)) + 1e-6
+        w = (w / w.sum(-1, keepdim=True))[..., None]
+        moved = (w * (quat_rotate(rot[idx], flat[:, None] - self.centers[idx]) + self.centers[idx] + move[idx])).sum(1)
+        if nearest_gaussian is not None:
+            moved = moved + self.residuals[slot][nearest_gaussian.reshape(-1)]
+        return moved.reshape(rest.shape)
+
     def arap(self, slot: int):
         """As rigid as possible: where a node's pose puts each neighbouring node, against where that
         neighbour's own pose puts it (embedded deformation's regularizer), in node spacings."""
@@ -185,6 +226,71 @@ class MovingGaussians(torch.nn.Module):
         accel = (m.roll(-1, 0) - 2 * m + m.roll(1, 0)).square().sum(-1).mean()
         qn, qp = same_hemisphere(q.roll(-1, 0), q), same_hemisphere(q.roll(1, 0), q)
         return accel + 100 * (qn - 2 * q + qp).square().sum(-1).mean()
+
+
+class PixelCopier:
+    """Colors a cell of the torus (a direction at a phase) with the artist's pixels. Each pixel's
+    rest-pose point (MovingGaussians.rest_points) is moved to each nearby original frame, projected
+    into its nearby directions, and takes the palette index there from one that sees it, as
+    reproject.py does across directions alone: nearer frames and directions cost less, regions keep
+    to one source, and shades are interpolated within the palette's ramps."""
+
+    def __init__(self, model, sources, warp, ramps, slots: int):
+        self.model, self.sources, self.warp, self.ramps, self.slots = model, sources, warp, ramps, slots
+
+    def __call__(self, slot_phase, yaw, camera, own):
+        """Palette indices (H, W) of the cell; `own` is the model's own colors, the fallback."""
+        model, warp = self.model, self.warp
+        right, up, forward, vm, K = camera
+        h, w = own.shape
+        rest, alpha, depth = model.rest_points(slot_phase, vm, K, w, h)
+        solid = alpha >= 0.5
+        if warp.smooth:
+            depth = smooth_depth(depth, solid, warp.smooth)[0]
+
+        def gap(a, b, period):
+            d = abs(a - b) % period
+            return min(d, period - d)
+
+        angles = [gap(s["yaw"], yaw, 360.0) for s in self.sources]
+        nearest_angle = max(min(angles), 1.0)
+        costs = [a / nearest_angle + gap(s["slot"], slot_phase, self.slots) for s, a in zip(self.sources, angles)]
+        chosen = sorted(range(len(self.sources)), key=lambda i: costs[i])[:6]
+        # Each pixel's surface point, from the depth, moved back to the rest pose. (Rendering rest
+        # positions as colors would give a wide Gaussian's center to every pixel it covers.) The
+        # nearest Gaussian's per-frame correction is taken off here, and the source frame's added back.
+        s0 = self.sources[0]
+        posed = pixel_rays(h, w, s0["pivot"], s0["offset"], right, up, forward)[0] + depth[..., None] * forward
+        rest = model.unpose_points(posed, slot_phase)
+        near_gaussian = torch.zeros(solid.shape, dtype=torch.long, device=rest.device)
+        if solid.any():
+            near_gaussian[solid] = nearest(rest[solid], model.means0)
+            rest = model.unpose_points(posed - model.residual(slot_phase)[near_gaussian], slot_phase)
+        points_by_slot = {}
+        index, seen, shade, cost = [], [], [], []
+        for i in chosen:
+            s = self.sources[i]
+            if s["slot"] not in points_by_slot:
+                points_by_slot[s["slot"]] = model.deform_points(rest, s["slot"], near_gaussian)
+            idx, ok, lum = fetch(points_by_slot[s["slot"]], s, warp.tolerance, self.ramps)
+            index.append(idx)
+            seen.append(ok & solid)
+            shade.append(lum)
+            cost.append(torch.full_like(depth, costs[i]))
+        index, seen, shade, cost = torch.stack(index), torch.stack(seen), torch.stack(shade), torch.stack(cost)
+        inside = seen.any(0)
+        for d in range(4):
+            inside = inside & neighbour(solid, d, False)
+        links = torch.stack([inside & neighbour(inside, d, False) & ((depth - neighbour(depth, d)).abs() < warp.tolerance)
+                             for d in range(4)])
+        labels = choose(cost, seen, links, warp.coherence)
+        picked = labels >= 0
+        out = torch.full_like(labels, -1)
+        out[picked] = index.gather(0, labels.clamp(min=0)[None])[0][picked]
+        lum = shade.gather(0, labels.clamp(min=0)[None])[0]
+        out = torch.where(picked, self.ramps.nearest(out, lum), out)
+        out = fill(out, solid, warp.fill)
+        return torch.where(solid & (out < 0), own, torch.where(solid, out, torch.full_like(out, -1)))
 
 
 def nearest(a, b):
@@ -353,12 +459,39 @@ def main():
     # 4. Scores and pictures.
     candidates = torch.tensor(list(range(128, 255)) if preset.shadows else [0] + list(range(128, 255)), device=device)
     per_frame = len(frames) / count  # model slots per animation frame
-    results = {"fitted": [], "hidden_direction": [], "hidden_frames": [], "hidden_frames_repeat_previous": []}
+    results = {key: [] for key in ("fitted", "hidden_direction", "hidden_direction_copied", "hidden_frames",
+                                   "hidden_frames_copied", "hidden_frames_repeat_previous")}
     with torch.no_grad():
-        def render(frame_phase, d_yaw):
+        def camera(d_yaw):
             r, u, f = (x[0] for x in camera_basis(torch.tensor([d_yaw], device=device), elevation))
-            colors, alphas, _ = model.rasterize(frame_phase * per_frame, viewmat(r, u, f)[None], K[None], w, h)
+            return r, u, f, viewmat(r, u, f), K
+
+        def render(frame_phase, d_yaw):
+            vm = camera(d_yaw)[3]
+            colors, alphas, _ = model.rasterize(frame_phase * per_frame, vm[None], K[None], w, h)
             return quantize(colors[0, ..., :3], alphas[0, ..., 0], palette, candidates)
+
+        # The originals the copier may take pixels from: every fitted frame in every fitted direction,
+        # with the model's depth there for the visibility test.
+        warp = Warp()
+        sources = []
+        for j, k in enumerate(frames):
+            for d in train_dirs:
+                r, u, f, vm, _ = camera(float(yaws[d]))
+                _, alpha, depth = model.rest_points(j, vm, K, w, h)
+                v = all_views[k][d]
+                idx = torch.as_tensor(v.indices, device=device).long()
+                m = masks_for([v], preset.shadows, device)[0]
+                sources.append({"view": d, "slot": j, "yaw": float(yaws[d]), "right": r, "up": u, "forward": f,
+                                "pivot": pivot, "offset": offset,
+                                "indices": torch.where(m == 1, idx, torch.full_like(idx, -1)),
+                                "depth": source_depth(depth, alpha >= 0.5, warp)})
+        copier = PixelCopier(model, sources, warp, Ramps(palette), len(frames))
+
+        def copied(frame_phase, d_yaw, own=None):
+            if own is None:
+                own = render(frame_phase, d_yaw)
+            return copier(frame_phase * per_frame, d_yaw, camera(d_yaw), own)
 
         def truth(k, d):
             v = all_views[k][d]
@@ -368,11 +501,14 @@ def main():
 
         for k in range(count):
             for d in range(len(yaws)):
-                s = score(render(k, float(yaws[d])), truth(k, d), palette)
+                own = render(k, float(yaws[d]))
+                s = score(own, truth(k, d), palette)
                 if d == args.hide_direction:
                     results["hidden_direction"].append(s)
+                    results["hidden_direction_copied"].append(score(copied(k, float(yaws[d]), own), truth(k, d), palette))
                 elif args.hide_frames and k % 2:
                     results["hidden_frames"].append(s)
+                    results["hidden_frames_copied"].append(score(copied(k, float(yaws[d]), own), truth(k, d), palette))
                     results["hidden_frames_repeat_previous"].append(score(truth(k - 1, d), truth(k, d), palette))
                 else:
                     results["fitted"].append(s)
@@ -385,7 +521,8 @@ def main():
                 print(key, json.dumps({m: round(v, 3) for m, v in summary[key].items()}))
         (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
 
-        # 16 directions by twice the frames: originals where they exist and were fitted, the model elsewhere.
+        # 16 directions by twice the frames: originals where they exist and were fitted, copied pixels
+        # elsewhere.
         pal = (palette.cpu().numpy() * 255).round().astype(np.uint8)
         sheet = []
         for step in range(2 * count):
@@ -393,7 +530,7 @@ def main():
             for n in range(16):
                 known = n % 2 == 0 and step % 2 == 0 and n // 2 != args.hide_direction and step // 2 in frames
                 column.append(truth(step // 2, n // 2).cpu().numpy() if known
-                              else render(step / 2, sign * n * 22.5).cpu().numpy())
+                              else copied(step / 2, sign * n * 22.5).cpu().numpy())
             sheet.append(column)
         write_sheet(sheet, pal, out_dir / "sheet.png")
         write_gif(sheet, pal, out_dir / "directions.gif")

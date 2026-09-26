@@ -480,6 +480,30 @@ on the warrior's walk, 0.79 / 13.1 on the zombie's.
   should be passing. Tracking all 8 frames (the real task: 16 from 8), the feet do swing in opposite
   phase, crossing between frames 0 and 2, about 5 pixels either way.
 
+**Copying pixels through time.** The moving Gaussians know where every surface point is in every
+frame, so a new cell of the torus can take the artist's pixels across time as well as across
+directions (`PixelCopier`). Each pixel's surface point, from the depth, is moved back to the rest
+pose by inverting its nearest nodes' motion, then forward to each nearby original frame, and
+projected into that frame's nearby directions. From there on it's reproject.py's warp: the original
+that sees the point gives its palette index, nearer frames and directions cost less, regions keep
+to one source, and shades are interpolated within the ramps. The sheet's new cells use it.
+
+| Test | Model's own colors: exact / RGB error | Copied pixels: exact / RGB error | Baseline |
+|------|------------------:|-----------------:|---------|
+| Zombie's walk, odd frames hidden | 31% / 13.0 | 36% / 12.9 | the previous frame repeated: 35% / 13.1 |
+| Warrior's walk, SW hidden | 24% / 15.4 | 27% / 16.4 | voxels' relit copied pixels: 30% / 15.3 |
+
+- **In time, copied pixels beat repeating the previous frame on every count but speckle** (1.6% stray
+  pixels against 1.3%; the originals have 1.2%), with the pose right: 0.91 silhouette IoU against
+  0.79.
+- **Across directions, they aren't relit yet.** The light turned with the camera, so a pixel copied
+  from another direction is shaded for that direction. The voxel pipeline relights it with its
+  lighting model; the Gaussians don't have one yet.
+- **Rest positions mustn't be rendered as colors.** That was the first try, and a check that copying
+  an original cell reproduces it failed (22% exact). A few Gaussians are several pixels wide, and
+  rendered as a color, a Gaussian's rest position goes to every pixel it covers. Unposing each
+  pixel's own surface point instead reproduces the original cell at 90–94% exact.
+
 ## Next steps
 
 - **Animations:** checked on two walks and an attack. Hits, deaths and spells, and the other
