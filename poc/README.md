@@ -504,6 +504,14 @@ to one source, and shades are interpolated within the ramps. The sheet's new cel
   rendered as a color, a Gaussian's rest position goes to every pixel it covers. Unposing each
   pixel's own surface point instead reproduces the original cell at 90–94% exact.
 
+**Shadows.** Voxel shadows march rays through the density; Gaussians get a shadow map instead
+(`shadow_map_opacity` in gaussians.py): the posed Gaussians rendered from the light, by another
+orthographic camera, and each pixel's ground point looked up in it. One render per light direction
+makes the light's fit (shadow.py's, which now takes any shadow function) quick. Fitted to frame 0 of
+the warrior's walk, it finds the same light as the voxel fits (20° and 55°), matching the baked
+shadows at 0.57 IoU, and 0.50 on the hidden direction. The sheet now shows the originals with their
+baked shadows, and the new cells over generated ones.
+
 ## Next steps
 
 - **Animations:** checked on two walks and an attack. Hits, deaths and spells, and the other

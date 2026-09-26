@@ -49,7 +49,7 @@ def shadow_opacity(field: VoxelField, origins, forward, lights, ground: float, s
     lights. A pixel's ray meets the ground (y = ground) at q, and the shadow there is how much light
     the reconstruction blocks between q and the light.
     """
-    q = origins + ((ground - origins[..., 1]) / forward[1])[..., None] * forward     # (H, W, 3)
+    q = ground_points(origins, forward, ground)                                   # (H, W, 3)
     q = q[None].expand(len(lights), *q.shape)
     near, far = ray_box(q, lights[:, None, None, :], field.box_min, field.box_max)
     near = near.clamp(min=0)
@@ -89,12 +89,20 @@ def iou(pred, target):
     return inter / union.clamp(min=1)
 
 
-def fit_light(scene, views: list[int]) -> tuple[ShadowLight, float]:
+def ground_points(origins, forward, ground: float):
+    """Where each pixel's ray (origins (H, W, 3), direction forward (3,)) meets the ground (y = ground)."""
+    return origins + ((ground - origins[..., 1]) / forward[1])[..., None] * forward
+
+
+def fit_light(scene, views: list[int], opacity=None, lowest=None) -> tuple[ShadowLight, float]:
     """The light and ground height whose shadows best match the given original views' baked shadows,
     and their mean intersection over union.
 
-    A coarse search over all directions (on every other pixel, with half the samples per ray) is
-    refined around the best one.
+    opacity(origins, forward, lights, ground, fine) gives the shadow's opacity (B, H, W) on the
+    ground under each pixel, for B lights; `fine` asks for full precision. By default it's marched
+    through the scene's voxel field, and `lowest` (the model's lowest height, near which the ground
+    is searched) comes from its occupied voxels. A coarse search over all directions (on every other
+    pixel) is refined around the best one.
     """
     field = scene.field
     right, up, forward = scene.basis(scene.yaws)
@@ -107,21 +115,24 @@ def fit_light(scene, views: list[int]) -> tuple[ShadowLight, float]:
         origins = pixel_rays(*v.shape, v.pivot, scene.offset, right[j], up[j], forward[j])[0]
         cases.append((origins, forward[j], right[j], target, cover))
     samples = scene.samples
+    if opacity is None:
+        def opacity(origins, forward, lights, ground, fine):
+            return shadow_opacity(field, origins, forward, lights, ground, samples if fine else samples // 2)
+    if lowest is None:
+        # The ground is near the lowest part of the model.
+        occupied = field.sigma(field.voxel_centers().view(-1, 3)) > math.log(2)  # half the light per voxel
+        lowest = float(field.voxel_centers().view(-1, 3)[occupied, 1].quantile(0.001))
 
-    # The ground is near the lowest part of the model.
-    occupied = field.sigma(field.voxel_centers().view(-1, 3)) > math.log(2)  # half the light per voxel
-    lowest = float(field.voxel_centers().view(-1, 3)[occupied, 1].quantile(0.001))
-
-    def score(azimuths, elevation, ground, stride, n):
+    def score(azimuths, elevation, ground, stride):
         """Mean IoU (B,) over the views, for lights at the given azimuths (B,) and one elevation, on
-        every `stride`th pixel with n samples per ray."""
+        every `stride`th pixel."""
         total = 0
         el = torch.full_like(azimuths, elevation)
         for origins, fwd, r, target, cover in cases:
             lights = light_directions(azimuths, el, r)
             s = (slice(None, None, stride),) * 2
-            opacity = shadow_opacity(field, origins[s], fwd, lights, ground, n)
-            total = total + iou((opacity >= 0.5) & ~cover[s], target[s])
+            shade = opacity(origins[s], fwd, lights, ground, stride == 1)
+            total = total + iou((shade >= 0.5) & ~cover[s], target[s])
         return total / len(cases)
 
     device = scene.palette.device
@@ -129,7 +140,7 @@ def fit_light(scene, views: list[int]) -> tuple[ShadowLight, float]:
     azimuths = torch.arange(0, 360, 10, device=device, dtype=torch.float32)
     for ground in [lowest + d for d in range(-4, 5)]:
         for elevation in range(10, 90, 5):
-            ious = score(azimuths, float(elevation), ground, 2, samples // 2)
+            ious = score(azimuths, float(elevation), ground, 2)
             k = int(ious.argmax())
             if float(ious[k]) > best[0]:
                 best = (float(ious[k]), ShadowLight(float(azimuths[k]), float(elevation), ground))
@@ -138,7 +149,7 @@ def fit_light(scene, views: list[int]) -> tuple[ShadowLight, float]:
     azimuths = coarse.azimuth + torch.arange(-7.5, 7.6, 2.5, device=device)
     for ground in [coarse.ground + d for d in (-1, -0.5, 0, 0.5, 1)]:
         for elevation in [coarse.elevation + d for d in range(-4, 5)]:
-            ious = score(azimuths, elevation, ground, 1, samples)
+            ious = score(azimuths, elevation, ground, 1)
             k = int(ious.argmax())
             if float(ious[k]) > best[0]:
                 best = (float(ious[k]), ShadowLight(float(azimuths[k]) % 360, elevation, ground))

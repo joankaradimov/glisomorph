@@ -47,8 +47,9 @@ from poc.evaluate import quantize, score
 from poc.ramps import Ramps
 from poc.reproject import Warp, choose, fetch, fill, neighbour, smooth_depth, source_depth
 from poc.field import camera_basis, pixel_rays
-from poc.gaussians import DISTANCE, intrinsics, viewmat
+from poc.gaussians import DISTANCE, intrinsics, shadow_map_opacity, viewmat
 from poc.scene import Scene, masks_for
+from poc.shadow import baked_shadow, fit_light, iou, shadow_mask
 from poc.views import PRESETS, frame_count, load_views
 
 
@@ -461,6 +462,7 @@ def main():
     per_frame = len(frames) / count  # model slots per animation frame
     results = {key: [] for key in ("fitted", "hidden_direction", "hidden_direction_copied", "hidden_frames",
                                    "hidden_frames_copied", "hidden_frames_repeat_previous")}
+    shadow_scores = {"hidden_direction": [], "hidden_frames": []}
     with torch.no_grad():
         def camera(d_yaw):
             r, u, f = (x[0] for x in camera_basis(torch.tensor([d_yaw], device=device), elevation))
@@ -488,6 +490,36 @@ def main():
                                 "depth": source_depth(depth, alpha >= 0.5, warp)})
         copier = PixelCopier(model, sources, warp, Ramps(palette), len(frames))
 
+        # Shadows: a shadow map of the posed Gaussians. The light and the ground's height are fitted to
+        # frame 0's baked shadows (shadow.py); the light turned with the camera, so it's the same for
+        # every frame.
+        def opacity_at(slot_phase):
+            means, quats = model.pose(slot_phase)
+            scales, opac = torch.exp(model.scales), torch.sigmoid(model.opacities)
+            return lambda origins, fwd, lights, ground, fine=True: shadow_map_opacity(
+                means, quats, scales, opac, origins, fwd, lights, ground)
+
+        light = None
+        if preset.shadows:
+            posed, _ = model.pose(0)
+            lowest = float(posed[torch.sigmoid(model.opacities) > 0.5, 1].quantile(0.001))
+            light, light_iou = fit_light(still_scene, train_dirs, opacity=opacity_at(0), lowest=lowest)
+            print("shadow light: %s (IoU %.2f with frame 0's baked shadows)" % (light, light_iou))
+
+        def with_shadow(indices, frame_phase, d_yaw):
+            """The cell as a sprite: its colors over its baked shadow (index 0)."""
+            if light is None:
+                return indices
+            r, u, f, _, _ = camera(d_yaw)
+            origins = pixel_rays(h, w, pivot, offset, r, u, f)[0]
+            shade = opacity_at(frame_phase * per_frame)(origins, f, light.direction(r)[None], light.ground)[0]
+            return torch.where(shadow_mask(shade, indices >= 0), torch.zeros_like(indices), indices)
+
+        def shadow_match(frame_phase, d, indices):
+            sprite = with_shadow(indices, frame_phase, float(yaws[d]))
+            original = torch.as_tensor(all_views[frame_phase][d].indices, device=device).long()
+            return float(iou(sprite == 0, baked_shadow(original)))
+
         def copied(frame_phase, d_yaw, own=None):
             if own is None:
                 own = render(frame_phase, d_yaw)
@@ -505,10 +537,16 @@ def main():
                 s = score(own, truth(k, d), palette)
                 if d == args.hide_direction:
                     results["hidden_direction"].append(s)
-                    results["hidden_direction_copied"].append(score(copied(k, float(yaws[d]), own), truth(k, d), palette))
+                    cell = copied(k, float(yaws[d]), own)
+                    results["hidden_direction_copied"].append(score(cell, truth(k, d), palette))
+                    if light is not None:
+                        shadow_scores["hidden_direction"].append(shadow_match(k, d, cell))
                 elif args.hide_frames and k % 2:
                     results["hidden_frames"].append(s)
-                    results["hidden_frames_copied"].append(score(copied(k, float(yaws[d]), own), truth(k, d), palette))
+                    cell = copied(k, float(yaws[d]), own)
+                    results["hidden_frames_copied"].append(score(cell, truth(k, d), palette))
+                    if light is not None:
+                        shadow_scores["hidden_frames"].append(shadow_match(k, d, cell))
                     results["hidden_frames_repeat_previous"].append(score(truth(k - 1, d), truth(k, d), palette))
                 else:
                     results["fitted"].append(s)
@@ -519,18 +557,27 @@ def main():
             if rows:
                 summary[key] = {m: float(np.mean([r[m] for r in rows])) for m in rows[0]}
                 print(key, json.dumps({m: round(v, 3) for m, v in summary[key].items()}))
+        if light is not None:
+            summary["shadow_light"] = dataclasses.asdict(light)
+            for key, rows in shadow_scores.items():
+                if rows:
+                    summary[key + "_shadow_iou"] = float(np.mean(rows))
+                    print(key, "shadow IoU %.3f" % summary[key + "_shadow_iou"])
         (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
 
-        # 16 directions by twice the frames: originals where they exist and were fitted, copied pixels
-        # elsewhere.
+        # 16 directions by twice the frames: originals where they exist and were fitted (with their baked
+        # shadows), copied pixels over generated shadows elsewhere.
         pal = (palette.cpu().numpy() * 255).round().astype(np.uint8)
         sheet = []
         for step in range(2 * count):
             column = []
             for n in range(16):
                 known = n % 2 == 0 and step % 2 == 0 and n // 2 != args.hide_direction and step // 2 in frames
-                column.append(truth(step // 2, n // 2).cpu().numpy() if known
-                              else copied(step / 2, sign * n * 22.5).cpu().numpy())
+                if known:
+                    column.append(all_views[step // 2][n // 2].indices.astype(np.int64))
+                else:
+                    cell = copied(step / 2, sign * n * 22.5)
+                    column.append(with_shadow(cell, step / 2, sign * n * 22.5).cpu().numpy())
             sheet.append(column)
         write_sheet(sheet, pal, out_dir / "sheet.png")
         write_gif(sheet, pal, out_dir / "directions.gif")
