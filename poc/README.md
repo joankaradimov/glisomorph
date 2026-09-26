@@ -491,14 +491,14 @@ to one source, and shades are interpolated within the ramps. The sheet's new cel
 | Test | Model's own colors: exact / RGB error | Copied pixels: exact / RGB error | Baseline |
 |------|------------------:|-----------------:|---------|
 | Zombie's walk, odd frames hidden | 31% / 13.0 | 36% / 12.9 | the previous frame repeated: 35% / 13.1 |
-| Warrior's walk, SW hidden | 24% / 15.4 | 27% / 16.4 | voxels' relit copied pixels: 30% / 15.3 |
+| Warrior's walk, SW hidden (unlit) | 24% / 15.4 | 27% / 16.4 | voxels' relit copied pixels: 30% / 15.3 |
 
 - **In time, copied pixels beat repeating the previous frame on every count but speckle** (1.6% stray
   pixels against 1.3%; the originals have 1.2%), with the pose right: 0.91 silhouette IoU against
   0.79.
-- **Across directions, they aren't relit yet.** The light turned with the camera, so a pixel copied
+- **Across directions, they need relighting.** The light turned with the camera, so a pixel copied
   from another direction is shaded for that direction. The voxel pipeline relights it with its
-  lighting model; the Gaussians don't have one yet.
+  lighting model, and so do the moving Gaussians now (see Lighting, below).
 - **Rest positions mustn't be rendered as colors.** That was the first try, and a check that copying
   an original cell reproduces it failed (22% exact). A few Gaussians are several pixels wide, and
   rendered as a color, a Gaussian's rest position goes to every pixel it covers. Unposing each
@@ -533,10 +533,11 @@ better silhouettes. Their fit to the known cells improves too: 52% exact against
 
 - **Animations:** checked on two walks and an attack. Hits, deaths and spells, and the other
   characters, are still to be seen; every animation needs its own preset, with its frame width.
-- **Moving Gaussians' fit:** small per-frame corrections for each Gaussian on top of the nodes'
-  motion, so that each frame can match its views as closely as a still.
-- **Gaussians' colors:** the lighting model, relit copied pixels, and shadows (a render from the
-  light instead of marching through voxels).
+- **Few frames:** with every other frame of the warrior's walk hidden, the legs pass each other
+  between the frames left, and tracking can't tell them apart (see Moving Gaussians). The real task,
+  16 frames from 8, has enough of them; fewer would need some prior on how legs swing.
+- **Lit stills:** fit.py's Gaussians are unlit; the moving Gaussians' lighting model would give the
+  stills relit copied pixels too.
 - **Cleaner surfaces:** 2D Gaussians (flat discs) would give sharper depth than 3D ones, but gsplat's
   2D rasterizer has no orthographic mode.
 - **Thin parts:** blades and bows still break up. A blade's silhouette survives (its opacity stays
