@@ -512,6 +512,23 @@ the warrior's walk, it finds the same light as the voxel fits (20° and 55°), m
 shadows at 0.57 IoU, and 0.50 on the hidden direction. The sheet now shows the originals with their
 baked shadows, and the new cells over generated ones.
 
+**Lighting.** The moving Gaussians have the voxel field's lighting model too (on by default,
+`--lighting none` to leave it out): colors become albedo, shaded by a light fixed to the camera, with
+an ambient term and a highlight. A Gaussian's normal is its thinnest axis (they're mostly flat),
+turned to face the camera, and shading is deferred: albedo, normal and highlight strength are
+rendered, then shaded per pixel. The copier relights each copied pixel, from its source's shading
+(the surface's normal turned back to the source frame by the nodes) to the new cell's, within its
+ramp, and prefers sources that shade the point alike.
+
+| Warrior's walk, SW hidden | Silhouette IoU | Exact | RGB error | Blurred RGB error |
+|---------------------------|---------------:|------:|----------:|------------------:|
+| Copied pixels, unlit | 0.81 | 27.9% | 16.2 | 10.4 |
+| Copied pixels, relit | 0.81 | 29.2% | 15.4 | 9.2 |
+| Voxels' relit copied pixels | 0.75 | 30.2% | 15.3 | 8.8 |
+
+Relit, the moving Gaussians color a hidden direction almost as well as the voxel pipeline, with
+better silhouettes. Their fit to the known cells improves too: 52% exact against 43% unlit.
+
 ## Next steps
 
 - **Animations:** checked on two walks and an attack. Hits, deaths and spells, and the other

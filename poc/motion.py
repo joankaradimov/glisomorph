@@ -102,7 +102,7 @@ class MovingGaussians(torch.nn.Module):
     """Shared Gaussians (rest means and quaternions, log scales, opacity and color logits), moved by
     nodes with a unit quaternion and a translation each, per frame."""
 
-    def __init__(self, still, frames: int, nodes: int = 256, bind: int = 4, links: int = 6):
+    def __init__(self, still, frames: int, nodes: int = 256, bind: int = 4, links: int = 6, lit: bool = False):
         super().__init__()
         p = still.params
         self.means0 = torch.nn.Parameter(p["means"].detach().clone())
@@ -137,6 +137,17 @@ class MovingGaussians(torch.nn.Module):
             near = [torch.cdist(chunk, self.means0).topk(5, largest=False).indices[:, 1:]
                     for chunk in torch.split(self.means0, 4096)]
         self.register_buffer("gaussian_links", torch.cat(near))
+        # The lighting model, as field.py's LitVoxelField: colors become albedo, shaded by a light
+        # fixed to the camera (x right, y up, z toward it), with an ambient term and a Blinn-Phong
+        # highlight of per-Gaussian strength. It starts where fits of Diablo's sprites end up.
+        self.lit = lit
+        if lit:
+            device = centers.device
+            self.specular = torch.nn.Parameter(torch.full((len(self.means0),), -3.0, device=device))
+            self.light_dirs = torch.nn.Parameter(torch.tensor([[0.4, 0.75, 0.5]], device=device))
+            self.light_raw = torch.nn.Parameter(torch.tensor([math.log(math.expm1(0.6))], device=device))
+            self.ambient_raw = torch.nn.Parameter(torch.tensor(math.log(math.expm1(0.6)), device=device))
+            self.shininess_raw = torch.nn.Parameter(torch.tensor(math.log(16.0), device=device))
 
     def node_pose(self, phase: float):
         """The nodes' unit quaternions (M, 4) and translations (M, 3) at a phase in model frames."""
@@ -161,11 +172,47 @@ class MovingGaussians(torch.nn.Module):
         turn = F.normalize((w * same_hemisphere(turns, turns[:, :1])).sum(1), dim=-1)
         return means, quat_multiply(turn, F.normalize(self.quats0, dim=-1))
 
+    def light_parameters(self):
+        return [self.specular, self.light_dirs, self.light_raw, self.ambient_raw, self.shininess_raw]
+
+    def normals(self, quats, forward):
+        """Unit normals (G, 3) of posed Gaussians: each one's thinnest axis, turned to face the camera."""
+        axis = F.one_hot(self.scales.argmin(-1), 3).float()
+        n = quat_rotate(quats, axis)
+        return torch.where((n @ -forward)[:, None] < 0, -n, n)
+
+    def shading(self, normals, right, up, forward):
+        """Diffuse-plus-ambient factor (...,) and highlight (...,) for unit normals (..., 3), seen by a
+        camera; the light turns with it."""
+        cam = F.normalize(self.light_dirs, dim=-1)
+        light = F.normalize(cam[:, :1] * right + cam[:, 1:2] * up - cam[:, 2:3] * forward, dim=-1)
+        power = F.softplus(self.light_raw)
+        diffuse = F.softplus(self.ambient_raw) + (power * torch.relu(normals @ light.t())).sum(-1)
+        halfway = F.normalize(light - forward, dim=-1)
+        highlight = (power * torch.relu(normals @ halfway.t()) ** torch.exp(self.shininess_raw)).sum(-1)
+        return diffuse, highlight
+
     def rasterize(self, phase, viewmats, Ks, width, height):
+        """Colors with expected depth (C, H, W, 4), opacity (C, H, W, 1) and gsplat's info. With the
+        lighting model, albedo, normal and highlight strength are rendered, then shaded per pixel
+        (deferred); the pixels' normals are kept in last_normal (C, H, W, 3)."""
         means, quats = self.pose(phase)
-        return rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
-                             torch.sigmoid(self.colors), viewmats, Ks, width, height, camera_model="ortho",
-                             render_mode="RGB+ED", packed=False)
+        common = dict(camera_model="ortho", render_mode="RGB+ED", packed=False)
+        if not self.lit:
+            return rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
+                                 torch.sigmoid(self.colors), viewmats, Ks, width, height, **common)
+        albedo = torch.sigmoid(self.colors)
+        strength = torch.sigmoid(self.specular)[:, None]
+        features = torch.stack([torch.cat([albedo, self.normals(quats, vm[2, :3]), strength], -1) for vm in viewmats])
+        out, alpha, info = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
+                                         features, viewmats, Ks, width, height, **common)
+        normal = F.normalize(out[..., 3:6], dim=-1)
+        shaded = []
+        for c, vm in enumerate(viewmats):
+            diffuse, highlight = self.shading(normal[c], vm[0, :3], -vm[1, :3], vm[2, :3])
+            shaded.append(out[c, ..., :3] * diffuse[..., None] + (out[c, ..., 6] * highlight)[..., None])
+        self.last_normal = normal
+        return torch.cat([torch.stack(shaded), out[..., 7:8]], -1), alpha, info
 
     def rest_points(self, phase, viewmat_, K, width, height):
         """What each pixel shows at a phase, as a point of the rest pose (H, W, 3), with the opacity
@@ -191,6 +238,18 @@ class MovingGaussians(torch.nn.Module):
         back = rot[idx] * torch.tensor([1.0, -1, -1, -1], device=rot.device)  # inverse rotations
         rest = (w * (quat_rotate(back, flat[:, None] - posed[idx]) + self.centers[idx])).sum(1)
         return rest.reshape(points.shape)
+
+    def turn_at(self, rest, phase):
+        """The blended rotation (..., 4) that the nodes near rest-pose points (..., 3) apply at a phase."""
+        rot, _ = self.node_pose(phase)
+        flat = rest.reshape(-1, 3)
+        d, idx = torch.cat([torch.cdist(c, self.centers) for c in torch.split(flat, 8192)]).topk(
+            self.bind_idx.shape[1], largest=False)
+        w = torch.exp(-d ** 2 / (2 * self.spacing ** 2)) + 1e-6
+        w = (w / w.sum(-1, keepdim=True))[..., None]
+        turns = rot[idx]
+        turn = F.normalize((w * same_hemisphere(turns, turns[:, :1])).sum(1), dim=-1)
+        return turn.reshape(rest.shape[:-1] + (4,))
 
     def deform_points(self, rest, slot: int, nearest_gaussian=None):
         """Rest-pose points (..., 3) moved to a frame by the nodes, plus the per-frame correction of
@@ -240,11 +299,16 @@ class PixelCopier:
         self.model, self.sources, self.warp, self.ramps, self.slots = model, sources, warp, ramps, slots
 
     def __call__(self, slot_phase, yaw, camera, own):
-        """Palette indices (H, W) of the cell; `own` is the model's own colors, the fallback."""
+        """Palette indices (H, W) of the cell; `own` is the model's own colors, the fallback. With the
+        model's lighting, each copied pixel is relit from its source's shading to this cell's, and
+        sources that shade a point differently cost more (as reproject.py's shading cost)."""
         model, warp = self.model, self.warp
         right, up, forward, vm, K = camera
         h, w = own.shape
         rest, alpha, depth = model.rest_points(slot_phase, vm, K, w, h)
+        if model.lit:
+            model.rasterize(slot_phase, vm[None], K[None], w, h)
+            normal = model.last_normal[0]
         solid = alpha >= 0.5
         if warp.smooth:
             depth = smooth_depth(depth, solid, warp.smooth)[0]
@@ -267,17 +331,31 @@ class PixelCopier:
         if solid.any():
             near_gaussian[solid] = nearest(rest[solid], model.means0)
             rest = model.unpose_points(posed - model.residual(slot_phase)[near_gaussian], slot_phase)
-        points_by_slot = {}
+        points_by_slot, normals_by_slot = {}, {}
+        if model.lit:
+            here, _ = model.shading(normal, right, up, forward)
+            turn_here = model.turn_at(rest, slot_phase)
         index, seen, shade, cost = [], [], [], []
         for i in chosen:
             s = self.sources[i]
             if s["slot"] not in points_by_slot:
                 points_by_slot[s["slot"]] = model.deform_points(rest, s["slot"], near_gaussian)
+                if model.lit:
+                    # The surface's normal as it was in the source frame: turned by the nodes' motion.
+                    relative = quat_multiply(model.turn_at(rest, s["slot"]), turn_here * torch.tensor(
+                        [1.0, -1, -1, -1], device=rest.device))
+                    normals_by_slot[s["slot"]] = F.normalize(quat_rotate(relative, normal), dim=-1)
             idx, ok, lum = fetch(points_by_slot[s["slot"]], s, warp.tolerance, self.ramps)
+            c = torch.full_like(depth, costs[i])
+            if model.lit:
+                there, _ = model.shading(normals_by_slot[s["slot"]], s["right"], s["up"], s["forward"])
+                ratio = here / there.clamp(min=1e-3)
+                lum = lum * ratio.clamp(0.5, 2.0)
+                c = c + warp.shading * torch.log(ratio.clamp(min=1e-3)).abs()
             index.append(idx)
             seen.append(ok & solid)
             shade.append(lum)
-            cost.append(torch.full_like(depth, costs[i]))
+            cost.append(c)
         index, seen, shade, cost = torch.stack(index), torch.stack(seen), torch.stack(shade), torch.stack(cost)
         inside = seen.any(0)
         for d in range(4):
@@ -334,6 +412,8 @@ def main():
     ap.add_argument("--hide-direction", type=int, default=None, help="leave this direction out of every frame")
     ap.add_argument("--hide-frames", choices=["odd"], default=None, help="leave every other frame out")
     ap.add_argument("--nodes", type=int, default=256, help="how many nodes move the Gaussians")
+    ap.add_argument("--lighting", default="phong", choices=["none", "phong"],
+                    help="shade albedo with a light fixed to the camera (as fit.py), and relight copied pixels")
     ap.add_argument("--track-iters", type=int, default=800, help="iterations per frame while tracking")
     ap.add_argument("--refine-iters", type=int, default=3000, help="iterations of the joint refinement")
     ap.add_argument("--arap", type=float, default=0.1, help="weight of the nodes' rigidity")
@@ -396,7 +476,7 @@ def main():
         keep = torch.sigmoid(p["opacities"]) > 0.5
         return p["means"][keep].detach(), torch.sigmoid(p["colors"][keep]).detach()
 
-    model = MovingGaussians(still_scene.field, len(frames), nodes=args.nodes)
+    model = MovingGaussians(still_scene.field, len(frames), nodes=args.nodes, lit=args.lighting != "none")
     print("%d Gaussians, %d nodes %.1f pixels apart" % (len(model.means0), args.nodes, model.spacing))
 
     def only_slot(j):
@@ -442,7 +522,8 @@ def main():
                             {"params": [model.means0], "lr": 0.005}, {"params": [model.quats0], "lr": 0.001},
                             {"params": [model.scales], "lr": 0.002}, {"params": [model.opacities], "lr": 0.01},
                             {"params": [model.colors], "lr": 0.01}]
-                           + ([{"params": [model.residuals], "lr": 0.01}] if args.corrections else []))
+                           + ([{"params": [model.residuals], "lr": 0.01}] if args.corrections else [])
+                           + ([{"params": model.light_parameters(), "lr": 0.01}] if model.lit else []))
     t0 = time.time()
     for it in range(args.refine_iters):
         j = it % len(frames)
@@ -552,7 +633,12 @@ def main():
                     results["fitted"].append(s)
         summary = {"preset": args.preset, "frames": count, "fitted_frames": frames, "directions": train_dirs,
                    "elevation_deg": math.degrees(float(elevation)), "gaussians": len(model.means0),
-                   "nodes": args.nodes, "seconds": time.time() - t_start}
+                   "nodes": args.nodes, "lighting": args.lighting, "seconds": time.time() - t_start}
+        if model.lit:
+            summary["light"] = {"direction_camera_space": F.normalize(model.light_dirs, dim=-1).tolist(),
+                                "power": F.softplus(model.light_raw).tolist(),
+                                "ambient": F.softplus(model.ambient_raw).item()}
+            print("light (camera space):", json.dumps(summary["light"]))
         for key, rows in results.items():
             if rows:
                 summary[key] = {m: float(np.mean([r[m] for r in rows])) for m in rows[0]}
