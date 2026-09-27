@@ -372,7 +372,8 @@ frame 0's camera shared, fits the shadows' light once, and writes the animation 
 to `out/<preset>-16/`:
 - `sheet.png`: a row per direction (from S clockwise, originals and new ones alternating) and a
   column per frame, at the frames' own size and anchor, in the palette, with index 255 transparent;
-- `directions.gif`: the 16 directions animated, to watch.
+- `directions.gif`: the 16 directions animated at the game's speed (a frame per 50 ms tick, as
+  walks and attacks play), to watch.
 
 ```
 python -m poc.animate --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk
@@ -469,7 +470,7 @@ together, the last tied to the first, the node paths kept smooth, and each Gauss
 correction of its position per frame, on top of the nodes' motion.
 
 The output samples the torus at twice the resolution on both axes: 16 directions by twice the
-frames.
+frames. Its GIF plays them at the game's speed, so at twice the frame rate: 40 frames a second.
 
 - **Nodes are needed.** Moving every Gaussian on its own, held together only by its nearest
   neighbours (as in Dynamic 3D Gaussians), smeared the swinging legs: the frames' silhouettes fell to

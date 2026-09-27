@@ -721,7 +721,9 @@ def main():
             sheet.append(column)
         if sheet:
             write_sheet(sheet, pal, out_dir / "sheet.png")
-            write_gif(sheet, pal, out_dir / "directions.gif")
+            # Twice the frames at the game's speed: 25 ms each, which a GIF (in steps of 10 ms) shows as
+            # 20 and 30 in turn.
+            write_gif(sheet, pal, out_dir / "directions.gif", duration=[20, 30] * count)
     torch.save({"model": model.state_dict(), "frames": frames}, out_dir / "motion.pt")
     print("wrote", out_dir, "(%.0fs)" % (time.time() - t_start))
 

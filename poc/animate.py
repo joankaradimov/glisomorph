@@ -10,7 +10,8 @@ Outputs, in out/<preset>-16/:
 - sheet.png: every frame in 16 directions, as the game would store them. There is a row per
   direction, from S clockwise with the originals and the new ones alternating, and a column per
   frame. Frames keep their size and anchor. The image is in the palette, with index 255 transparent.
-- directions.gif: the 16 directions animated, enlarged, the new ones marked in blue.
+- directions.gif: the 16 directions animated, enlarged, the new ones marked in blue, at the game's
+  speed for walks and attacks (a frame per 50 ms tick).
 """
 
 import argparse
@@ -28,6 +29,7 @@ from poc.views import PRESETS, frame_count
 
 DIRECTIONS = ["S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW", "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE"]
 TRANSPARENT = 255  # sprites never use it
+TICK_MS = 50  # the game's tick: walks and attacks show a frame per tick (standing, a frame per 4)
 BACKGROUND = (40, 40, 44)
 
 
@@ -52,7 +54,10 @@ def write_sheet(frames: list[list[np.ndarray]], palette: np.ndarray, path: Path)
     image.save(path, transparency=TRANSPARENT)
 
 
-def write_gif(frames: list[list[np.ndarray]], palette: np.ndarray, path: Path, scale: int = 2) -> None:
+def write_gif(frames: list[list[np.ndarray]], palette: np.ndarray, path: Path, scale: int = 2,
+              duration=TICK_MS) -> None:
+    """All directions of each frame, side by side, one GIF frame each, shown for `duration` ms (or a
+    list of durations, one per frame)."""
     solid = np.any([img >= 0 for directions in frames for img in directions], axis=0)
     ys, xs = np.nonzero(solid)
     y0, y1, x0, x1 = max(ys.min() - 2, 0), ys.max() + 3, max(xs.min() - 2, 0), xs.max() + 3
@@ -80,7 +85,7 @@ def write_gif(frames: list[list[np.ndarray]], palette: np.ndarray, path: Path, s
         for n, tile in enumerate(tiles):
             picture.paste(tile, ((n % 8) * (tw + 4), (n // 8) * (th + 4)))
         pictures.append(picture)
-    pictures[0].save(path, save_all=True, append_images=pictures[1:], duration=100, loop=0)
+    pictures[0].save(path, save_all=True, append_images=pictures[1:], duration=duration, loop=0)
 
 
 def main():
