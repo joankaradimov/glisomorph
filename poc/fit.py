@@ -104,6 +104,11 @@ def main(argv=None):
     ap.add_argument("--supersample", type=int, default=None,
                     help="render each pixel as the average of s x s sub-pixel samples (area sampling); by default "
                          "%d for Gaussians, 1 for voxels" % GAUSSIAN_SUPERSAMPLE)
+    ap.add_argument("--snap", type=float, default=0.0,
+                    help="Gaussians: fit colors as they'll be snapped to the palette, by cross-entropy over its "
+                         "colors at this temperature (0: the squared distance to the pixel's palette color)")
+    ap.add_argument("--keyed", action="store_true",
+                    help="Gaussians: fit opacity as the sprites' 1-bit transparency (any above a half is solid)")
     ap.add_argument("--refine-camera", action="store_true",
                     help="refine the calibrated elevation and pivot offset by gradient")
     ap.add_argument("--refine-from", type=int, default=300, help="iteration at which camera refinement starts")
@@ -193,7 +198,7 @@ def main(argv=None):
               "test_views": test if args.split != "all" else [], "model": args.model,
               "lighting": args.lighting if lit else "none", "lights": args.lights, "harmonics": args.harmonics,
               "coupled_normals": args.coupled_normals, "voxel": args.voxel, "box_min": box_min, "box_max": box_max,
-              "supersample": args.supersample, "yaw_sign": sign}
+              "supersample": args.supersample, "snap": args.snap, "keyed": args.keyed, "yaw_sign": sign}
     yaw_rad = torch.deg2rad(yaws)
     if gaussians:
         from poc.gaussians import GaussianField  # needs gsplat
@@ -241,10 +246,17 @@ def main(argv=None):
         # All training views at once, with densification (gaussians.py).
         from poc.gaussians import intrinsics, viewmat
         r, u, f = camera_basis(yaws[train], elev)
+        snap = None
+        if args.snap:
+            candidates = torch.tensor([0] + list(range(128, 255)), device=device)  # the indices sprites use
+            colors = palette[candidates].float()
+            class_of = ((palette.float()[:, None] - colors) ** 2).sum(-1).argmin(1)  # each index's nearest
+            snap = (colors, torch.stack([class_of[torch.as_tensor(views[i].indices, device=device).long().clamp(min=0)]
+                                         for i in train]), args.snap)
         field.fit(torch.stack([viewmat(r[k], u[k], f[k]) for k in range(len(train))]),
                   torch.stack([intrinsics(views[i].pivot, off, device) for i in train]),
                   torch.stack([t[0] for t in targets]), torch.stack([t[1] == 1 for t in targets]),
-                  iters=args.iters, lr=args.lr, supersample=args.supersample)
+                  iters=args.iters, lr=args.lr, supersample=args.supersample, snap=snap, keyed=args.keyed)
     else:
         t0 = time.time()
         for it in range(args.iters):

@@ -94,13 +94,19 @@ class GaussianField(torch.nn.Module):
         return pool(colors[..., :3], s), pool(alpha, s)
 
     def fit(self, viewmats, Ks, targets, masks, iters: int = 3000, lr: float = 0.05, densify: bool = True,
-            supersample: int = 1):
+            supersample: int = 1, snap=None, keyed: bool = False):
         """Fit to views: viewmats (C, 4, 4) and Ks (C, 3, 3) as viewmat() and intrinsics() make them,
         target colors (C, H, W, 3), masks (C, H, W), True where the model is seen. All views render in
         one call per step. With `densify`, gsplat's default strategy clones and splits Gaussians where
         the views pull hardest, and prunes transparent ones. With `supersample` s, the views render s
         times finer and are averaged down, as a renderer with antialiasing makes a pixel: then the model
-        can hold detail finer than a pixel, as far as the views pin it down."""
+        can hold detail finer than a pixel, as far as the views pin it down.
+
+        The sprites' pixels were snapped to the palette, and their transparency is one bit. With `snap`
+        (the palette colors a pixel can snap to (K, 3), each view's class among them (C, H, W), and a
+        temperature), colors are fitted as they'll be snapped: any color nearest the right palette color
+        will do (cross-entropy over the palette, softened by the temperature), rather than the palette
+        color itself. With `keyed`, any opacity above a half is solid, and any below it transparent."""
         params = self.params
         rates = {"means": lr / 5, "scales": lr / 10, "quats": lr / 50, "opacities": lr, "colors": lr / 2}
         optimizers = {k: torch.optim.Adam([params[k]], lr=rates[k]) for k in params}
@@ -123,7 +129,15 @@ class GaussianField(torch.nn.Module):
             if densify:
                 strategy.step_pre_backward(params, optimizers, state, step, info)
             rgb, alpha = down(colors[..., :3]), down(alphas)[..., 0]
-            loss = ((rgb - targets) ** 2)[masks].mean()
+            if snap is None:
+                loss = ((rgb - targets) ** 2)[masks].mean()
+            else:
+                palette, classes, tau = snap
+                color = rgb[masks] / alpha[masks].clamp(min=0.25)[:, None]  # snapped without the opacity
+                # Scaled by the temperature, so that it pulls about as hard as the squared distance does.
+                loss = tau * F.cross_entropy(-((color[:, None] - palette) ** 2).sum(-1) / tau, classes[masks])
+            if keyed:
+                alpha = torch.sigmoid((alpha - 0.5) * 12)  # past a half, little more pull either way
             loss = loss + 0.5 * F.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), solid)
             loss = loss + F.relu(params["scales"] - math.log(3.0)).square().mean()  # keep Gaussians small
             loss.backward()

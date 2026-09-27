@@ -459,8 +459,11 @@ def follow(means, points, moves, k: int = 4):
     return moves[near].mean(1)
 
 
-def image_loss(colors, alphas, targets, masks, blur: int = 1):
-    """Color error inside the silhouettes and silhouette error, at full size or averaged over blur x blur."""
+def image_loss(colors, alphas, targets, masks, blur: int = 1, snap=None, keyed: bool = False):
+    """Color error inside the silhouettes and silhouette error, at full size or averaged over blur x blur.
+    At full size, as GaussianField.fit: with `snap` (the palette colors a pixel can snap to (K, 3) and a
+    temperature), colors are fitted as they'll be snapped, so any color nearest the right palette color
+    will do; with `keyed`, any opacity above a half is solid, and any below it transparent."""
     rgb, alpha = colors[..., :3], alphas[..., 0]
     solid = masks.float()
     if blur > 1:
@@ -468,7 +471,15 @@ def image_loss(colors, alphas, targets, masks, blur: int = 1):
             return F.avg_pool2d(x.movedim(-1, 1) if x.dim() == 4 else x[:, None], blur).movedim(1, -1).squeeze(-1)
         rgb, alpha, targets, solid = down(rgb), down(alpha), down(targets * solid[..., None]), down(solid)
         return ((rgb - targets) ** 2).mean() + 0.5 * ((alpha - solid) ** 2).mean()
-    loss = ((rgb - targets) ** 2)[masks].mean()
+    if snap is None:
+        loss = ((rgb - targets) ** 2)[masks].mean()
+    else:
+        palette, tau = snap
+        color = rgb[masks] / alpha[masks].clamp(min=0.25)[:, None]  # snapped without the opacity
+        classes = ((targets[masks][:, None] - palette) ** 2).sum(-1).argmin(1)  # each pixel's palette color
+        loss = tau * F.cross_entropy(-((color[:, None] - palette) ** 2).sum(-1) / tau, classes)
+    if keyed:
+        alpha = torch.sigmoid((alpha - 0.5) * 12)  # past a half, little more pull either way
     return loss + 0.5 * F.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), solid)
 
 
@@ -505,6 +516,12 @@ def main():
                     help="what the joint refinement changes: the colors (and highlights) only; also the rest "
                          "shape, fitted to every frame through the tracked motion; or also the motion, the "
                          "opacities and per-frame corrections, which fit the known cells closer but copy worse")
+    ap.add_argument("--snap", type=float, default=0.0,
+                    help="in the refinement, fit colors as they'll be snapped to the palette: cross-entropy over "
+                         "its colors at this temperature (0: the squared distance to the pixel's palette color)")
+    ap.add_argument("--keyed", action="store_true",
+                    help="in the refinement, fit opacity as the sprites' 1-bit transparency (any above a half is "
+                         "solid)")
     ap.add_argument("--load", default=None,
                     help="a saved motion.pt to score and draw again, instead of tracking and refining")
     ap.add_argument("--no-sheet", action="store_true", help="score, but skip the 16-direction sheet and GIF")
@@ -666,12 +683,14 @@ def main():
         if args.corrections:
             groups.append({"params": [model.residuals], "lr": 0.01})
     opt = torch.optim.Adam(groups)
+    candidates = torch.tensor([0] + list(range(128, 255)), device=device)  # the indices sprites use
+    snap = (palette[candidates], args.snap) if args.snap else None
     t0 = time.time()
     for it in range(0 if args.load else args.refine_iters):
         j = it % len(frames)
         targets, masks = all_targets[j]
         colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
-        loss = image_loss(colors, alphas, targets, masks)
+        loss = image_loss(colors, alphas, targets, masks, snap=snap, keyed=args.keyed)
         if args.refine == "shape":
             loss = loss + F.relu(model.scales - math.log(3.0)).square().mean()  # keep Gaussians small
         if args.refine == "all":
@@ -685,7 +704,6 @@ def main():
             print("refine %5d  loss %.5f  (%.0fs)" % (it, loss.item(), time.time() - t0))
 
     # 4. Scores and pictures.
-    candidates = torch.tensor([0] + list(range(128, 255)), device=device)
     per_frame = len(frames) / count  # model slots per animation frame
     results = {key: [] for key in ("fitted", "hidden_direction", "hidden_direction_copied", "hidden_frames",
                                    "hidden_frames_copied", "hidden_frames_repeat_previous")}

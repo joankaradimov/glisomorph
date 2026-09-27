@@ -465,6 +465,30 @@ A hidden direction gains less: with SW hidden, its copied pixels get a silhouett
 against 0.862, and an RGB error of 16.7 against 17.1 (8 x 8 and 16 x 16 alike). Its shadow can move
 by a row: with the new outline's lowest pixel a row lower, the shadow hangs a row lower too.
 
+**Fitting the palette.** The sprites' pixels were snapped to Diablo's palette, and their transparency
+is one bit, but the Gaussians are fitted to the squared distance from each pixel's palette color, and
+to full opacity. `--snap T` fits colors as they'll be snapped instead: by cross-entropy over the
+palette's colors, softened by the temperature T, so that any color nearest the right palette color
+will do. `--keyed` does the same for transparency: any opacity above a half is solid. Both are
+options of fit.py (Gaussians) and of motion.py's refinement, off by default. On the warrior's stance
+(SW hidden) and the zombie's walk (moving Gaussians, 4 x 4, odd frames hidden):
+
+| IoU / exact / RGB error | Fitted cells, own colors | Hidden cells, own colors | Hidden cells, copied |
+|---|---|---|---|
+| Stance: squared distance | 1.000 / 93.8% / 0.59 | 0.820 / 17.0% / 17.0 | 0.820 / 26.2% / 16.2 |
+| Stance: `--snap 0.0005` | 1.000 / 99.2% / 0.02 | 0.815 / 17.5% / 16.8 | 0.815 / 26.0% / 16.5 |
+| Stance: `--snap 0.002 --keyed` | 1.000 / 98.9% / 0.03 | 0.804 / 15.9% / 17.0 | 0.804 / 24.4% / 17.4 |
+| Zombie: squared distance (two runs) | 0.967–0.968 / 72.6–73.2% / 4.1–4.2 | 0.921–0.926 / 55.9–56.4% / 6.7–6.8 | 0.921–0.926 / 54.0–54.3% / 7.0–7.1 |
+| Zombie: `--snap 0.0005` | 0.958 / 82.9% / 2.1 | 0.912 / 57.3% / 6.3 | 0.912 / 53.5% / 7.4 |
+
+- **The fitted cells come back nearly exact:** their misses were colors landing next to the right
+  palette color.
+- **Hidden cells don't gain:** what they get wrong is the color itself (an unlit still gives a
+  surface one color, a compromise between the views' shading), not how it's matched to the palette.
+  The moving Gaussians' own colors, lit, gain a point.
+- **Outlines lose a point or so,** with `--keyed` on the stance and with `--snap` on the zombie, and
+  the copied pixels with them.
+
 ### Moving Gaussians
 
 `motion.py` fits a whole looping animation with one set of Gaussians. A looping animation is a
