@@ -640,7 +640,11 @@ shape, moved.
   be seen; every animation needs its own preset, with its frame width.
 - **Surfaces frame 0 hides:** the rest shape has only frame 0's Gaussians, refitted. Surfaces that
   only other frames show (the inside of an arm, the far side of a blade) could get Gaussians of
-  their own, by densifying in the rest pose from every frame's views.
+  their own. Densifying in the rest pose from every frame's views (gsplat's strategy, clones and
+  splits following their Gaussian's nodes) tripled the Gaussians and made every test worse (the
+  zombie's hidden frames: 0.885 IoU and 49.8% exact, against 0.902 and 51.9%), even the known
+  cells' fit: with the opacities held, so that thin parts can't fade, new Gaussians can't find
+  their own. Freeing only the new ones' opacities might work.
 - **Few frames:** with every other frame of the warrior's walk hidden, the legs pass each other
   between the frames left, and tracking can't tell them apart (see Moving Gaussians). The real task,
   16 frames from 8, has enough of them; fewer would need some prior on how legs swing.
