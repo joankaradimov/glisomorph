@@ -93,11 +93,14 @@ class GaussianField(torch.nn.Module):
         self.last_origins = pixel_rays(height, width, pivot, offset, right, up, forward)[0]
         return pool(colors[..., :3], s), pool(alpha, s)
 
-    def fit(self, viewmats, Ks, targets, masks, iters: int = 3000, lr: float = 0.05, densify: bool = True):
+    def fit(self, viewmats, Ks, targets, masks, iters: int = 3000, lr: float = 0.05, densify: bool = True,
+            supersample: int = 1):
         """Fit to views: viewmats (C, 4, 4) and Ks (C, 3, 3) as viewmat() and intrinsics() make them,
         target colors (C, H, W, 3), masks (C, H, W), True where the model is seen. All views render in
         one call per step. With `densify`, gsplat's default strategy clones and splits Gaussians where
-        the views pull hardest, and prunes transparent ones."""
+        the views pull hardest, and prunes transparent ones. With `supersample` s, the views render s
+        times finer and are averaged down, as a renderer with antialiasing makes a pixel: then the model
+        can hold detail finer than a pixel, as far as the views pin it down."""
         params = self.params
         rates = {"means": lr / 5, "scales": lr / 10, "quats": lr / 50, "opacities": lr, "colors": lr / 2}
         optimizers = {k: torch.optim.Adam([params[k]], lr=rates[k]) for k in params}
@@ -107,12 +110,19 @@ class GaussianField(torch.nn.Module):
         state = strategy.initialize_state(scene_scale=1.0)
         solid = masks.float()
         _, h, w = masks.shape
+        s = supersample
+        fine = Ks.clone()
+        fine[:, :2] *= s  # s pixels per world unit, the origin where it was
+
+        def down(x):
+            return F.avg_pool2d(x.permute(0, 3, 1, 2), s).permute(0, 2, 3, 1) if s > 1 else x
+
         t0 = time.time()
         for step in range(iters):
-            colors, alphas, info = self.rasterize(viewmats, Ks, w, h)
+            colors, alphas, info = self.rasterize(viewmats, fine, w * s, h * s)
             if densify:
                 strategy.step_pre_backward(params, optimizers, state, step, info)
-            rgb, alpha = colors[..., :3], alphas[..., 0]
+            rgb, alpha = down(colors[..., :3]), down(alphas)[..., 0]
             loss = ((rgb - targets) ** 2)[masks].mean()
             loss = loss + 0.5 * F.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), solid)
             loss = loss + F.relu(params["scales"] - math.log(3.0)).square().mean()  # keep Gaussians small

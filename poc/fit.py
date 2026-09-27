@@ -235,7 +235,7 @@ def main(argv=None):
         field.fit(torch.stack([viewmat(r[k], u[k], f[k]) for k in range(len(train))]),
                   torch.stack([intrinsics(views[i].pivot, off, device) for i in train]),
                   torch.stack([t[0] for t in targets]), torch.stack([t[1] == 1 for t in targets]),
-                  iters=args.iters, lr=args.lr)
+                  iters=args.iters, lr=args.lr, supersample=args.supersample)
     else:
         t0 = time.time()
         for it in range(args.iters):

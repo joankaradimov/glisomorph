@@ -642,6 +642,44 @@ against 0.811, and 69% of the thin pixels covered against 72%), and the walks th
 sword is lost at the fastest part of the swing, it's already lost in the tracked frames on either
 side, not between them.
 
+## Higher resolution
+
+The reconstructions render at any resolution, so sprites could be made larger than the originals.
+Outlines can be drawn finer from the 3D shape, but new texture detail would have to come from
+combining the originals: each sees a surface at other offsets below a pixel. `superres.py` measures
+how much of it comes back:
+
+```
+python -m poc.superres --mpq PATH/TO/DIABDAT.MPQ --preset warrior --scale 2
+```
+
+There's no larger Diablo sprite to compare with, so the originals are the answer key. Each direction
+is shrunk by the scale (pixels averaged in blocks, then snapped to the palette), and each method has to
+bring the small sprites back to full size, from all 8 small sprites (known directions), or from 7,
+making the 8th (a hidden direction). "Upscaled" repeats the small sprite's pixels: it has no new
+information. The fits are Gaussians fitted to the small sprites, plainly or supersampled (`fit.py
+--supersample` now works for Gaussians too: each pixel is the average of finer samples, so the model
+can hold detail finer than a pixel).
+
+| Warrior, 2x: IoU / exact / RGB error | Known directions | Hidden direction |
+|---|---|---|
+| upscaled | 0.862 / 41.9% / 9.0 | 0.779 / 18.5% / 18.1 |
+| fit, copied pixels | 0.739 / 40.9% / 9.5 | 0.739 / 20.1% / 17.3 |
+| supersampled fit, own colors | 0.852 / 17.6% / 18.3 | 0.775 / 8.7% / 25.5 |
+| supersampled fit, copied pixels | 0.852 / 39.8% / 9.8 | 0.775 / 16.6% / 17.1 |
+
+- **Nothing recovers detail yet.** In the known directions, nothing beats repeating the small
+  sprite's pixels. The supersampled fit's own colors are noise between the small pixels: the eight
+  views don't pin it down. They shade each surface differently (the light turned with the camera),
+  the geometry is good to about a small pixel, and a surface point is seen from only a few
+  directions, 45° apart.
+- **A fit only renders finely if it was fitted finely.** Fitted at the originals' size, Gaussians
+  are only ever seen at pixel centers, and rendered finer, they show holes between them (0.74
+  silhouette IoU). Fitted supersampled, they hold together (0.85).
+- **A synthetic answer key didn't work.** The first version used a supersampled fit of the real
+  sprite as the truth, rendered finer: its detail below a pixel was the same kind of noise, which no
+  method could, or should, recover.
+
 ## Next steps
 
 - **Animations:** checked on two walks and an attack; the attack's sword swing needed the tracking
