@@ -487,9 +487,21 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --hide-fram
    Gaussian from a pixel or so away, and a leg moves several pixels per frame (a sword, tens), so
    two things pull from further: blurred copies of the images, and optimal transport from the
    model's surface to the surface of that frame's still (see [Fast motion](#fast-motion), below).
+   The images are blurred by 4, 2 and then 1 pixels, in three stages of up to 266 iterations, and
+   a stage ends once its image loss hasn't improved for 50 iterations (`--patience`).
 3. The rest shape and the colors are refitted to all frames at once, through the tracked motion
    (see [The shape from every frame](#the-shape-from-every-frame)).
 4. A phase between frames interpolates the node poses periodically.
+
+Ending the stages early takes a quarter off the tracking of the warrior's walk and a fifth off the
+zombie's, and scores the same within the noise. The attack's swing keeps improving to the end of
+most stages, so it saves only 5% there:
+
+| Copied pixels: IoU / exact / RGB error | Every stage in full | Ending early | Tracking iterations |
+|---|---|---|---|
+| Warrior's walk, SW hidden | 0.817 / 30.1% / 15.0 | 0.820 / 29.8% / 15.0 | 5,586 → 4,176 |
+| Zombie's walk, odd frames hidden | 0.906 / 51.1% / 8.4 | 0.907 / 51.1% / 8.4 | 8,778 → 6,976 |
+| Attack, odd frames hidden | 0.810 / 38.4% / 15.4 | 0.804 / 38.1% / 15.5 | 5,586 → 5,318 |
 
 The frames' stills are saved, and reused by later runs (`--refit-stills` fits them again). The
 tables before [Fast motion](#fast-motion) were measured with the first tracker, which matched

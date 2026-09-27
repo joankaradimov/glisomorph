@@ -451,7 +451,11 @@ def main():
     ap.add_argument("--nodes", type=int, default=256, help="how many nodes move the Gaussians")
     ap.add_argument("--lighting", default="phong", choices=["none", "phong"],
                     help="shade albedo with a light fixed to the camera (as fit.py), and relight copied pixels")
-    ap.add_argument("--track-iters", type=int, default=800, help="iterations per frame while tracking")
+    ap.add_argument("--track-iters", type=int, default=800,
+                    help="most iterations per frame while tracking, over its three stages of blur")
+    ap.add_argument("--patience", type=int, default=50,
+                    help="a stage of tracking ends once its image loss hasn't improved for this many iterations "
+                         "(0 = every stage runs its full share)")
     ap.add_argument("--refine-iters", type=int, default=3000, help="iterations of the joint refinement")
     ap.add_argument("--arap", type=float, default=0.1, help="weight of the nodes' rigidity")
     ap.add_argument("--corrections", type=float, default=0.01,
@@ -461,6 +465,8 @@ def main():
                          "still (0 = images only)")
     ap.add_argument("--rematch", type=int, default=200, help="iterations between transports while tracking")
     ap.add_argument("--refit-stills", action="store_true", help="fit the frames' stills again, even if saved")
+    ap.add_argument("--still-supersample", type=int, default=fit.GAUSSIAN_SUPERSAMPLE,
+                    help="samples per pixel side for the frames' stills (fit.py --supersample)")
     ap.add_argument("--refine", default="shape", choices=["colors", "shape", "all"],
                     help="what the joint refinement changes: the colors (and highlights) only; also the rest "
                          "shape, fitted to every frame through the tracked motion; or also the motion, the "
@@ -489,10 +495,11 @@ def main():
         folder = Path(args.out) / fit.run_name(args.preset, split, tag=tag, model="gaussians")
         if (folder / "scene.pt").exists() and not args.refit_stills:
             saved = Scene.load(folder / "scene.pt", args.mpq)
-            if saved.supersample == fit.GAUSSIAN_SUPERSAMPLE:  # else it's from before the default changed
+            if saved.supersample == args.still_supersample:  # else it was fitted otherwise
                 return saved, folder
         argv = ["--mpq", args.mpq, "--preset", args.preset, "--split", split, "--frame", str(k), "--model",
-                "gaussians", "--tag", tag, "--out", args.out, "--no-evaluate"]
+                "gaussians", "--supersample", str(args.still_supersample), "--tag", tag, "--out", args.out,
+                "--no-evaluate"]
         return fit.main(argv + (["--camera", str(camera)] if camera else []))
 
     still_scene, still_dir = still(0)
@@ -565,22 +572,38 @@ def main():
         targets, masks = targets_of(frames[j])
         goal = None
         opt = torch.optim.Adam([{"params": [model.node_moves], "lr": 0.1}, {"params": [model.node_quats], "lr": 0.01}])
-        for it in range(args.track_iters):
-            if args.matching and it % args.rematch == 0:
-                goal = transport_goal(j)
-            colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
-            blur = 4 if it < args.track_iters // 3 else 2 if it < 2 * args.track_iters // 3 else 1
-            loss = image_loss(colors, alphas, targets, masks, blur) + args.arap * model.arap(j)
-            if goal is not None:
-                # The pull fades out, leaving the images the last word.
-                means, _ = model.pose(j)
-                loss = loss + args.matching * (1 - it / args.track_iters) * (means - goal).norm(dim=-1).mean()
-            opt.zero_grad()
-            loss.backward()
-            only_slot(j)
-            opt.step()
-        print("tracked frame %d (%d of %d): loss %.5f (%.0fs)" % (frames[j], j, len(frames) - 1, loss.item(),
-                                                                   time.time() - t0))
+        # Three stages, blurred by 4, 2 and 1 pixels. Each ends early once its image loss stops improving
+        # (checked every 10 iterations), so that a frame that barely moves doesn't take as long as a swing.
+        share, it = args.track_iters // 3, 0
+        for stage, blur in enumerate((4, 2, 1)):
+            best, stale = float("inf"), 0
+            for step in range(share):
+                if args.matching and it % args.rematch == 0:
+                    goal = transport_goal(j)
+                colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
+                fit_loss = image_loss(colors, alphas, targets, masks, blur)
+                loss = fit_loss + args.arap * model.arap(j)
+                if goal is not None:
+                    # The pull fades out over the stages as they'd run in full, leaving the images the
+                    # last word; a last stage that ends early keeps up to a quarter of it.
+                    means, _ = model.pose(j)
+                    fade = 1 - (stage + step / share) / 3
+                    loss = loss + args.matching * fade * (means - goal).norm(dim=-1).mean()
+                opt.zero_grad()
+                loss.backward()
+                only_slot(j)
+                opt.step()
+                it += 1
+                if args.patience and step % 10 == 9:
+                    value = fit_loss.item()
+                    if value < best * (1 - 1e-3):
+                        best, stale = value, 0
+                    else:
+                        stale += 10
+                    if stale >= args.patience:
+                        break
+        print("tracked frame %d (%d of %d): loss %.5f, %d iterations (%.0fs)" % (
+            frames[j], j, len(frames) - 1, loss.item(), it, time.time() - t0))
 
     # 3. The rest shape and colors, refitted to every frame at once through the tracked motion: frame 0's
     #    still saw the model from 8 directions, but as parts move, the other frames show them from more.
