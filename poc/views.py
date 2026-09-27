@@ -42,6 +42,7 @@ PRESETS = {
     "rogue": Preset("plrgfx/rogue/rls/rlsas.cl2", 96, "sheet", shadows=True),
     "zombie": Preset("monsters/zombie/zombien.cl2", 128, "sheet", shadows=True),
     "zombie-walk": Preset("monsters/zombie/zombiew.cl2", 128, "sheet", shadows=True),  # 24 frames
+    "zombie-attack": Preset("monsters/zombie/zombiea.cl2", 128, "sheet", shadows=True),  # 12 frames
     "skeleton": Preset("monsters/skelaxe/sklaxn.cl2", 128, "sheet", shadows=True),
 }
 
