@@ -633,6 +633,15 @@ shape, moved.
   covered).
 - Runs of the attack vary by a point or two in exact pixels and RGB error, so its colors are a tie.
 
+**Interpolating along screws didn't help.** Between frames, each node's rotation and move are
+interpolated apart (periodic Catmull-Rom), so a node swinging around a joint cuts across its arc.
+Blending the nodes' rigid motions as dual quaternions follows the arc instead, but the tracked nodes'
+rotations are too loose for that. Scored on the same saved models (`--load` scores a saved
+motion.pt again, without tracking), the attack's hidden frames came out worse (0.789 silhouette IoU
+against 0.811, and 69% of the thin pixels covered against 72%), and the walks the same. Where the
+sword is lost at the fastest part of the swing, it's already lost in the tracked frames on either
+side, not between them.
+
 ## Next steps
 
 - **Animations:** checked on two walks and an attack; the attack's sword swing needed the tracking

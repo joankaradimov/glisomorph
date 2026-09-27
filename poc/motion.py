@@ -465,6 +465,8 @@ def main():
                     help="what the joint refinement changes: the colors (and highlights) only; also the rest "
                          "shape, fitted to every frame through the tracked motion; or also the motion, the "
                          "opacities and per-frame corrections, which fit the known cells closer but copy worse")
+    ap.add_argument("--load", default=None,
+                    help="a saved motion.pt to score and draw again, instead of tracking and refining")
     ap.add_argument("--no-sheet", action="store_true", help="score, but skip the 16-direction sheet and GIF")
     ap.add_argument("--tag", default="", help="suffix for the output folder")
     ap.add_argument("--out", default="out")
@@ -521,6 +523,8 @@ def main():
         return surface_points(colors, alphas, origins, forward[dirs])
 
     model = MovingGaussians(still_scene.field, len(frames), nodes=args.nodes, lit=args.lighting != "none")
+    if args.load:
+        model.load_state_dict(torch.load(args.load, map_location=device)["model"])
     print("%d Gaussians, %d nodes %.1f pixels apart" % (len(model.means0), args.nodes, model.spacing))
 
     def only_slot(j):
@@ -551,7 +555,7 @@ def main():
             means, _ = model.pose(j)
             return means + follow(means, here[:, :3], there[:, :3] - here[:, :3])
 
-    for j in range(1, len(frames)):
+    for j in range(1, 1 if args.load else len(frames)):  # a loaded model is tracked already
         t0 = time.time()
         with torch.no_grad():
             model.node_quats[j] = model.node_quats[j - 1]
@@ -597,7 +601,7 @@ def main():
             groups.append({"params": [model.residuals], "lr": 0.01})
     opt = torch.optim.Adam(groups)
     t0 = time.time()
-    for it in range(args.refine_iters):
+    for it in range(0 if args.load else args.refine_iters):
         j = it % len(frames)
         targets, masks = all_targets[j]
         colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
