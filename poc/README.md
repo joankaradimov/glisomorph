@@ -470,7 +470,8 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --hide-fram
    Gaussian from a pixel or so away, and a leg moves several pixels per frame (a sword, tens), so
    two things pull from further: blurred copies of the images, and optimal transport from the
    model's surface to the surface of that frame's still (see [Fast motion](#fast-motion), below).
-3. The colors are fitted to all frames at once; the motion and the shape stay as tracked.
+3. The rest shape and the colors are refitted to all frames at once, through the tracked motion
+   (see [The shape from every frame](#the-shape-from-every-frame)).
 4. A phase between frames interpolates the node poses periodically.
 
 The frames' stills are saved, and reused by later runs (`--refit-stills` fits them again). The
@@ -574,7 +575,7 @@ them, and the refinement then faded it out in every frame. Three changes keep it
   to send each part somewhere with room for it, so the sword goes to where the sword is now, not
   onto the body. Counting pixels rather than Gaussians matters too: a still's blade is many faint
   Gaussians, which the old matching, taking only opaque ones, didn't see at all.
-- **Only colors are refined.** Refining everything after tracking faded the sword anyway: opacity
+- **No refining of the motion.** Refining everything after tracking faded the sword anyway: opacity
   is shared by all frames, and a blade a pixel off in some of them is only ever pushed toward
   transparent. It also made the copied pixels worse (the table's "refining everything"). The known
   cells fit closer, but the frames agree less on where each surface point is, which is what copying
@@ -603,15 +604,43 @@ point of exact pixels from run to run.
   the known cells' own colors fit closer (the walk's: 53% exact against 44%); but its copied pixels
   are worse, and those are what the sheets show.
 
+"Now" in this table refined only the colors after tracking. The rest shape is now refitted too:
+
+#### The shape from every frame
+
+Frame 0's still sees the model from 8 directions. As an animation's parts move, the other frames
+show them from more: a forearm turning, a sword swinging. So after tracking, the rest shape (the
+Gaussians' positions, turns and sizes) is refitted to every frame's views at once, through the
+tracked motion (`--refine shape`, the default; `--refine colors` refits only the colors). The motion
+stays as tracked, and the opacities as they were, so that nothing fades and every frame is the same
+shape, moved.
+
+| Copied pixels: IoU / exact / RGB error | Colors only | Shape too |
+|---|---|---|
+| Zombie's walk, odd frames hidden | 0.877 / 49.8% / 9.0 | 0.902 / 51.9% / 8.0 |
+| Attack, odd frames hidden (two runs each) | 0.791–0.796 / 38.2–39.0% / 14.6–15.8 | 0.806–0.811 / 37.3–39.2% / 14.6–16.2 |
+| Warrior's walk, SW hidden | 0.825 / 31.1% / 14.6 | 0.828 / 30.6% / 14.7 |
+
+- **Silhouettes improve everywhere,** most on the zombie, whose 24 frames show it from the most
+  directions, and its colors with them. The known cells fit closer too: the zombie's go from 48% to
+  64% exact.
+- **The blade gains a little.** Of the attack's thin pixels (what a 5 × 5 opening removes from its
+  outline: mostly the sword), the hidden frames cover 72% and get 25% exact, against 68% and 24%
+  refining only the colors, and 51% and 17% repeating the previous frame. Where the sword swings
+  fastest, hiding every other frame leaves too much between frames, and every version loses it.
+- **Refining the motion with the shape was worse,** even with each frame still pulled to its still
+  by transport: 0.743 silhouette IoU on the attack's hidden frames, and fewer thin pixels (60%
+  covered).
+- Runs of the attack vary by a point or two in exact pixels and RGB error, so its colors are a tie.
+
 ## Next steps
 
 - **Animations:** checked on two walks and an attack; the attack's sword swing needed the tracking
   of [Fast motion](#fast-motion). Hits, deaths and spells, and the other characters, are still to
   be seen; every animation needs its own preset, with its frame width.
-- **Silhouettes and thin parts together:** refining the motion and shape tightens silhouettes (the
-  zombie's in-between frames: 0.913 against 0.877), but fades thin parts and costs copied pixels
-  their consistency. Refining them with opacities held, and with the transport's pull kept on,
-  might keep both.
+- **Surfaces frame 0 hides:** the rest shape has only frame 0's Gaussians, refitted. Surfaces that
+  only other frames show (the inside of an arm, the far side of a blade) could get Gaussians of
+  their own, by densifying in the rest pose from every frame's views.
 - **Few frames:** with every other frame of the warrior's walk hidden, the legs pass each other
   between the frames left, and tracking can't tell them apart (see Moving Gaussians). The real task,
   16 frames from 8, has enough of them; fewer would need some prior on how legs swing.

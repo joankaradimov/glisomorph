@@ -20,8 +20,10 @@ whole limbs through a few nodes is far better posed than moving every Gaussian o
    compared first, and each Gaussian is drawn to where optimal transport takes the surface around it,
    from the model as it is to the surface of that frame's still (transported again now and then, as
    in ICP). Transport, unlike nearest neighbours, follows a sword through its swing.
-3. The colors are then fitted to all frames at once. With the lighting model (the default), they're
-   albedo, shaded by a light fixed to the camera, held where the voxel fits find it.
+3. The rest shape and the colors are then refitted to all frames at once, through the tracked
+   motion: as parts move, the frames show them from more directions than frame 0 alone. With the
+   lighting model (the default), colors are albedo, shaded by a light fixed to the camera, held where
+   the voxel fits find it.
 
 A phase between frames interpolates the node poses periodically (Catmull-Rom). A new cell of the
 torus takes the artist's pixels (PixelCopier): its surface points are moved to nearby original frames
@@ -32,7 +34,7 @@ in-betweens against the originals.
 
 Outputs, in out/<preset>-motion[-<test>][-<tag>]/: metrics.json, sheet.png (16 directions by twice the
 frames, in the palette: the originals, and copied pixels over generated shadows in between),
-directions.gif and motion.pt.
+directions.gif, motion.pt, and with a test, hidden.npz (the hidden cells as generated).
 """
 
 import argparse
@@ -459,9 +461,10 @@ def main():
                          "still (0 = images only)")
     ap.add_argument("--rematch", type=int, default=200, help="iterations between transports while tracking")
     ap.add_argument("--refit-stills", action="store_true", help="fit the frames' stills again, even if saved")
-    ap.add_argument("--refine", default="colors", choices=["colors", "all"],
-                    help="what the joint refinement changes: the colors (and highlights), or also the motion, the "
-                         "rest shape and per-frame corrections, which fit the known cells closer but copy worse")
+    ap.add_argument("--refine", default="shape", choices=["colors", "shape", "all"],
+                    help="what the joint refinement changes: the colors (and highlights) only; also the rest "
+                         "shape, fitted to every frame through the tracked motion; or also the motion, the "
+                         "opacities and per-frame corrections, which fit the known cells closer but copy worse")
     ap.add_argument("--no-sheet", action="store_true", help="score, but skip the 16-direction sheet and GIF")
     ap.add_argument("--tag", default="", help="suffix for the output folder")
     ap.add_argument("--out", default="out")
@@ -531,22 +534,34 @@ def main():
     #    pixel or so away; a blade can swing tens of pixels between frames. So each Gaussian is also
     #    pulled to where optimal transport takes the surface around it, from the model as it is to the
     #    surface of the frame's own still, transported again every `rematch` iterations (as in ICP).
+    still_surfaces = {}
+
+    def still_surface(j):
+        if j not in still_surfaces:
+            with torch.no_grad():
+                still_surfaces[j] = surface_of(*stills[frames[j]].rasterize(viewmats[dirs], Ks[dirs], w, h)[:2])
+        return still_surfaces[j]
+
+    def transport_goal(j):
+        """Where each Gaussian goes (G, 3) if it follows the surface around it, from the model posed in
+        slot j to the surface of frame frames[j]'s still."""
+        with torch.no_grad():
+            here = surface_of(*model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)[:2])
+            there = transport(here, still_surface(j))
+            means, _ = model.pose(j)
+            return means + follow(means, here[:, :3], there[:, :3] - here[:, :3])
+
     for j in range(1, len(frames)):
         t0 = time.time()
         with torch.no_grad():
             model.node_quats[j] = model.node_quats[j - 1]
             model.node_moves[j] = model.node_moves[j - 1]
-            goal_surface = surface_of(*stills[frames[j]].rasterize(viewmats[dirs], Ks[dirs], w, h)[:2])
         targets, masks = targets_of(frames[j])
         goal = None
         opt = torch.optim.Adam([{"params": [model.node_moves], "lr": 0.1}, {"params": [model.node_quats], "lr": 0.01}])
         for it in range(args.track_iters):
             if args.matching and it % args.rematch == 0:
-                with torch.no_grad():
-                    here = surface_of(*model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)[:2])
-                    there = transport(here, goal_surface)
-                    means, _ = model.pose(j)
-                    goal = means + follow(means, here[:, :3], there[:, :3] - here[:, :3])
+                goal = transport_goal(j)
             colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
             blur = 4 if it < args.track_iters // 3 else 2 if it < 2 * args.track_iters // 3 else 1
             loss = image_loss(colors, alphas, targets, masks, blur) + args.arap * model.arap(j)
@@ -561,19 +576,23 @@ def main():
         print("tracked frame %d (%d of %d): loss %.5f (%.0fs)" % (frames[j], j, len(frames) - 1, loss.item(),
                                                                    time.time() - t0))
 
-    # 3. Colors: the albedo and highlights are fitted to every frame at once. The motion and the shape
-    #    stay as tracked. Refining them too (--refine all: every frame together, the loop closed by the
-    #    smoothness of the node paths, with small per-frame corrections of each Gaussian) fits the known
-    #    cells closer, but at the cost of consistency between frames, which copying pixels relies on;
-    #    and a thin blade that's a pixel off in some frames fades out in all of them.
+    # 3. The rest shape and colors, refitted to every frame at once through the tracked motion: frame 0's
+    #    still saw the model from 8 directions, but as parts move, the other frames show them from more.
+    #    The motion stays as tracked, and the opacities as they were, so that nothing fades and every
+    #    frame is the same shape moved. Refining the motion too (--refine all: the loop closed by the
+    #    smoothness of the node paths, with the opacities and small per-frame corrections of each
+    #    Gaussian) fits the known cells closer, but at the cost of consistency between frames, which
+    #    copying pixels relies on; and a thin blade that's a pixel off in some frames fades out in all.
     all_targets = [targets_of(k) for k in frames]
     groups = [{"params": [model.colors], "lr": 0.01}]
     if model.lit:
         groups.append({"params": model.highlight_parameters(), "lr": 0.01})
+    if args.refine != "colors":
+        groups += [{"params": [model.means0], "lr": 0.005}, {"params": [model.quats0], "lr": 0.001},
+                   {"params": [model.scales], "lr": 0.002}]
     if args.refine == "all":
         groups += [{"params": [model.node_moves], "lr": 0.02}, {"params": [model.node_quats], "lr": 0.002},
-                   {"params": [model.means0], "lr": 0.005}, {"params": [model.quats0], "lr": 0.001},
-                   {"params": [model.scales], "lr": 0.002}, {"params": [model.opacities], "lr": 0.01}]
+                   {"params": [model.opacities], "lr": 0.01}]
         if args.corrections:
             groups.append({"params": [model.residuals], "lr": 0.01})
     opt = torch.optim.Adam(groups)
@@ -583,6 +602,8 @@ def main():
         targets, masks = all_targets[j]
         colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
         loss = image_loss(colors, alphas, targets, masks)
+        if args.refine == "shape":
+            loss = loss + F.relu(model.scales - math.log(3.0)).square().mean()  # keep Gaussians small
         if args.refine == "all":
             loss = loss + args.arap * model.arap(j) + 0.01 * model.smoothness()
             if args.corrections:
@@ -599,6 +620,7 @@ def main():
     results = {key: [] for key in ("fitted", "hidden_direction", "hidden_direction_copied", "hidden_frames",
                                    "hidden_frames_copied", "hidden_frames_repeat_previous")}
     shadow_scores = {"hidden_direction": [], "hidden_frames": []}
+    hidden_cells = {}
     with torch.no_grad():
         def camera(d_yaw):
             r, u, f = (x[0] for x in camera_basis(torch.tensor([d_yaw], device=device), elevation))
@@ -672,12 +694,14 @@ def main():
                     results["hidden_direction"].append(s)
                     cell = copied(k, float(yaws[d]), own)
                     results["hidden_direction_copied"].append(score(cell, truth(k, d), palette))
+                    hidden_cells["f%d_d%d" % (k, d)] = cell.cpu().numpy().astype(np.int16)
                     if preset.shadows:
                         shadow_scores["hidden_direction"].append(shadow_match(k, d, cell))
                 elif args.hide_frames and k % 2:
                     results["hidden_frames"].append(s)
                     cell = copied(k, float(yaws[d]), own)
                     results["hidden_frames_copied"].append(score(cell, truth(k, d), palette))
+                    hidden_cells["f%d_d%d" % (k, d)] = cell.cpu().numpy().astype(np.int16)
                     if preset.shadows:
                         shadow_scores["hidden_frames"].append(shadow_match(k, d, cell))
                     results["hidden_frames_repeat_previous"].append(score(truth(k - 1, d), truth(k, d), palette))
@@ -701,6 +725,8 @@ def main():
                     summary[key + "_shadow_iou"] = float(np.mean(rows))
                     print(key, "shadow IoU %.3f" % summary[key + "_shadow_iou"])
         (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
+        if hidden_cells:  # the hidden cells as generated (copied pixels, no shadows), for a closer look
+            np.savez_compressed(out_dir / "hidden.npz", **hidden_cells)
 
         # 16 directions by twice the frames: originals where they exist and were fitted (with their baked
         # shadows), copied pixels over generated shadows elsewhere.
