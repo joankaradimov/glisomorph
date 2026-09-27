@@ -671,6 +671,35 @@ against 0.811, and 69% of the thin pixels covered against 72%), and the walks th
 sword is lost at the fastest part of the swing, it's already lost in the tracked frames on either
 side, not between them.
 
+#### Supersampled
+
+Like the stills (see [Supersampled fitting](#gaussians)), the moving Gaussians make each pixel the
+average of 4 x 4 samples (`--supersample`; 1 for one sample per pixel): in tracking, in the
+refinement, and in the surfaces the transport pulls toward. The frames' stills are fitted alike
+(`--still-supersample` follows `--supersample`), and saved apart from stills sampled otherwise.
+Stills fitted finer than the moving Gaussians render don't suit them: with 16 x 16 stills and one
+sample per pixel, the tracking loss tripled.
+
+| IoU / exact / RGB error | 1 sample per pixel | 4 x 4 | 16 x 16 |
+|---|---|---|---|
+| Zombie's walk: known cells, own colors | 0.942 / 62.6–63.5% / 5.7–5.8 | 0.967–0.968 / 72.6–73.2% / 4.1–4.2 | 0.972 / 72.8% / 4.2 |
+| Zombie's walk: odd frames hidden, copied | 0.903–0.907 / 50.6–51.1% / 8.4–8.5 | 0.921–0.926 / 54.0–54.3% / 7.0–7.1 | 0.923 / 53.4% / 7.5 |
+| Warrior's walk: known cells, own colors | 0.922 / 54.5% / 7.1 | 0.948 / 65.2% / 4.7 | |
+| Warrior's walk: SW hidden, copied | 0.820 / 29.8% / 15.0 | 0.820 / 30.3% / 14.6 | |
+| Attack: known cells, own colors | 0.907 / 39.8% / 10.0 | 0.925 / 49.4% / 7.7 | |
+| Attack: odd frames hidden, copied | 0.804 / 38.1% / 15.5 | 0.802 / 38.6% / 15.3 | |
+
+(Ranges: the zombie's two runs of each.)
+
+- **The known cells gain ten points of exact pixels,** as the stills did.
+- **The zombie's hidden frames gain three,** well beyond the runs' spread, and lose the bright specks
+  on its legs. The warrior's hidden direction and the attack's hidden frames gain a little color,
+  within the noise. The attack still loses its sword where it swings fastest: that's tracking,
+  which sampling doesn't change.
+- **16 x 16 gains nothing more,** unlike the stills. Tracking and refining the zombie took 4.3
+  minutes at one sample per pixel, 6.1 at 4 x 4 and 33 at 16 x 16, alone on the GPU. (Three runs
+  sharing it take about three times as long each, so running them together saves nothing.)
+
 ## Higher resolution
 
 The reconstructions render at any resolution, so sprites could be made larger than the originals.

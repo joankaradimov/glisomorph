@@ -106,12 +106,31 @@ def farthest_points(points, count: int):
     return chosen
 
 
+def average_down(colors, alpha, s: int):
+    """A render s times finer, averaged over s x s blocks: colors with expected depth (C, H*s, W*s, k+1),
+    premultiplied, and opacity (C, H*s, W*s, 1). Colors and opacity average plainly; depth is weighted
+    by opacity, as it's an expectation over what the pixel covers."""
+    if s == 1:
+        return colors, alpha
+
+    def pool(x):
+        return F.avg_pool2d(x.permute(0, 3, 1, 2), s).permute(0, 2, 3, 1)
+
+    a = pool(alpha)
+    depth = pool(colors[..., -1:] * alpha) / a.clamp(min=1e-6)
+    return torch.cat([pool(colors[..., :-1]), depth], -1), a
+
+
 class MovingGaussians(torch.nn.Module):
     """Shared Gaussians (rest means and quaternions, log scales, opacity and color logits), moved by
     nodes with a unit quaternion and a translation each, per frame."""
 
-    def __init__(self, still, frames: int, nodes: int = 256, bind: int = 4, links: int = 6, lit: bool = False):
+    def __init__(self, still, frames: int, nodes: int = 256, bind: int = 4, links: int = 6, lit: bool = False,
+                 supersample: int = 1):
         super().__init__()
+        # Each pixel the average of supersample x supersample samples, as the originals' pixels are
+        # averages over the edges they partly cover and the colors that mix in them.
+        self.supersample = supersample
         p = still.params
         self.means0 = torch.nn.Parameter(p["means"].detach().clone())
         self.quats0 = torch.nn.Parameter(F.normalize(p["quats"].detach(), dim=-1))
@@ -203,34 +222,45 @@ class MovingGaussians(torch.nn.Module):
         return diffuse, highlight
 
     def rasterize(self, phase, viewmats, Ks, width, height):
-        """Colors with expected depth (C, H, W, 4), opacity (C, H, W, 1) and gsplat's info. With the
-        lighting model, albedo, normal and highlight strength are rendered, then shaded per pixel
-        (deferred); the pixels' normals are kept in last_normal (C, H, W, 3)."""
+        """Colors with expected depth (C, H, W, 4), opacity (C, H, W, 1) and gsplat's info, each pixel
+        the average of supersample x supersample samples. With the lighting model, albedo, normal and
+        highlight strength are rendered, then shaded per sample (deferred), before averaging; the
+        pixels' normals are kept in last_normal (C, H, W, 3)."""
+        s = self.supersample
+        if s > 1:
+            Ks = Ks.clone()
+            Ks[:, :2] *= s  # s samples per world unit, the origin where it was
         means, quats = self.pose(phase)
         common = dict(camera_model="ortho", render_mode="RGB+ED", packed=False)
         if not self.lit:
-            return rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
-                                 torch.sigmoid(self.colors), viewmats, Ks, width, height, **common)
+            out, alpha, info = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
+                                             torch.sigmoid(self.colors), viewmats, Ks, width * s, height * s, **common)
+            return (*average_down(out, alpha, s), info)
         albedo = torch.sigmoid(self.colors)
         strength = torch.sigmoid(self.specular)[:, None]
         features = torch.stack([torch.cat([albedo, self.normals(quats, vm[2, :3]), strength], -1) for vm in viewmats])
         out, alpha, info = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
-                                         features, viewmats, Ks, width, height, **common)
+                                         features, viewmats, Ks, width * s, height * s, **common)
         normal = F.normalize(out[..., 3:6], dim=-1)
         shaded = []
         for c, vm in enumerate(viewmats):
             diffuse, highlight = self.shading(normal[c], vm[0, :3], -vm[1, :3], vm[2, :3])
             shaded.append(out[c, ..., :3] * diffuse[..., None] + (out[c, ..., 6] * highlight)[..., None])
-        self.last_normal = normal
-        return torch.cat([torch.stack(shaded), out[..., 7:8]], -1), alpha, info
+        colors, alpha = average_down(torch.cat([torch.stack(shaded), out[..., 3:6], out[..., 7:8]], -1), alpha, s)
+        self.last_normal = F.normalize(colors[..., 3:6], dim=-1)
+        return torch.cat([colors[..., :3], colors[..., 6:7]], -1), alpha, info
 
     def rest_points(self, phase, viewmat_, K, width, height):
         """What each pixel shows at a phase, as a point of the rest pose (H, W, 3), with the opacity
         (H, W) and expected depth (H, W) there: the rest positions, rendered as colors."""
+        s = self.supersample
+        K = K.clone()
+        K[:2] *= s
         means, quats = self.pose(phase)
         out, alpha, _ = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities), self.means0,
-                                      viewmat_[None], K[None], width, height, camera_model="ortho",
+                                      viewmat_[None], K[None], width * s, height * s, camera_model="ortho",
                                       render_mode="RGB+ED", packed=False)
+        out, alpha = average_down(out, alpha, s)
         a = alpha[0, ..., 0]
         return out[0, ..., :3] / a.clamp(min=1e-6)[..., None], a, out[0, ..., 3] - DISTANCE
 
@@ -465,8 +495,12 @@ def main():
                          "still (0 = images only)")
     ap.add_argument("--rematch", type=int, default=200, help="iterations between transports while tracking")
     ap.add_argument("--refit-stills", action="store_true", help="fit the frames' stills again, even if saved")
-    ap.add_argument("--still-supersample", type=int, default=fit.GAUSSIAN_SUPERSAMPLE,
-                    help="samples per pixel side for the frames' stills (fit.py --supersample)")
+    ap.add_argument("--supersample", type=int, default=4,
+                    help="samples per pixel side: each pixel of the moving Gaussians the average of s x s (16 "
+                         "gained nothing over 4)")
+    ap.add_argument("--still-supersample", type=int, default=None,
+                    help="samples per pixel side for the frames' stills (fit.py --supersample); by default as "
+                         "--supersample, so that the moving Gaussians start from stills sampled alike")
     ap.add_argument("--refine", default="shape", choices=["colors", "shape", "all"],
                     help="what the joint refinement changes: the colors (and highlights) only; also the rest "
                          "shape, fitted to every frame through the tracked motion; or also the motion, the "
@@ -477,6 +511,8 @@ def main():
     ap.add_argument("--tag", default="", help="suffix for the output folder")
     ap.add_argument("--out", default="out")
     args = ap.parse_args()
+    if args.still_supersample is None:
+        args.still_supersample = args.supersample
     device = torch.device("cuda")
     t_start = time.time()
 
@@ -491,7 +527,7 @@ def main():
 
     # 1. Every fitted frame as a still; frame 0 calibrates the camera, and the others share it.
     def still(k, camera=None):
-        tag = "motion-f%d%s" % (k, test)
+        tag = "motion-f%d%s%s" % (k, test, "-ss%d" % args.still_supersample if args.still_supersample != 1 else "")
         folder = Path(args.out) / fit.run_name(args.preset, split, tag=tag, model="gaussians")
         if (folder / "scene.pt").exists() and not args.refit_stills:
             saved = Scene.load(folder / "scene.pt", args.mpq)
@@ -531,7 +567,8 @@ def main():
     def surface_of(colors, alphas):
         return surface_points(colors, alphas, origins, forward[dirs])
 
-    model = MovingGaussians(still_scene.field, len(frames), nodes=args.nodes, lit=args.lighting != "none")
+    model = MovingGaussians(still_scene.field, len(frames), nodes=args.nodes, lit=args.lighting != "none",
+                            supersample=args.supersample)
     if args.load:
         model.load_state_dict(torch.load(args.load, map_location=device)["model"])
     print("%d Gaussians, %d nodes %.1f pixels apart" % (len(model.means0), args.nodes, model.spacing))
@@ -552,7 +589,11 @@ def main():
     def still_surface(j):
         if j not in still_surfaces:
             with torch.no_grad():
-                still_surfaces[j] = surface_of(*stills[frames[j]].rasterize(viewmats[dirs], Ks[dirs], w, h)[:2])
+                s = args.supersample  # the still sampled as the moving Gaussians are
+                fine = Ks[dirs].clone()
+                fine[:, :2] *= s
+                colors, alphas, _ = stills[frames[j]].rasterize(viewmats[dirs], fine, w * s, h * s)
+                still_surfaces[j] = surface_of(*average_down(colors, alphas, s))
         return still_surfaces[j]
 
     def transport_goal(j):
