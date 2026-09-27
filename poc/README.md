@@ -24,7 +24,8 @@ Only Diablo 1, only still frames.
      the same direction (see [Coherent warps](#coherent-warps)).
    - Each pixel's material comes from the nearest source pixel, and its shade is interpolated
      between source pixels of that material (see [Shades](#shades)).
-   - Characters get a baked shadow, cast by the reconstruction (see [Shadows](#shadows)).
+   - Characters get a baked shadow, made from their new outline the way the originals' were (see
+     [Shadows](#shadows)).
 
 ```
 python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior --split all
@@ -73,7 +74,7 @@ pixels depend on things the other directions don't pin down:
 
 - sub-pixel placement of edges and of thin parts, such as the arrow's 1-pixel shaft;
 - texture detail at the scale of single pixels;
-- shading from lights fixed to the camera: the warrior's shadow falls left of him in every direction;
+- shading from lights fixed to the camera, which differs from one direction to the next;
 - the original renderer's quantization to the palette.
 
 **Does it look right? Mostly, at game scale.** The synthesized directions have the right silhouette,
@@ -114,9 +115,9 @@ error is the mean absolute difference, 0–255.
 
 - **The light is recovered consistently.** Fitted to each sprite separately, the single light comes
   out almost the same every time. In camera space (x right, y up, z toward the camera) it's about
-  (0.4, 0.75, 0.5): upper right and in front. It confirms that the lights were fixed to the camera, as
-  do the baked shadows, which fall the same way in every direction. (The shadows come from another
-  light, though: see [Shadows](#shadows).)
+  (0.4, 0.75, 0.5): upper right and in front. It confirms that the lights were fixed to the camera.
+  (The baked shadows fall the same way in every direction too, but no light casts them: see
+  [Shadows](#shadows).)
 - **Normals mustn't reshape the geometry.** When shading gradients flowed into the density through
   the normals, the optimizer bent the shape to fake shading, and character silhouettes dropped from
   0.86 to 0.77–0.80 IoU. Normals are now computed from the density without passing gradients back
@@ -253,19 +254,35 @@ Interpolated shades, added later, remove most of what's left of the speckle: see
 
 ## Shadows
 
-Character sprites carry a baked shadow: solid index 0 on the ground, under the character. The light
-that cast it turned with the camera, so it falls the same way on screen in every direction: behind
-the character and a little to the left. `shadow.py` gives a new direction its shadow the same way:
+Character sprites carry a baked shadow: solid index 0 on the ground beside the character, falling the
+same way on screen in every direction, behind the character and a little to the left. No light casts
+it in 3D. Each shadow is the sprite's own outline, transformed in 2D (`shadow.py`):
 
-1. **Casting.** The ground point that a pixel sees is in shadow if the reconstruction blocks its way
-   to the light: a ray is marched through the field, from the ground toward the light.
-2. **Fitting the light.** The light's direction and the ground's height are searched for the shadows
-   that best match the originals'. Black pixels inside the model are part of its texture, not
-   shadow, so only groups of index-0 pixels that touch the background count.
-3. **Drawing.** The shadow's opacity is averaged over 3 x 3 pixels, which cleans ragged edges, and
-   drawn as index 0 wherever the model doesn't cover it.
+- **Squashed and sheared.** A pixel h rows above the *ground row* goes to h/3 rows above it and
+  0.26 h pixels to the left (then one pixel right and 1.75 up). Where the outline itself is, the
+  sprite covers the shadow.
+- **About a ground row that stays put.** The ground row is fixed for each direction of an
+  animation: the lowest row of the outline in its first frame. When the feet move, the ground
+  doesn't.
 
-`evaluate.py` does this for every sprite with baked shadows, and draws the shadows in all pictures.
+One rule for everything: it reproduces the originals' shadows at 0.944 IoU over 712 cells (the
+warrior, rogue, zombie and skeleton standing, the warrior's and the zombie's walks and the warrior's
+attack, every frame, all 8 directions), the worst cell at 0.87. New cells get their shadows the same
+way, from their own outlines; a new direction's ground row comes from its own first frame. (Black
+pixels inside the model are part of its texture, so only groups of index-0 pixels that touch the
+background count as an original's shadow.) So a shadow tells nothing about the shape that its own
+sprite doesn't.
+
+**How it was found.** The shadows were first cast in 3D, by a light that turned with the camera, found
+by searching for the shadows that best match the originals': a ground point was shaded if the
+reconstruction blocked its way to the light. The best light (20° to the right of the camera and 55°
+above the ground, for every sprite) reached only 0.5 IoU, and the new cells' shadows, rounder than
+the originals', made animations flicker where the two alternate. It couldn't have been right: even
+the warrior's visual hull, which contains the real model, casts no shadow that covers more than 83%
+of the originals', under any light and ground. Fitting the model to cast the originals' shadows, in the hope
+that each would show the shape from another direction, only bent the model out of shape. A 2D
+transform of each sprite's own outline fitted at once, with the ground row at each cell's lowest
+pixel; the attack, whose feet move, then showed that the ground row is the first frame's.
 
 **Black texture.** Fits and scores used to treat every index-0 pixel of a character as transparent,
 including the black inside the model: 1.2% of the warrior's pixels, mostly the straps across his
@@ -281,25 +298,19 @@ contacts would catch some of them, but also some of the straps.
 | Walk, moving Gaussians' relit copied pixels | 0.805 / 29.2% / 15.4 | 0.814 / 30.5% / 14.9 |
 
 The fitted directions gain most, their silhouettes no longer holed by the straps: 0.977 to 0.987 IoU
-with voxels. The shadows' fit doesn't change. Other tables in this README predate the fix.
+with voxels. Other tables in this README predate the fix.
 
-**Results** (intersection over union with the originals' shadows; the 11 held-out character
-directions from above):
+**Results** (IoU with the originals' shadows, warrior standing, SW hidden):
 
-| Shadow | Fitted directions | Held-out directions |
-|--------|------------------:|--------------------:|
-| cast by the reconstruction | 0.58 | 0.52 |
-| the nearest original direction's, as it is | — | 0.26 |
+| Shadow | Fitted directions | Hidden direction |
+|--------|------------------:|-----------------:|
+| the originals' own outlines, by the rule | 0.94 | 0.94 |
+| a voxel fit's outlines, by the rule | 0.93 | 0.68 |
+| a Gaussian fit's outlines, by the rule | 0.88 | 0.80 |
+| cast in 3D by the best light, from the voxel fit (before) | 0.51 | 0.46 |
 
-- **The shadows' light is the same for every sprite.** Seen from the character, every fit puts it
-  about 20° to the right of the camera and 55° above the ground (20–22.5° and 54–57°), for all three
-  characters.
-- **It isn't the light that shades the models.** Measured the same way, the lighting model's light is
-  at about 73° and 65°, and shadows cast from it match the originals poorly (IoU under 0.2). The
-  sprites were lit by more than one light, and the shadows come from one of the others.
-- **The shapes match; the edges are off by a pixel or two.** The shadows have the right shapes, down
-  to the streak of the warrior's sword. Most of the disagreement is a shift of a pixel or two along
-  the edges, which costs a lot of overlap on shapes this thin.
+A new direction's shadow is only as good as its outline, whose silhouette IoU is 0.86 or so; a
+row's difference in its lowest pixel moves the whole shadow.
 
 ## Shades
 
@@ -362,14 +373,13 @@ python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --split all --
   per frame on average, twice as much as the originals (0.19).
 - **`--camera` shares one camera.** Frames 1–7 take frame 0's camera instead of calibrating, and the
   new directions then move like the originals: 0.18 pixels per frame.
-- **Nothing flickers.** From one frame to the next, 72% of the new directions' pixels change color,
-  against 68% for the originals (walking moves most pixels). Their shadows change by 38% of their
-  area per frame, against 41% for the originals' baked shadows, although each frame fits its own
-  shadow light.
+- **Nothing flickers.** From one frame to the next, 71% of the new directions' pixels change color,
+  against 68% for the originals (walking moves most pixels). Their shadows change by 43% of their
+  area per frame, against 41% for the originals' baked shadows.
 
 **`animate.py`** does all this for a whole animation. It fits every frame on all 8 directions, with
-frame 0's camera shared, fits the shadows' light once, and writes the animation in 16 directions
-to `out/<preset>-16/`:
+frame 0's camera shared, gives the new directions shadows by the rule in [Shadows](#shadows), and
+writes the animation in 16 directions to `out/<preset>-16/`:
 - `sheet.png`: a row per direction (from S clockwise, originals and new ones alternating) and a
   column per frame, at the frames' own size and anchor, in the palette, with index 255 transparent;
 - `directions.gif`: the 16 directions animated at the game's speed (a frame per 50 ms tick, as
@@ -384,11 +394,11 @@ With `animate.py` (and the lighting model), the new directions move and change l
 | Animation | Directions | Sideways per frame | Pixels changing per frame | Shadow changing per frame |
 |-----------|------------|-------------------:|--------------------------:|--------------------------:|
 | Warrior's walk, 8 frames | originals | 0.19 px | 68% | 41% |
-| | new | 0.20 px | 72% | 37% |
+| | new | 0.20 px | 71% | 43% |
 | Zombie's walk, 24 frames | originals | 0.57 px | 66% | 28% |
-| | new | 0.61 px | 71% | 29% |
+| | new | 0.61 px | 71% | 30% |
 | Warrior's attack, 16 frames | originals | 1.44 px | 68% | 45% |
-| | new | 1.41 px | 73% | 47% |
+| | new | 1.42 px | 72% | 45% |
 
 (The attack's frames are 128 pixels wide: `--preset warrior-attack`.)
 
@@ -407,7 +417,7 @@ python -m poc.fit --mpq PATH/TO/DIABDAT.MPQ --preset warrior --split holdout:1 -
 
 A Gaussian starts at each voxel of the visual hull. All directions are rendered in one call per
 step, and gsplat's densification clones and splits Gaussians where the views pull hardest. They're
-unlit for now: a color each, no lighting model and no shadows.
+unlit for now: a color each, with no lighting model.
 
 **Setup.** gsplat compiles CUDA code, and PyTorch only builds extensions against a CUDA toolkit of
 its own major version. On Windows, this worked:
@@ -522,13 +532,15 @@ to one source, and shades are interpolated within the ramps. The sheet's new cel
   rendered as a color, a Gaussian's rest position goes to every pixel it covers. Unposing each
   pixel's own surface point instead reproduces the original cell at 90–94% exact.
 
-**Shadows.** Voxel shadows march rays through the density; Gaussians get a shadow map instead
-(`shadow_map_opacity` in gaussians.py): the posed Gaussians rendered from the light, by another
-orthographic camera, and each pixel's ground point looked up in it. One render per light direction
-makes the light's fit (shadow.py's, which now takes any shadow function) quick. Fitted to frame 0 of
-the warrior's walk, it finds the same light as the voxel fits (20° and 55°), matching the baked
-shadows at 0.57 IoU, and 0.50 on the hidden direction. The sheet now shows the originals with their
-baked shadows, and the new cells over generated ones.
+**Shadows.** The sheet shows the originals with their baked shadows, and the new cells over shadows
+made by the rule in [Shadows](#shadows): each cell's outline, about its direction's ground row, the
+lowest row of frame 0's outline there (an original's, or in a new direction, the copied frame 0's).
+The Gaussians first cast shadows in 3D instead, from a shadow map (the posed Gaussians rendered from
+the fitted light), and those were rounder than the originals'. Where the two alternate, in the
+original directions' in-between frames, the zombie's shadows jumped from frame to frame: their area
+changed by 25 pixels on average (12%), against 5 in the new directions, where all are generated. By
+the rule, it changes by 8. On the warrior's walk with SW hidden, the hidden direction's shadows match
+the originals at 0.72 IoU (0.50 from the shadow map).
 
 **Lighting.** The moving Gaussians have the voxel field's lighting model too (on by default,
 `--lighting none` to leave it out): colors become albedo, shaded by a light fixed to the camera, with
@@ -623,8 +635,8 @@ point of exact pixels from run to run.
 - **Blending:** where two directions see a surface about equally well, blend their colors and snap
   the blend to the palette, instead of picking one. That would trade some crispness for shading
   between the two directions'.
-- **Lighting:** the lights could be fitted once for the whole game and then held fixed: the shading
-  light and the shadows' light come out the same for every sprite.
+- **Lighting:** the shading light could be fitted once for the whole game and then held fixed: it
+  comes out the same for every sprite (the moving Gaussians already hold it there).
 - **Evaluation:** only the arrows have usable in-between directions. The fireball and the holy bolt
   aren't a rigid model turned: their flames trail along the direction of flight, and the
   reconstruction does worse than reusing the nearest direction. Characters can only be scored by

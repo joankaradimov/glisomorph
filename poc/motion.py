@@ -25,9 +25,10 @@ whole limbs through a few nodes is far better posed than moving every Gaussian o
 
 A phase between frames interpolates the node poses periodically (Catmull-Rom). A new cell of the
 torus takes the artist's pixels (PixelCopier): its surface points are moved to nearby original frames
-and directions, and copied from there, relit. Shadows come from a shadow map of the posed Gaussians,
-with the light fitted to frame 0's baked shadows. --hide-direction and --hide-frames keep a direction
-or every other frame out of the fit, to score the in-betweens against the originals.
+and directions, and copied from there, relit. Its shadow is made as the originals' were (shadow.py):
+its own outline, squashed and sheared about its direction's ground row, found in frame 0.
+--hide-direction and --hide-frames keep a direction or every other frame out of the fit, to score the
+in-betweens against the originals.
 
 Outputs, in out/<preset>-motion[-<test>][-<tag>]/: metrics.json, sheet.png (16 directions by twice the
 frames, in the palette: the originals, and copied pixels over generated shadows in between),
@@ -50,11 +51,11 @@ from poc import fit
 from poc.animate import write_gif, write_sheet
 from poc.evaluate import quantize, score
 from poc.field import camera_basis, pixel_rays
-from poc.gaussians import DISTANCE, intrinsics, shadow_map_opacity, viewmat
+from poc.gaussians import DISTANCE, intrinsics, viewmat
 from poc.ramps import Ramps
 from poc.reproject import Warp, choose, fetch, fill, neighbour, smooth_depth, source_depth
 from poc.scene import Scene, masks_for
-from poc.shadow import baked_shadow, fit_light, iou, shadow_mask
+from poc.shadow import baked_shadow, iou, lowest_row, outline_shadow
 from poc.views import PRESETS, frame_count, load_views
 
 
@@ -625,40 +626,37 @@ def main():
                                 "depth": source_depth(depth, alpha >= 0.5, warp)})
         copier = PixelCopier(model, sources, warp, Ramps(palette), len(frames))
 
-        # Shadows: a shadow map of the posed Gaussians. The light and the ground's height are fitted to
-        # frame 0's baked shadows (shadow.py); the light turned with the camera, so it's the same for
-        # every frame.
-        def opacity_at(slot_phase):
-            means, quats = model.pose(slot_phase)
-            scales, opac = torch.exp(model.scales), torch.sigmoid(model.opacities)
-            return lambda origins, fwd, lights, ground, fine=True: shadow_map_opacity(
-                means, quats, scales, opac, origins, fwd, lights, ground)
-
-        light = None
-        if preset.shadows:
-            posed, _ = model.pose(0)
-            lowest = float(posed[torch.sigmoid(model.opacities) > 0.5, 1].quantile(0.001))
-            light, light_iou = fit_light(still_scene, train_dirs, opacity=opacity_at(0), lowest=lowest)
-            print("shadow light: %s (IoU %.2f with frame 0's baked shadows)" % (light, light_iou))
-
-        def with_shadow(indices, frame_phase, d_yaw):
-            """The cell as a sprite: its colors over its baked shadow (index 0)."""
-            if light is None:
-                return indices
-            r, u, f, _, _ = camera(d_yaw)
-            origins = pixel_rays(h, w, pivot, offset, r, u, f)[0]
-            shade = opacity_at(frame_phase * per_frame)(origins, f, light.direction(r)[None], light.ground)[0]
-            return torch.where(shadow_mask(shade, indices >= 0), torch.zeros_like(indices), indices)
-
-        def shadow_match(frame_phase, d, indices):
-            sprite = with_shadow(indices, frame_phase, float(yaws[d]))
-            original = torch.as_tensor(all_views[frame_phase][d].indices, device=device).long()
-            return float(iou(baked_shadow(sprite), baked_shadow(original)))
-
         def copied(frame_phase, d_yaw, own=None):
             if own is None:
                 own = render(frame_phase, d_yaw)
             return copier(frame_phase * per_frame, d_yaw, camera(d_yaw), own)
+
+        # Shadows, made as the originals' were (shadow.py): a cell's own outline, squashed and sheared
+        # about its direction's ground row, the lowest row of the direction's outline in frame 0 (an
+        # original's where there is one, else the copied cell's). n counts the 16 directions from S.
+        grounds = {}
+
+        def ground_row(n):
+            if n not in grounds:
+                if n % 2 == 0 and n // 2 != args.hide_direction:
+                    idx = torch.as_tensor(all_views[0][n // 2].indices, device=device).long()
+                    grounds[n] = lowest_row((idx >= 0) & ~baked_shadow(idx))
+                else:
+                    grounds[n] = lowest_row(copied(0, sign * n * 22.5) >= 0)
+            return grounds[n]
+
+        def shadow_of(indices, n):
+            return outline_shadow(indices >= 0, ground_row(n))
+
+        def with_shadow(indices, n):
+            """The cell as a sprite: its colors over its shadow (index 0)."""
+            if not preset.shadows:
+                return indices
+            return torch.where(shadow_of(indices, n), torch.zeros_like(indices), indices)
+
+        def shadow_match(k, d, indices):
+            original = torch.as_tensor(all_views[k][d].indices, device=device).long()
+            return float(iou(shadow_of(indices, 2 * d), baked_shadow(original)))
 
         def truth(k, d):
             v = all_views[k][d]
@@ -674,13 +672,13 @@ def main():
                     results["hidden_direction"].append(s)
                     cell = copied(k, float(yaws[d]), own)
                     results["hidden_direction_copied"].append(score(cell, truth(k, d), palette))
-                    if light is not None:
+                    if preset.shadows:
                         shadow_scores["hidden_direction"].append(shadow_match(k, d, cell))
                 elif args.hide_frames and k % 2:
                     results["hidden_frames"].append(s)
                     cell = copied(k, float(yaws[d]), own)
                     results["hidden_frames_copied"].append(score(cell, truth(k, d), palette))
-                    if light is not None:
+                    if preset.shadows:
                         shadow_scores["hidden_frames"].append(shadow_match(k, d, cell))
                     results["hidden_frames_repeat_previous"].append(score(truth(k - 1, d), truth(k, d), palette))
                 else:
@@ -697,8 +695,7 @@ def main():
             if rows:
                 summary[key] = {m: float(np.mean([r[m] for r in rows])) for m in rows[0]}
                 print(key, json.dumps({m: round(v, 3) for m, v in summary[key].items()}))
-        if light is not None:
-            summary["shadow_light"] = dataclasses.asdict(light)
+        if preset.shadows:
             for key, rows in shadow_scores.items():
                 if rows:
                     summary[key + "_shadow_iou"] = float(np.mean(rows))
@@ -717,7 +714,7 @@ def main():
                     column.append(all_views[step // 2][n // 2].indices.astype(np.int64))
                 else:
                     cell = copied(step / 2, sign * n * 22.5)
-                    column.append(with_shadow(cell, step / 2, sign * n * 22.5).cpu().numpy())
+                    column.append(with_shadow(cell, n).cpu().numpy())
             sheet.append(column)
         if sheet:
             write_sheet(sheet, pal, out_dir / "sheet.png")

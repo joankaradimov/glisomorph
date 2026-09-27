@@ -5,15 +5,14 @@
 fit.py runs this after fitting. Run by hand, it evaluates a saved fit again, for example with other
 reprojection settings (`--warp`, see reproject.py), without fitting again.
 
-For sprites with baked shadows, it also fits the shadows' light to the known directions (see
-shadow.py), and draws shadows in the new ones.
+For sprites with baked shadows, it draws shadows in the new directions the way the originals' were
+made (shadow.py), and scores them against the originals'.
 
 Outputs: metrics.json, views.npz (truth, field colors, reprojected and relit colors, and shadows per
 view), compare.png, in_between.png and turntable.gif.
 """
 
 import argparse
-import dataclasses
 import json
 from pathlib import Path
 
@@ -26,7 +25,7 @@ from diablo1.palette import ramp_of
 from poc.ramps import Ramps
 from poc.reproject import Warp, fill, neighbour, reproject, source_depth
 from poc.scene import Scene
-from poc.shadow import baked_shadow, fit_light, iou, shadow_mask, shadow_opacity
+from poc.shadow import baked_shadow, iou, lowest_row, outline_shadow
 
 WARPS = {"coherent": Warp(), "plain": Warp.plain()}
 # Warp settings that can be changed from the command line, over the chosen warp's.
@@ -129,12 +128,12 @@ def to_rgb(indices: np.ndarray, palette_u8: np.ndarray, background=(64, 64, 64))
 
 class Renderer:
     """Renders any direction of a scene and colors it: with the field's own colors, reprojected from
-    the known directions, and, with a lighting model, reprojected and relit. With a shadow light
-    (`light`, see shadow.py), sprites get their baked shadow too."""
+    the known directions, and, with a lighting model, reprojected and relit. Sprites with baked
+    shadows get theirs too (shadow.py)."""
 
     def __init__(self, scene: Scene, warp: Warp):
         self.scene, self.warp = scene, warp
-        self.light = None
+        self.shadows = scene.preset.shadows
         self.ramps = Ramps(scene.palette)
         # Sprites use 0 (black) and 128-254. On characters, 0 is also their baked shadow, which the
         # model doesn't have, but black inside the model is part of its texture.
@@ -201,20 +200,17 @@ class Renderer:
         plain, relit = self.colored(r)
         return relit if relit is not None else plain
 
-    @torch.no_grad()
-    def shadow(self, r: dict):
-        """Where the direction shows its baked shadow (H, W): ground in shadow that the model doesn't
-        hide. None without a shadow light."""
-        if self.light is None:
+    def shadow(self, outline, ground=None):
+        """The baked shadow (H, W) of a sprite with this outline (H, W), about a ground row: by default
+        its own lowest row, as a still is its own first frame (shadow.py). None without shadows."""
+        if not self.shadows:
             return None
-        t = r["target"]
-        opacity = shadow_opacity(self.scene.field, t["origins"], t["forward"], self.light.direction(t["right"])[None],
-                                 self.light.ground, self.scene.samples)[0]
-        return shadow_mask(opacity, t["solid"])
+        return outline_shadow(outline, lowest_row(outline) if ground is None else ground)
 
-    def sprite(self, r: dict):
+    def sprite(self, r: dict, ground=None):
         """The direction as a sprite: its best colors, over its baked shadow (index 0)."""
-        return with_shadow(self.best_colors(r), self.shadow(r))
+        colors = self.best_colors(r)
+        return with_shadow(colors, self.shadow(colors >= 0, ground))
 
 
 def with_shadow(indices, shadow):
@@ -229,8 +225,6 @@ def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
     palette_np = palette.cpu().numpy()
     palette_u8 = (palette_np * 255).round().astype(np.uint8)
     renderer = Renderer(scene, warp)
-    if scene.preset.shadows and hasattr(scene.field, "sigma"):  # shadows need a density to march through
-        renderer.light, _ = fit_light(scene, train)
 
     # 1. Scores. A known direction's reprojection never uses that direction itself. Colors are scored
     #    without the baked shadows, which are scored on their own.
@@ -243,7 +237,7 @@ def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
         reprojected[i], relit_i = renderer.colored(r, exclude=i)
         if relit_i is not None:
             relit[i] = relit_i
-        shadows[i] = renderer.shadow(r)
+        shadows[i] = renderer.shadow(r["target"]["solid"])
         original = torch.as_tensor(v.indices, device=device).long()
         if shadows[i] is not None:
             match = float(iou(shadows[i], baked_shadow(original)))
@@ -268,9 +262,8 @@ def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
                "test_reprojected": mean_scores(results["test_reprojected"]),
                "test_relit": mean_scores(results["test_relit"]),
                "baseline_nearest_view": mean_scores(results["baseline"])}
-    if renderer.light is not None:
-        summary["shadows"] = {"light": dataclasses.asdict(renderer.light),
-                              "train_iou": float(np.mean(results["shadow_train"])),
+    if renderer.shadows:
+        summary["shadows"] = {"train_iou": float(np.mean(results["shadow_train"])),
                               "test_iou": float(np.mean(results["shadow_test"])) if results["shadow_test"] else None}
         print("shadows:", json.dumps(summary["shadows"]))
     if scene.lit:

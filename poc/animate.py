@@ -4,7 +4,8 @@
 
 Each frame is fitted on all 8 directions (fit.py), unless its fit is already saved. Frame 0
 calibrates the camera and the other frames share it, so the new directions don't wobble (see
-Motion in README.md). The shadows' light is fitted once, on frame 0.
+Motion in README.md). The new directions' shadows are made as the originals' were (shadow.py): each
+hangs from its direction's ground row, found in frame 0.
 
 Outputs, in out/<preset>-16/:
 - sheet.png: every frame in 16 directions, as the game would store them. There is a row per
@@ -22,9 +23,9 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 from poc import fit
-from poc.evaluate import Renderer, add_warp_arguments, warp_from_args
+from poc.evaluate import Renderer, add_warp_arguments, warp_from_args, with_shadow
 from poc.scene import Scene
-from poc.shadow import fit_light
+from poc.shadow import lowest_row
 from poc.views import PRESETS, frame_count
 
 DIRECTIONS = ["S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW", "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE"]
@@ -33,14 +34,18 @@ TICK_MS = 50  # the game's tick: walks and attacks show a frame per tick (standi
 BACKGROUND = (40, 40, 44)
 
 
-def render_frame(scene: Scene, renderer: Renderer) -> list[np.ndarray]:
-    """The 16 directions of one frame, from S clockwise: the originals, with a new one after each."""
-    out = []
+def render_frame(scene: Scene, renderer: Renderer, grounds=None):
+    """The 16 directions of one frame, from S clockwise: the originals, with a new one after each; and
+    the new ones' ground rows. Their shadows hang from the given ground rows, or, in the first frame
+    (None), from their own lowest rows."""
+    out, rows = [], []
     for i, v in enumerate(scene.views):
         out.append(v.indices.astype(np.int64))
         r = renderer.render(v.shape, v.pivot, scene.sign * (i * 360 / len(scene.views) + 180 / len(scene.views)))
-        out.append(renderer.sprite(r).cpu().numpy())
-    return out
+        colors = renderer.best_colors(r)
+        rows.append(lowest_row(colors >= 0) if grounds is None else grounds[i])
+        out.append(with_shadow(colors, renderer.shadow(colors >= 0, rows[-1])).cpu().numpy())
+    return out, rows
 
 
 def write_sheet(frames: list[list[np.ndarray]], palette: np.ndarray, path: Path) -> None:
@@ -117,18 +122,14 @@ def main():
         folders.append(folder)
 
     warp = warp_from_args(args)
-    frames, light, palette = [], None, None
+    frames, grounds, palette = [], None, None
     with torch.no_grad():
         for k, folder in enumerate(folders):
             scene = Scene.load(folder / "scene.pt", args.mpq)
             if len(scene.views) != 8:
                 raise SystemExit("%s has %d directions; animate.py makes 16 out of 8" % (args.preset, len(scene.views)))
-            renderer = Renderer(scene, warp)
-            if preset.shadows:
-                if light is None:
-                    light, _ = fit_light(scene, scene.train)
-                renderer.light = light
-            frames.append(render_frame(scene, renderer))
+            frame, grounds = render_frame(scene, Renderer(scene, warp), grounds)
+            frames.append(frame)
             if palette is None:
                 palette = (scene.palette.cpu().numpy() * 255).round().astype(np.uint8)
             print("frame %d of %d: rendered" % (k, count))

@@ -44,34 +44,6 @@ def intrinsics(pivot, offset, device, supersample: int = 1):
                         torch.stack([zero, zero, torch.ones((), device=device)])])
 
 
-def shadow_map_opacity(means, quats, scales, opacities, origins, forward, lights, ground: float, size: int = 256):
-    """Opacity (B, H, W) of the shadow on the ground under each pixel, for each of B lights (unit
-    vectors toward them): the Gaussians rendered from the light (a shadow map, orthographic, one pixel
-    per world unit), looked up where each pixel's ground point falls. The counterpart of
-    shadow.shadow_opacity, which marches through voxels."""
-    from poc.shadow import ground_points
-    device = means.device
-    q = ground_points(origins, forward, ground)                                         # (H, W, 3)
-    world_up = torch.tensor([0.0, 1.0, 0.0], device=device)
-    blank = torch.zeros((len(means), 3), device=device)
-    K = intrinsics((size / 2, size / 2), (0.0, 0.0), device)
-    out = []
-    for light in lights:
-        forward_l = -F.normalize(light, dim=0)
-        right_l = torch.cross(forward_l, world_up, dim=0)
-        if right_l.norm() < 1e-4:  # the light straight overhead
-            right_l = torch.tensor([1.0, 0.0, 0.0], device=device)
-        right_l = F.normalize(right_l, dim=0)
-        up_l = torch.cross(right_l, forward_l, dim=0)
-        _, alpha, _ = rasterization(means, quats, scales, opacities, blank, viewmat(right_l, up_l, forward_l)[None],
-                                    K[None], size, size, camera_model="ortho", packed=False)
-        u = q @ right_l + size / 2
-        v = size / 2 - q @ up_l
-        grid = torch.stack([u / size * 2 - 1, v / size * 2 - 1], -1)[None]
-        out.append(F.grid_sample(alpha.permute(0, 3, 1, 2), grid, align_corners=False)[0, 0])
-    return torch.stack(out)
-
-
 def _logit(p: float) -> float:
     return math.log(p / (1 - p))
 
