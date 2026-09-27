@@ -488,7 +488,9 @@ def main():
         tag = "motion-f%d%s" % (k, test)
         folder = Path(args.out) / fit.run_name(args.preset, split, tag=tag, model="gaussians")
         if (folder / "scene.pt").exists() and not args.refit_stills:
-            return Scene.load(folder / "scene.pt", args.mpq), folder
+            saved = Scene.load(folder / "scene.pt", args.mpq)
+            if saved.supersample == fit.GAUSSIAN_SUPERSAMPLE:  # else it's from before the default changed
+                return saved, folder
         argv = ["--mpq", args.mpq, "--preset", args.preset, "--split", split, "--frame", str(k), "--model",
                 "gaussians", "--tag", tag, "--out", args.out, "--no-evaluate"]
         return fit.main(argv + (["--camera", str(camera)] if camera else []))

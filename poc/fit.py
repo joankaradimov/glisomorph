@@ -28,6 +28,12 @@ from poc.scene import Scene, make_field, masks_for
 from poc.views import PRESETS, load_views
 
 
+# Gaussians render each pixel as the average of 16 x 16 samples by default: fitted so, they reproduce the
+# originals far better (on the warrior, 90% of pixels exactly against 61% sampled once at pixel
+# centers), because a pixel of an original is an average too, over partly covered edges and mixed colors.
+GAUSSIAN_SUPERSAMPLE = 16
+
+
 def run_name(preset: str, split: str, lighting: str = "phong", lights: int = 1, harmonics: int = 0,
              tag: str = "", model: str = "voxels") -> str:
     """A fit's output folder: <preset>-<split>-<colors>[-<tag>] (see the module's docstring)."""
@@ -95,8 +101,9 @@ def main(argv=None):
     ap.add_argument("--light-lr", type=float, default=0.01)
     ap.add_argument("--coupled-normals", action="store_true",
                     help="let shading gradients reshape the density through the normals")
-    ap.add_argument("--supersample", type=int, default=1,
-                    help="render each pixel as the average of s x s sub-pixel rays (area sampling)")
+    ap.add_argument("--supersample", type=int, default=None,
+                    help="render each pixel as the average of s x s sub-pixel samples (area sampling); by default "
+                         "%d for Gaussians, 1 for voxels" % GAUSSIAN_SUPERSAMPLE)
     ap.add_argument("--refine-camera", action="store_true",
                     help="refine the calibrated elevation and pivot offset by gradient")
     ap.add_argument("--refine-from", type=int, default=300, help="iteration at which camera refinement starts")
@@ -119,6 +126,8 @@ def main(argv=None):
     ap.add_argument("--no-evaluate", action="store_true", help="save the fit without scoring it or drawing pictures")
     add_warp_arguments(ap)
     args = ap.parse_args(argv)
+    if args.supersample is None:
+        args.supersample = GAUSSIAN_SUPERSAMPLE if args.model == "gaussians" else 1
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -448,6 +448,23 @@ its own major version. On Windows, this worked:
 - **Copied pixels are still better colored with voxels**, because only voxels have the lighting
   model, and so relighting, so far.
 
+**Supersampled fitting.** A pixel of an original is an average: over edges it partly covers, and
+colors that mix within it. Rendered once at each pixel's center, Gaussians can't match that. So by
+default they're now fitted with every pixel the average of 16 x 16 samples (`fit.py --supersample`).
+Rendered that way and snapped to the palette, the fit reproduces the originals far better:
+
+| Warrior, all 8 directions | Silhouette IoU | Exact | RGB error | Fit |
+|---|---:|---:|---:|---:|
+| 1 sample per pixel | 0.941 | 61.0% | 6.0 | 27 s |
+| 2 x 2 | 0.951 | 72.8% | 3.7 | |
+| 4 x 4 | 0.983 | 86.1% | 1.6 | |
+| 8 x 8 | 0.998 | 88.8% | 1.1 | 31 s |
+| 16 x 16 | 0.999 | 89.6% | 1.0 | 69 s |
+
+A hidden direction gains less: with SW hidden, its copied pixels get a silhouette IoU of 0.875
+against 0.862, and an RGB error of 16.7 against 17.1 (8 x 8 and 16 x 16 alike). Its shadow can move
+by a row: with the new outline's lowest pixel a row lower, the shadow hangs a row lower too.
+
 ### Moving Gaussians
 
 `motion.py` fits a whole looping animation with one set of Gaussians. A looping animation is a
