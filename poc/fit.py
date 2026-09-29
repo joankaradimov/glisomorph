@@ -290,7 +290,7 @@ def main(argv=None):
             opt.step()
             sched.step()
             if it % 500 == 0 or it == args.iters - 1:
-                print("iter %5d  loss %.5f  (%.0fs)" % (it, total + regularizer.item(), time.time() - t0))
+                print("iter %5d/%5d  loss %.5f  (%.0fs)" % (it + 1, args.iters, total + regularizer.item(), time.time() - t0))
 
     if args.refine_camera:
         off = tuple(off_param.detach().tolist())
