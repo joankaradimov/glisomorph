@@ -131,6 +131,7 @@ class MovingGaussians(torch.nn.Module):
         # Each pixel the average of supersample x supersample samples, as the originals' pixels are
         # averages over the edges they partly cover and the colors that mix in them.
         self.supersample = supersample
+        self.keep_samples = False
         p = still.params
         self.means0 = torch.nn.Parameter(p["means"].detach().clone())
         self.quats0 = torch.nn.Parameter(F.normalize(p["quats"].detach(), dim=-1))
@@ -225,7 +226,8 @@ class MovingGaussians(torch.nn.Module):
         """Colors with expected depth (C, H, W, 4), opacity (C, H, W, 1) and gsplat's info, each pixel
         the average of supersample x supersample samples. With the lighting model, albedo, normal and
         highlight strength are rendered, then shaded per sample (deferred), before averaging; the
-        pixels' normals are kept in last_normal (C, H, W, 3)."""
+        pixels' normals are kept in last_normal (C, H, W, 3). With keep_samples, the samples' own colors
+        (premultiplied) and opacity are kept in last_samples, before averaging."""
         s = self.supersample
         if s > 1:
             Ks = Ks.clone()
@@ -235,6 +237,8 @@ class MovingGaussians(torch.nn.Module):
         if not self.lit:
             out, alpha, info = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
                                              torch.sigmoid(self.colors), viewmats, Ks, width * s, height * s, **common)
+            if self.keep_samples:
+                self.last_samples = (out[..., :3], alpha)
             return (*average_down(out, alpha, s), info)
         albedo = torch.sigmoid(self.colors)
         strength = torch.sigmoid(self.specular)[:, None]
@@ -246,6 +250,8 @@ class MovingGaussians(torch.nn.Module):
         for c, vm in enumerate(viewmats):
             diffuse, highlight = self.shading(normal[c], vm[0, :3], -vm[1, :3], vm[2, :3])
             shaded.append(out[c, ..., :3] * diffuse[..., None] + (out[c, ..., 6] * highlight)[..., None])
+        if self.keep_samples:
+            self.last_samples = (torch.stack(shaded), alpha)
         colors, alpha = average_down(torch.cat([torch.stack(shaded), out[..., 3:6], out[..., 7:8]], -1), alpha, s)
         self.last_normal = F.normalize(colors[..., 3:6], dim=-1)
         return torch.cat([colors[..., :3], colors[..., 6:7]], -1), alpha, info
@@ -459,6 +465,18 @@ def follow(means, points, moves, k: int = 4):
     return moves[near].mean(1)
 
 
+def sample_variation(rgb, alpha):
+    """Total variation of samples' colors (C, h, w, 3), premultiplied, with their opacity (C, h, w, 1):
+    the mean color jump (L1) between neighbouring samples where both are solid. As a prior, it favours
+    flat patches of color between the edges the images demand, rather than each Gaussian a color of its
+    own: a clean look at the samples' resolution (4x, sampled 4 x 4)."""
+    u = rgb / alpha.clamp(min=0.25)
+    solid = (alpha > 0.5).float()
+    dy = (u[:, 1:] - u[:, :-1]).abs().sum(-1, keepdim=True) * solid[:, 1:] * solid[:, :-1]
+    dx = (u[:, :, 1:] - u[:, :, :-1]).abs().sum(-1, keepdim=True) * solid[:, :, 1:] * solid[:, :, :-1]
+    return (dy.sum() + dx.sum()) / solid.sum().clamp(min=1)
+
+
 def image_loss(colors, alphas, targets, masks, blur: int = 1, snap=None, keyed: bool = False):
     """Color error inside the silhouettes and silhouette error, at full size or averaged over blur x blur.
     At full size, as GaussianField.fit: with `snap` (the palette colors a pixel can snap to (K, 3) and a
@@ -516,6 +534,10 @@ def main():
                     help="what the joint refinement changes: the colors (and highlights) only; also the rest "
                          "shape, fitted to every frame through the tracked motion; or also the motion, the "
                          "opacities and per-frame corrections, which fit the known cells closer but copy worse")
+    ap.add_argument("--tv", type=float, default=0.0,
+                    help="in the refinement, weight of the samples' total variation (sample_variation): flat "
+                         "patches of color between edges, for a clean look at the samples' resolution, 4x "
+                         "(0: none; 0.005 suits the zombie)")
     ap.add_argument("--snap", type=float, default=0.0,
                     help="in the refinement, fit colors as they'll be snapped to the palette: cross-entropy over "
                          "its colors at this temperature (0: the squared distance to the pixel's palette color)")
@@ -685,12 +707,15 @@ def main():
     opt = torch.optim.Adam(groups)
     candidates = torch.tensor([0] + list(range(128, 255)), device=device)  # the indices sprites use
     snap = (palette[candidates], args.snap) if args.snap else None
+    model.keep_samples = bool(args.tv)
     t0 = time.time()
     for it in range(0 if args.load else args.refine_iters):
         j = it % len(frames)
         targets, masks = all_targets[j]
         colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
         loss = image_loss(colors, alphas, targets, masks, snap=snap, keyed=args.keyed)
+        if args.tv:
+            loss = loss + args.tv * sample_variation(*model.last_samples)
         if args.refine == "shape":
             loss = loss + F.relu(model.scales - math.log(3.0)).square().mean()  # keep Gaussians small
         if args.refine == "all":
@@ -702,6 +727,7 @@ def main():
         opt.step()
         if it % 500 == 0 or it == args.refine_iters - 1:
             print("refine %5d  loss %.5f  (%.0fs)" % (it, loss.item(), time.time() - t0))
+    model.keep_samples, model.last_samples = False, None
 
     # 4. Scores and pictures.
     per_frame = len(frames) / count  # model slots per animation frame

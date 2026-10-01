@@ -765,6 +765,57 @@ can hold detail finer than a pixel).
   sprite as the truth, rendered finer: its detail below a pixel was the same kind of noise, which no
   method could, or should, recover.
 
+### A clean look at 4x
+
+Rendered at 4x, the Gaussians' own colors look scaly: between the originals' pixels nothing holds a
+Gaussian's color to its neighbours'. With no answer key at 4x, the looks were judged by eye, with
+the share of speckle (pixels at 4x unlike all four neighbours) as a number, and the fit checked at
+1x, with SW hidden. The zombie's walk, frame 0, fitted 16 x 16 per pixel, rendered at 4x in two
+fitted and two in-between directions:
+
+| IoU / exact | Fitted, own colors | SW: IoU / own colors / copied | Speckle at 4x | Look at 4x |
+|---|---|---|---|---|
+| Plain | 1.000 / 97.1% | 0.923 / 20.6% / 23.9% | 5.8% | Scaly, streaky |
+| Total variation at 4x (0.005) | 1.000 / 95.7% | 0.924 / 25.2% / 23.0% | 0.1% | Clean: flat patches |
+| Colors pulled to the 8 nearest Gaussians' | 1.000 / 89.2% | 0.918 / 24.4% / 24.2% | 0.2% | Clean: soft gradients |
+| No Gaussian under 0.5 px across | 0.968 / 80.8% | 0.919 / 21.0% / 25.0% | 0.0% | Clean, but soft |
+| The same, on the two larger axes only | 0.999 / 91.5% | 0.918 / 19.1% / 23.8% | 0.9% | Brush strokes |
+| 1.5 px voxels, no splitting | 0.998 / 86.3% | 0.918 / 17.2% / 23.8% | 1.6% | Still streaky |
+| None longer than 4 times its width | 0.998 / 95.9% | 0.922 / 16.8% / 25.0% | 5.7% | As plain |
+| The 0.5 px floor at render time only | 0.722 / 13.8% | 0.744 / 8.3% / 17.3% | 0.5% | Blotchy |
+
+SW's own colors vary by about 2 points from run to run (20.6% to 22.8% exact, plain).
+
+- **The scales come from each Gaussian having a color of its own,** not from their shapes: capping
+  how long they are changes nothing. Tying colors together removes them, and leaves the outline as
+  sharp as plain.
+- **Total variation's weight:** from 0.005 up, the speckle is gone. Heavier, the patches grow and
+  the fit loosens (the fitted cells 95.8% exact at 0.005, 83.2% at 0.02, 63.1% at 0.04), while SW's
+  own colors creep up (22.3% plain, 25.6%, 26.1%, 27.3%) and its copied pixels stay put. Its patches
+  follow the originals' pixels in fitted directions, and run in streaks in between.
+- **A floor has to be fitted:** applied only to render, it bares inner Gaussians' colors.
+- **Learned downsamplers didn't help.** One small CNN halving, shared by four levels (16 -> 8 -> 4 ->
+  2 -> 1, each the 2 x 2 average plus a learned correction), took the coloring over: the Gaussians'
+  colors drifted to gray and their opacity past 1, and the four levels put the color back step by
+  step, so at 4x, two levels in, the sprite came out half colored. SW's copied pixels dropped from
+  26.0% to 22.0% exact. A linear one, a shared symmetric filter [a, 1/2 - a, 1/2 - a, a] (a = 0 is
+  the average), took a to the sharpest allowed, -1/8: the originals are crisper than an average.
+  SW's outline got worse (0.903 against 0.914), 4x stayed streaky, and it fitted 5 times slower.
+
+`motion.py --tv W` puts total variation in the moving Gaussians' refinement, on their samples (4 x 4
+per pixel: the 4x image). On the zombie's walk, with odd frames hidden (rendered at 4x from the
+saved models; rendering larger isn't in motion.py yet):
+
+| Zombie's walk, 4 x 4 | Fitted cells, own colors | Hidden frames: own / copied | Outline | Look at 4x |
+|---|---|---|---|---|
+| Plain (two runs) | 72.6–73.2% | 55.9–56.4% / 54.0–54.3% | 0.921–0.926 | Scaly |
+| `--tv 0.005` | 66.9% | 57.6% / 53.2% | 0.917 | Clean, painterly |
+| Colors pulled to the 8 nearest (0.05) | 68.2% | 55.3% / 53.4% | 0.917 | Wrinkled, metallic |
+
+Pulling colors together evens out only the albedo; lit, each Gaussian's normal still shades it a
+little differently. Total variation, on the shaded samples, smooths both. It costs the 1x sheets
+about a point of copied pixels, so it's off by default: it's for rendering larger.
+
 ## Next steps
 
 - **Animations:** checked on two walks and an attack; the attack's sword swing needed the tracking
