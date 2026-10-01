@@ -482,6 +482,28 @@ def sample_variation(rgb, alpha):
     return (dy.sum() + dx.sum()) / solid.sum().clamp(min=1)
 
 
+def coverage_variation(alpha):
+    """Total variation of samples' coverage (C, h, w, 1), per solid sample: the outline's length against
+    the area inside it. As a prior, it costs needles (much outline, little inside) more than a smooth
+    outline."""
+    dy = (alpha[:, 1:] - alpha[:, :-1]).abs().sum()
+    dx = (alpha[:, :, 1:] - alpha[:, :, :-1]).abs().sum()
+    return (dy + dx) / (alpha > 0.5).sum().clamp(min=1)
+
+
+def color_smoothness(colors, neighbours):
+    """The mean squared difference between each Gaussian's color (N, 3) and its neighbours' (N, k): as a
+    prior, color varies smoothly between Gaussians, rather than each having its own. Along a thin part,
+    a blade, the neighbours run along it."""
+    return ((colors[:, None] - colors[neighbours]) ** 2).sum(-1).mean()
+
+
+def neighbours_of(points, k: int):
+    """For each point (N, 3), its k nearest other points (N, k)."""
+    return torch.cat([torch.cdist(chunk, points).topk(k + 1, largest=False).indices[:, 1:]
+                      for chunk in torch.split(points, 2048)])
+
+
 def image_loss(colors, alphas, targets, masks, blur: int = 1, snap=None, keyed: bool = False):
     """Color error inside the silhouettes and silhouette error, at full size or averaged over blur x blur.
     At full size, as GaussianField.fit: with `snap` (the palette colors a pixel can snap to (K, 3) and a
@@ -556,6 +578,12 @@ def main():
                          "over taken out (edges.py): redrawn over black, given an inside neighbour's color, or kept "
                          "('none'). Rendered larger, the model's edges then show no bluish rim. The copier keeps "
                          "the originals' edges: the sheet's new cells sit beside original ones")
+    ap.add_argument("--outline-tv", type=float, default=0.0,
+                    help="in the refinement, weight of the samples' coverage's total variation "
+                         "(coverage_variation): smooth outlines, without needles (0: none)")
+    ap.add_argument("--color-smooth", type=float, default=0.0,
+                    help="in the refinement, weight of each Gaussian's albedo pulled toward its 8 nearest "
+                         "Gaussians' (color_smoothness): even colors along thin parts (0: none)")
     ap.add_argument("--snap", type=float, default=0.0,
                     help="in the refinement, fit colors as they'll be snapped to the palette: cross-entropy over "
                          "its colors at this temperature (0: the squared distance to the pixel's palette color)")
@@ -744,7 +772,8 @@ def main():
     opt = torch.optim.Adam(groups)
     candidates = torch.tensor([0] + list(range(128, 255)), device=device)  # the indices sprites use
     snap = (palette[candidates], args.snap) if args.snap else None
-    model.keep_samples = bool(args.tv)
+    model.keep_samples = bool(args.tv or args.outline_tv)
+    neighbours = None
     t0 = time.time()
     for it in range(0 if args.load else args.refine_iters):
         j = it % len(frames)
@@ -753,6 +782,12 @@ def main():
         loss = image_loss(colors, alphas, targets, masks, snap=snap, keyed=args.keyed)
         if args.tv:
             loss = loss + args.tv * sample_variation(*model.last_samples)
+        if args.outline_tv:
+            loss = loss + args.outline_tv * coverage_variation(model.last_samples[1])
+        if args.color_smooth:
+            if it % 50 == 0:  # the rest shape moves as it's refined
+                neighbours = neighbours_of(model.means0.detach(), 8)
+            loss = loss + args.color_smooth * color_smoothness(torch.sigmoid(model.colors), neighbours)
         if args.refine == "shape":
             loss = loss + F.relu(model.scales - math.log(3.0)).square().mean()  # keep Gaussians small
         if args.refine == "all":

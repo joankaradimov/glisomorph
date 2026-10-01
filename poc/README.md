@@ -863,6 +863,26 @@ between some frames. Fitted to all 24 frames, they don't: the legs' silhouettes 
 phase to the next as evenly as the originals' do from frame to frame (the largest change 1.81
 times the median, in both), the largest where the artist's own stride is fastest.
 
+**Thin parts.** At 4x the warrior's blade comes out speckled and ragged. The speckle is in its
+colors, not its lighting (drawn as albedo alone, it's as speckled): a blade is a pixel or two wide
+in every original, nearly all of it edge pixels blended with the background, and it moves fast, so
+hundreds of small Gaussians each fit a few pixels of a staircase that shifts from frame to frame.
+
+- **A thin part's edges:** they have no clean pixels inside to tell their color, so where its
+  neighbours are blends too, `edges.py` takes a pixel's color from the three pixels within two that
+  are farthest from the background color, a blade's middle. A few fewer blue specks.
+- **`--color-smooth W`** pulls each Gaussian's albedo toward its 8 nearest Gaussians' in the
+  refinement; along a blade they run along it. At 0.2 the blade turns an even gray, with little of
+  its speckle.
+- **`--outline-tv W`** adds the total variation of the samples' coverage to the refinement, which
+  costs needles more than a smooth outline: a few stray slivers go, but the outline stays fuzzy.
+  Capping how elongated a Gaussian may be (4 times its width) made the blade blobbier, no cleaner.
+
+Together, with `--tv 0.005`, they cost the attack's hidden frames little at 1x (copied pixels 36.9%
+exact against 37.2%, own colors 32.1% against 33.5%; the fitted cells' own colors 39.1% against
+44.0%), so they're options for rendering larger. The blade's outline needs something else: drawn as
+a line, or made of flat Gaussians.
+
 **Rendering larger.** `--scale 4` also draws the 16 directions by twice the frames 4 times larger,
 as `directions-4x.gif`, four directions to a row. Every cell is the model's, as there are no
 originals at that size: its own colors, one sample per pixel where that's the fit's own grid, or
