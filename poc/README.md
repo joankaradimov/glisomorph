@@ -530,6 +530,18 @@ most stages, so it saves only 5% there:
 | Zombie's walk, odd frames hidden | 0.906 / 51.1% / 8.4 | 0.907 / 51.1% / 8.4 | 8,778 → 6,976 |
 | Attack, odd frames hidden | 0.810 / 38.4% / 15.4 | 0.804 / 38.1% / 15.5 | 5,586 → 5,318 |
 
+Tracking's time went to the backward pass and to shading 1.5 million samples per step (8 views,
+4 x 4 per pixel), not to rasterizing; the transports took a second each. Three more savings halve a
+run (the zombie's walk, odd frames hidden, alone on the GPU: 548 s to 312 s), with the same scores
+within the noise (hidden frames' own colors 54.8% exact in both, copied pixels 51.1% and 50.9%):
+
+- **The blurred stages render one sample per pixel** (`--blurred-supersample`): blurred by 4 or 2
+  pixels, what's below a pixel is gone anyway. Only the last stage needs 4 x 4.
+- **Transports take 10 Sinkhorn iterations per blur level**, not 30 (`--sinkhorn-iters`). With the
+  first, tracking takes half the time (273 s to 142 s).
+- **The stills of frames other than the first take 1,000 iterations**, not 2,000 (`--still-iters`):
+  they only give the transport its targets. They take half the time (13 s to 7 s each).
+
 The frames' stills are saved, and reused by later runs (`--refit-stills` fits them again). The
 tables before [Fast motion](#fast-motion) were measured with the first tracker, which matched
 nearest neighbours instead, and a refinement of everything (now `--refine all`): all frames
@@ -828,10 +840,13 @@ the outermost Gaussians, which learned it, draw it as a line, and copied pixels 
   outermost Gaussians anyway: at 1x both explain the edge as well.
 - **Taking it out of the originals did.** `--edges black`, now the default, redraws each blended
   edge pixel as if over black, pixel - (1 - coverage) x background (never as index 0, the shadows'
-  black), before fitting and copying: the edges keep their falloff, without the blue. `--edges
-  inside` gives them an inside neighbour's color instead, which leaves them too bright; `--edges
-  none` keeps them. The fitted cells score as before (the zombie's walk, all frames: 66.4% exact
-  against 66.5%), and the sheet's original cells keep their own edges.
+  black), before fitting: the edges keep their falloff, without the blue. `--edges inside` gives them
+  an inside neighbour's color instead, which leaves them too bright; `--edges none` keeps them. The
+  fitted cells score as before (the zombie's walk, all frames: 66.4% exact against 66.5%).
+- **The copier keeps the originals' edges:** the sheet's new cells sit beside original ones, which
+  keep theirs. Copying from redrawn edges cost the zombie's hidden frames 3 points of exact pixels
+  at 1x (51.1% against 54.0–54.3%); copying from the originals', they score 53.6%. Rendered larger,
+  copying from the redrawn edges is what takes the rim out.
 
 **Legs.** Rendered at 4x from the model fitted to every other frame, the zombie's legs jumped
 between some frames. Fitted to all 24 frames, they don't: the legs' silhouettes change from one

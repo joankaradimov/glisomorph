@@ -234,6 +234,7 @@ class MovingGaussians(torch.nn.Module):
             Ks = Ks.clone()
             Ks[:, :2] *= s  # s samples per world unit, the origin where it was
         means, quats = self.pose(phase)
+        self.last_means = means  # for the transport's pull, without posing again
         common = dict(camera_model="ortho", render_mode="RGB+ED", packed=False)
         if not self.lit:
             out, alpha, info = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
@@ -524,6 +525,14 @@ def main():
                     help="weight of the pull toward where optimal transport takes the surface in each frame's "
                          "still (0 = images only)")
     ap.add_argument("--rematch", type=int, default=200, help="iterations between transports while tracking")
+    ap.add_argument("--sinkhorn-iters", type=int, default=10,
+                    help="Sinkhorn iterations per blur level of a transport (30 tracked no better)")
+    ap.add_argument("--blurred-supersample", type=int, default=1,
+                    help="samples per pixel side in tracking's blurred stages, where sub-pixel detail is blurred "
+                         "away anyway (4 x 4 tracked no better, in twice the time)")
+    ap.add_argument("--still-iters", type=int, default=1000,
+                    help="iterations of the stills of frames other than the first, which only give the transport "
+                         "its targets (0: fit.py's 2000, which did no better)")
     ap.add_argument("--refit-stills", action="store_true", help="fit the frames' stills again, even if saved")
     ap.add_argument("--supersample", type=int, default=4,
                     help="samples per pixel side: each pixel of the moving Gaussians the average of s x s (16 "
@@ -541,9 +550,9 @@ def main():
                          "(0: none; 0.005 suits the zombie)")
     ap.add_argument("--edges", default="black", choices=["black", "inside", "none"],
                     help="fit colors to the originals with their edges' share of the background they were drawn "
-                         "over taken out (edges.py), and copy from them: redrawn over black, given an inside "
-                         "neighbour's color, or kept ('none'). Rendered larger, it shows as a bluish rim. (The "
-                         "sheet's original cells keep theirs.)")
+                         "over taken out (edges.py): redrawn over black, given an inside neighbour's color, or kept "
+                         "('none'). Rendered larger, the model's edges then show no bluish rim. The copier keeps "
+                         "the originals' edges: the sheet's new cells sit beside original ones")
     ap.add_argument("--snap", type=float, default=0.0,
                     help="in the refinement, fit colors as they'll be snapped to the palette: cross-entropy over "
                          "its colors at this temperature (0: the squared distance to the pixel's palette color)")
@@ -572,8 +581,9 @@ def main():
 
     # 1. Every fitted frame as a still; frame 0 calibrates the camera, and the others share it.
     def still(k, camera=None):
-        tag = "motion-f%d%s%s%s" % (k, test, "-ss%d" % args.still_supersample if args.still_supersample != 1 else "",
-                                    "-" + args.edges if args.edges != "none" else "")
+        iters = args.still_iters if k and args.still_iters else None
+        tag = "motion-f%d%s%s%s%s" % (k, test, "-ss%d" % args.still_supersample if args.still_supersample != 1 else "",
+                                      "-" + args.edges if args.edges != "none" else "", "-i%d" % iters if iters else "")
         folder = Path(args.out) / fit.run_name(args.preset, split, tag=tag, model="gaussians")
         if (folder / "scene.pt").exists() and not args.refit_stills:
             saved = Scene.load(folder / "scene.pt", args.mpq)
@@ -581,7 +591,7 @@ def main():
                 return saved, folder
         argv = ["--mpq", args.mpq, "--preset", args.preset, "--split", split, "--frame", str(k), "--model",
                 "gaussians", "--supersample", str(args.still_supersample), "--tag", tag, "--out", args.out,
-                "--no-evaluate", "--edges", args.edges]
+                "--no-evaluate", "--edges", args.edges] + (["--iters", str(iters)] if iters else [])
         return fit.main(argv + (["--camera", str(camera)] if camera else []))
 
     still_scene, still_dir = still(0)
@@ -602,11 +612,11 @@ def main():
     Ks = K[None].repeat(len(yaws), 1, 1)
     dirs = torch.tensor(train_dirs, device=device)
 
-    def model_indices(v):
+    def model_indices(v, redraw=True):
         """A view's palette indices where the model is (-1 elsewhere: the background, a baked shadow), its
-        edges redrawn under --edges."""
+        edges redrawn under --edges (unless not to redraw)."""
         idx = np.where(masks_for([v], preset.shadows, device)[0].cpu().numpy() == 1, v.indices, -1)
-        if args.edges == "none":
+        if args.edges == "none" or not redraw:
             return idx
         return (edges_over_black if args.edges == "black" else clean_edges)(idx, palette.cpu().numpy())
 
@@ -655,7 +665,7 @@ def main():
         slot j to the surface of frame frames[j]'s still."""
         with torch.no_grad():
             here = surface_of(*model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)[:2])
-            there = transport(here, still_surface(j))
+            there = transport(here, still_surface(j), iterations=args.sinkhorn_iters)
             means, _ = model.pose(j)
             return means + follow(means, here[:, :3], there[:, :3] - here[:, :3])
 
@@ -674,14 +684,16 @@ def main():
             best, stale = float("inf"), 0
             for step in range(share):
                 if args.matching and it % args.rematch == 0:
+                    model.supersample = args.supersample
                     goal = transport_goal(j)
+                model.supersample = args.supersample if blur == 1 else args.blurred_supersample
                 colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
                 fit_loss = image_loss(colors, alphas, targets, masks, blur)
                 loss = fit_loss + args.arap * model.arap(j)
                 if goal is not None:
                     # The pull fades out over the stages as they'd run in full, leaving the images the
                     # last word; a last stage that ends early keeps up to a quarter of it.
-                    means, _ = model.pose(j)
+                    means = model.last_means
                     fade = 1 - (stage + step / share) / 3
                     loss = loss + args.matching * fade * (means - goal).norm(dim=-1).mean()
                 opt.zero_grad()
@@ -699,6 +711,7 @@ def main():
                         break
         print("tracked frame %d (%d of %d): loss %.5f, %d iterations (%.0fs)" % (
             frames[j], j, len(frames) - 1, loss.item(), it, time.time() - t0))
+    model.supersample = args.supersample
 
     # 3. The rest shape and colors, refitted to every frame at once through the tracked motion: frame 0's
     #    still saw the model from 8 directions, but as parts move, the other frames show them from more.
@@ -770,7 +783,8 @@ def main():
                 _, alpha, depth = model.rest_points(j, vm, K, w, h)
                 sources.append({"view": d, "slot": j, "yaw": float(yaws[d]), "right": r, "up": u, "forward": f,
                                 "pivot": pivot, "offset": offset,
-                                "indices": torch.as_tensor(model_indices(all_views[k][d]), device=device).long(),
+                                "indices": torch.as_tensor(model_indices(all_views[k][d], redraw=False),
+                                                           device=device).long(),
                                 "depth": source_depth(depth, alpha >= 0.5, warp)})
         copier = PixelCopier(model, sources, warp, Ramps(palette), len(frames))
 
