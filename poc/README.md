@@ -481,8 +481,11 @@ options of fit.py (Gaussians) and of motion.py's refinement, off by default. On 
 | Zombie: squared distance (two runs) | 0.967–0.968 / 72.6–73.2% / 4.1–4.2 | 0.921–0.926 / 55.9–56.4% / 6.7–6.8 | 0.921–0.926 / 54.0–54.3% / 7.0–7.1 |
 | Zombie: `--snap 0.0005` | 0.958 / 82.9% / 2.1 | 0.912 / 57.3% / 6.3 | 0.912 / 53.5% / 7.4 |
 
-- **The fitted cells come back nearly exact:** their misses were colors landing next to the right
-  palette color.
+- **The fitted cells come back nearly exact, but half the stance's gain is in how it's scored.** The
+  squared distance fits colors as rendered over black (times opacity), and snapping divides the
+  opacity out, so partly covered edge pixels snap brighter than they were fitted. Scored the way it
+  was fitted, the stance's squared distance is 96.6% exact, against 99.2% with `--snap 0.0005`; the
+  misses left were colors landing next to the right palette color.
 - **Hidden cells don't gain:** what they get wrong is the color itself (an unlit still gives a
   surface one color, a compromise between the views' shading), not how it's matched to the palette.
   The moving Gaussians' own colors, lit, gain a point.
