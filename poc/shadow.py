@@ -31,17 +31,18 @@ def lowest_row(outline: torch.Tensor):
     return float(rows.max()) if len(rows) else None
 
 
-def outline_shadow(outline: torch.Tensor, ground) -> torch.Tensor:
+def outline_shadow(outline: torch.Tensor, ground, scale: float = 1.0) -> torch.Tensor:
     """The shadow (H, W bool) that a sprite with this outline (H, W bool) carries, about the given
     ground row (see the module's docstring). It isn't drawn where the outline is: the sprite covers
-    it. No shadow without a ground row."""
+    it. No shadow without a ground row. For a sprite drawn `scale` times larger, the offset grows
+    with it (the squash and shear are ratios)."""
     shadow = torch.zeros_like(outline)
     if ground is None:
         return shadow
     ys, xs = torch.nonzero(outline, as_tuple=True)
     height = ground - ys.float()
-    x = torch.round(xs + OFFSET[0] - SHEAR * height).long()
-    y = torch.round(ground + OFFSET[1] - SQUASH * height).long()
+    x = torch.round(xs + scale * OFFSET[0] - SHEAR * height).long()
+    y = torch.round(ground + scale * OFFSET[1] - SQUASH * height).long()
     inside = (x >= 0) & (x < outline.shape[1]) & (y >= 0) & (y < outline.shape[0])
     shadow[y[inside], x[inside]] = True
     return shadow & ~outline

@@ -826,7 +826,7 @@ SW's own colors vary by about 2 points from run to run (20.6% to 22.8% exact, pl
 
 `motion.py --tv W` puts total variation in the moving Gaussians' refinement, on their samples (4 x 4
 per pixel: the 4x image). On the zombie's walk, with odd frames hidden (rendered at 4x from the
-saved models; rendering larger isn't in motion.py yet):
+saved models, as `--scale` below does):
 
 | Zombie's walk, 4 x 4 | Fitted cells, own colors | Hidden frames: own / copied | Outline | Look at 4x |
 |---|---|---|---|---|
@@ -862,6 +862,17 @@ the outermost Gaussians, which learned it, draw it as a line, and copied pixels 
 between some frames. Fitted to all 24 frames, they don't: the legs' silhouettes change from one
 phase to the next as evenly as the originals' do from frame to frame (the largest change 1.81
 times the median, in both), the largest where the artist's own stride is fastest.
+
+**Rendering larger.** `--scale 4` also draws the 16 directions by twice the frames 4 times larger,
+as `directions-4x.gif`, four directions to a row. Every cell is the model's, as there are no
+originals at that size: its own colors, one sample per pixel where that's the fit's own grid, or
+with `--scale-colors copied`, copied pixels, from the originals with their edges redrawn. Shadows
+follow the 2D rule, their offset grown with the scale. A saved model draws again without fitting
+(`--load`, in half a minute for the zombie's walk in its own colors). For the look above:
+
+```
+python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset zombie-walk --tv 0.005 --scale 4
+```
 
 ## Next steps
 

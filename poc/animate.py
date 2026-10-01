@@ -60,9 +60,9 @@ def write_sheet(frames: list[list[np.ndarray]], palette: np.ndarray, path: Path)
 
 
 def write_gif(frames: list[list[np.ndarray]], palette: np.ndarray, path: Path, scale: int = 2,
-              duration=TICK_MS) -> None:
-    """All directions of each frame, side by side, one GIF frame each, shown for `duration` ms (or a
-    list of durations, one per frame)."""
+              duration=TICK_MS, columns: int = 8) -> None:
+    """All directions of each frame, side by side in rows of `columns`, one GIF frame each, shown for
+    `duration` ms (or a list of durations, one per frame)."""
     solid = np.any([img >= 0 for directions in frames for img in directions], axis=0)
     ys, xs = np.nonzero(solid)
     y0, y1, x0, x1 = max(ys.min() - 2, 0), ys.max() + 3, max(xs.min() - 2, 0), xs.max() + 3
@@ -86,9 +86,10 @@ def write_gif(frames: list[list[np.ndarray]], palette: np.ndarray, path: Path, s
             draw.text((5, 6), DIRECTIONS[d], fill=(230, 230, 230), font=font)
             tiles.append(tile)
         tw, th = tiles[0].size
-        picture = Image.new("RGB", (8 * (tw + 4) - 4, 2 * (th + 4) - 4), (15, 15, 18))
+        rows = -(-len(tiles) // columns)
+        picture = Image.new("RGB", (columns * (tw + 4) - 4, rows * (th + 4) - 4), (15, 15, 18))
         for n, tile in enumerate(tiles):
-            picture.paste(tile, ((n % 8) * (tw + 4), (n // 8) * (th + 4)))
+            picture.paste(tile, ((n % columns) * (tw + 4), (n // columns) * (th + 4)))
         pictures.append(picture)
     pictures[0].save(path, save_all=True, append_images=pictures[1:], duration=duration, loop=0)
 

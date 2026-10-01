@@ -34,7 +34,8 @@ in-betweens against the originals.
 
 Outputs, in out/<preset>-motion[-<test>][-<tag>]/: metrics.json, sheet.png (16 directions by twice the
 frames, in the palette: the originals, and copied pixels over generated shadows in between),
-directions.gif, motion.pt, and with a test, hidden.npz (the hidden cells as generated).
+directions.gif, motion.pt, with a test, hidden.npz (the hidden cells as generated), and with --scale S,
+directions-<S>x.gif (every cell the model's, S times larger).
 """
 
 import argparse
@@ -373,7 +374,9 @@ class PixelCopier:
         # positions as colors would give a wide Gaussian's center to every pixel it covers.) The
         # nearest Gaussian's per-frame correction is taken off here, and the source frame's added back.
         s0 = self.sources[0]
-        posed = pixel_rays(h, w, s0["pivot"], s0["offset"], right, up, forward)[0] + depth[..., None] * forward
+        scale = h // s0["indices"].shape[0]  # cells may be drawn larger than the originals
+        posed = pixel_rays(h // scale, w // scale, s0["pivot"], s0["offset"], right, up, forward,
+                           supersample=scale)[0] + depth[..., None] * forward
         rest = model.unpose_points(posed, slot_phase)
         near_gaussian = torch.zeros(solid.shape, dtype=torch.long, device=rest.device)
         if solid.any():
@@ -562,6 +565,12 @@ def main():
     ap.add_argument("--load", default=None,
                     help="a saved motion.pt to score and draw again, instead of tracking and refining")
     ap.add_argument("--no-sheet", action="store_true", help="score, but skip the 16-direction sheet and GIF")
+    ap.add_argument("--scale", type=int, default=1,
+                    help="also draw the 16 directions by twice the frames this many times larger, as a GIF "
+                         "(directions-<scale>x.gif)")
+    ap.add_argument("--scale-colors", default="own", choices=["own", "copied"],
+                    help="the larger cells' colors: the model's own, or copied pixels (from the originals with "
+                         "their edges redrawn, as --edges)")
     ap.add_argument("--tag", default="", help="suffix for the output folder")
     ap.add_argument("--out", default="out")
     args = ap.parse_args()
@@ -887,6 +896,39 @@ def main():
             # Twice the frames at the game's speed: 25 ms each, which a GIF (in steps of 10 ms) shows as
             # 20 and 30 in turn.
             write_gif(sheet, pal, out_dir / "directions.gif", duration=[20, 30] * count)
+        if args.scale > 1:
+            # Larger, every cell is the model's: there are no originals at that size. One sample per
+            # pixel, where that's the fit's own grid; copied pixels come from the originals with their
+            # edges redrawn, as the colors were fitted, since a blended edge would show as a rim.
+            S, fine = args.scale, model.supersample
+            K_big = intrinsics(pivot, offset, device, S)
+            model.supersample = max(1, fine // S)
+            big_copier = PixelCopier(model, [dict(s, indices=torch.as_tensor(
+                model_indices(all_views[frames[s["slot"]]][s["view"]]), device=device).long()) for s in sources],
+                warp, Ramps(palette), len(frames))
+
+            def big_cell(step, n):
+                d_yaw = sign * n * 22.5
+                r, u, f, vm, _ = camera(d_yaw)
+                colors, alphas, _ = model.rasterize(step / 2 * per_frame, vm[None], K_big[None], w * S, h * S)
+                own = quantize(colors[0, ..., :3], alphas[0, ..., 0], palette, candidates)
+                if args.scale_colors == "own":
+                    return own
+                return big_copier(step / 2 * per_frame, d_yaw, (r, u, f, vm, K_big), own)
+
+            big_grounds = {n: lowest_row(big_cell(0, n) >= 0) for n in range(16)}
+            big = []
+            for step in range(2 * count):
+                column = []
+                for n in range(16):
+                    cell = big_cell(step, n)
+                    if preset.shadows:
+                        shade = outline_shadow(cell >= 0, big_grounds[n], scale=S)
+                        cell = torch.where(shade, torch.zeros_like(cell), cell)
+                    column.append(cell.cpu().numpy())
+                big.append(column)
+            model.supersample = fine
+            write_gif(big, pal, out_dir / ("directions-%dx.gif" % S), scale=1, duration=[20, 30] * count, columns=4)
     torch.save({"model": model.state_dict(), "frames": frames}, out_dir / "motion.pt")
     print("wrote", out_dir, "(%.0fs)" % (time.time() - t_start))
 
