@@ -542,6 +542,16 @@ within the noise (hidden frames' own colors 54.8% exact in both, copied pixels 5
 - **The stills of frames other than the first take 1,000 iterations**, not 2,000 (`--still-iters`):
   they only give the transport its targets. They take half the time (13 s to 7 s each).
 
+The refinement has no such saving: its loss, averaged over each pass through the frames, still falls
+at its 3,000th iteration (0.0050 at 600, 0.0046 at 1,200, 0.0043 at 3,000), so stopping it once it
+stops improving never stops it. Cut to 1,500 or 1,000 iterations, the copied pixels hold (hidden
+frames 53.4% and 53.3% exact, against 53.6%), but the model's own colors lose (the fitted cells
+67.7% and 65.9% against 71.0%; hidden frames 54.2% and 53.4% against 54.7%), and those are what a
+larger rendering shows. Run longer, it never settles either (0.0039 at 12,000, with no 360
+iterations in a row better by a tenth of a percent), and the gain goes only to the frames it's
+fitted to: at 12,000 the fitted cells are 74.0% exact, but the hidden frames' own colors 53.9% and
+copied pixels 53.1%, no better. It keeps its 3,000.
+
 The frames' stills are saved, and reused by later runs (`--refit-stills` fits them again). The
 tables before [Fast motion](#fast-motion) were measured with the first tracker, which matched
 nearest neighbours instead, and a refinement of everything (now `--refine all`): all frames
