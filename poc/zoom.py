@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from blizzard_common.mpq import MpqArchive
+from poc.views import AssetReader
 from diablo1.palette import load_pal
 
 
@@ -20,7 +20,7 @@ def main():
     ap.add_argument("--views", type=int, nargs="+", required=True)
     ap.add_argument("--scale", type=int, default=8)
     args = ap.parse_args()
-    with MpqArchive(args.mpq) as mpq:
+    with AssetReader(args.mpq) as mpq:
         pal = np.array(load_pal(mpq.read("levels/towndata/town.pal")), dtype=np.uint8)
     data = np.load(Path(args.run) / "views.npz")
     tiles = []
