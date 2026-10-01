@@ -20,8 +20,10 @@ import math
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
+from poc.edges import clean_edges, edges_over_black
 from poc.evaluate import add_warp_arguments, evaluate, warp_from_args
 from poc.field import VoxelField, allowed_masks, camera_basis, carve, silhouettes
 from poc.scene import Scene, make_field, masks_for
@@ -107,6 +109,11 @@ def main(argv=None):
     ap.add_argument("--snap", type=float, default=0.0,
                     help="Gaussians: fit colors as they'll be snapped to the palette, by cross-entropy over its "
                          "colors at this temperature (0: the squared distance to the pixel's palette color)")
+    ap.add_argument("--edges", default=None, choices=["black", "inside", "none"],
+                    help="fit colors to the originals with their edges' share of the background they were drawn "
+                         "over taken out (edges.py): redrawn over black, given an inside neighbour's color, or "
+                         "kept ('none'). Rendered larger, it shows as a bluish rim. By default black for "
+                         "Gaussians, none for voxels")
     ap.add_argument("--keyed", action="store_true",
                     help="Gaussians: fit opacity as the sprites' 1-bit transparency (any above a half is solid)")
     ap.add_argument("--refine-camera", action="store_true",
@@ -133,6 +140,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.supersample is None:
         args.supersample = GAUSSIAN_SUPERSAMPLE if args.model == "gaussians" else 1
+    if args.edges is None:
+        args.edges = "black" if args.model == "gaussians" else "none"
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -198,7 +207,8 @@ def main(argv=None):
               "test_views": test if args.split != "all" else [], "model": args.model,
               "lighting": args.lighting if lit else "none", "lights": args.lights, "harmonics": args.harmonics,
               "coupled_normals": args.coupled_normals, "voxel": args.voxel, "box_min": box_min, "box_max": box_max,
-              "supersample": args.supersample, "snap": args.snap, "keyed": args.keyed, "yaw_sign": sign}
+              "supersample": args.supersample, "snap": args.snap, "keyed": args.keyed,
+              "edges": args.edges, "yaw_sign": sign}
     yaw_rad = torch.deg2rad(yaws)
     if gaussians:
         from poc.gaussians import GaussianField  # needs gsplat
@@ -235,8 +245,14 @@ def main(argv=None):
         opt.add_param_group({"params": [elev_param], "lr": args.camera_lr})
         opt.add_param_group({"params": [off_param], "lr": args.camera_lr * 20})
     sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=(0.1) ** (1 / args.iters)) if opt else None
-    targets = [(palette[torch.as_tensor(views[i].indices, device=device).long().clamp(min=0)], masks[i])
-               for i in train]
+    def colors_of(i):
+        """A training view's palette indices, its edges redrawn under --edges."""
+        if args.edges == "none":
+            return views[i].indices
+        redraw = edges_over_black if args.edges == "black" else clean_edges
+        return redraw(np.where(masks[i].cpu().numpy() == 1, views[i].indices, -1), palette.cpu().numpy())
+
+    targets = [(palette[torch.as_tensor(colors_of(i), device=device).long().clamp(min=0)], masks[i]) for i in train]
 
     def tv(p):
         return (((p[..., 1:, :, :] - p[..., :-1, :, :]) ** 2).mean() + ((p[..., :, 1:, :] - p[..., :, :-1, :]) ** 2).mean()

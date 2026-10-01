@@ -816,6 +816,28 @@ Pulling colors together evens out only the albedo; lit, each Gaussian's normal s
 little differently. Total variation, on the shaded samples, smooths both. It costs the 1x sheets
 about a point of copied pixels, so it's off by default: it's for rendering larger.
 
+**Edges.** At 4x, a thin blue-gray line ran around the sprite. It's in the originals: they were
+rendered over a dark blue-gray background before it was keyed out, and their edge pixels kept a
+share of it (`edges.py`). An outline pixel is close to a blend of its inside neighbours' color and
+one background color, (34, 37, 50) for the zombie's walk and (29, 37, 57) for the warrior's, solved
+separately; the blend halves the outline pixels' error (RMS 23 -> 10). At 1x it's a soft edge; at 4x
+the outermost Gaussians, which learned it, draw it as a line, and copied pixels as bluish blocks.
+
+- **Fitting the background didn't take it out.** With a learned background color behind the
+  Gaussians (and 1-bit transparency, so that it can show), the fit painted the blue into the
+  outermost Gaussians anyway: at 1x both explain the edge as well.
+- **Taking it out of the originals did.** `--edges black`, now the default, redraws each blended
+  edge pixel as if over black, pixel - (1 - coverage) x background (never as index 0, the shadows'
+  black), before fitting and copying: the edges keep their falloff, without the blue. `--edges
+  inside` gives them an inside neighbour's color instead, which leaves them too bright; `--edges
+  none` keeps them. The fitted cells score as before (the zombie's walk, all frames: 66.4% exact
+  against 66.5%), and the sheet's original cells keep their own edges.
+
+**Legs.** Rendered at 4x from the model fitted to every other frame, the zombie's legs jumped
+between some frames. Fitted to all 24 frames, they don't: the legs' silhouettes change from one
+phase to the next as evenly as the originals' do from frame to frame (the largest change 1.81
+times the median, in both), the largest where the artist's own stride is fastest.
+
 ## Next steps
 
 - **Animations:** checked on two walks and an attack; the attack's sword swing needed the tracking

@@ -51,6 +51,7 @@ from gsplat import rasterization
 
 from poc import fit
 from poc.animate import write_gif, write_sheet
+from poc.edges import clean_edges, edges_over_black
 from poc.evaluate import quantize, score
 from poc.field import camera_basis, pixel_rays
 from poc.gaussians import DISTANCE, intrinsics, viewmat
@@ -538,6 +539,11 @@ def main():
                     help="in the refinement, weight of the samples' total variation (sample_variation): flat "
                          "patches of color between edges, for a clean look at the samples' resolution, 4x "
                          "(0: none; 0.005 suits the zombie)")
+    ap.add_argument("--edges", default="black", choices=["black", "inside", "none"],
+                    help="fit colors to the originals with their edges' share of the background they were drawn "
+                         "over taken out (edges.py), and copy from them: redrawn over black, given an inside "
+                         "neighbour's color, or kept ('none'). Rendered larger, it shows as a bluish rim. (The "
+                         "sheet's original cells keep theirs.)")
     ap.add_argument("--snap", type=float, default=0.0,
                     help="in the refinement, fit colors as they'll be snapped to the palette: cross-entropy over "
                          "its colors at this temperature (0: the squared distance to the pixel's palette color)")
@@ -566,7 +572,8 @@ def main():
 
     # 1. Every fitted frame as a still; frame 0 calibrates the camera, and the others share it.
     def still(k, camera=None):
-        tag = "motion-f%d%s%s" % (k, test, "-ss%d" % args.still_supersample if args.still_supersample != 1 else "")
+        tag = "motion-f%d%s%s%s" % (k, test, "-ss%d" % args.still_supersample if args.still_supersample != 1 else "",
+                                    "-" + args.edges if args.edges != "none" else "")
         folder = Path(args.out) / fit.run_name(args.preset, split, tag=tag, model="gaussians")
         if (folder / "scene.pt").exists() and not args.refit_stills:
             saved = Scene.load(folder / "scene.pt", args.mpq)
@@ -574,7 +581,7 @@ def main():
                 return saved, folder
         argv = ["--mpq", args.mpq, "--preset", args.preset, "--split", split, "--frame", str(k), "--model",
                 "gaussians", "--supersample", str(args.still_supersample), "--tag", tag, "--out", args.out,
-                "--no-evaluate"]
+                "--no-evaluate", "--edges", args.edges]
         return fit.main(argv + (["--camera", str(camera)] if camera else []))
 
     still_scene, still_dir = still(0)
@@ -595,10 +602,18 @@ def main():
     Ks = K[None].repeat(len(yaws), 1, 1)
     dirs = torch.tensor(train_dirs, device=device)
 
+    def model_indices(v):
+        """A view's palette indices where the model is (-1 elsewhere: the background, a baked shadow), its
+        edges redrawn under --edges."""
+        idx = np.where(masks_for([v], preset.shadows, device)[0].cpu().numpy() == 1, v.indices, -1)
+        if args.edges == "none":
+            return idx
+        return (edges_over_black if args.edges == "black" else clean_edges)(idx, palette.cpu().numpy())
+
     def targets_of(k):
         views = [all_views[k][d] for d in train_dirs]
         masks = masks_for(views, preset.shadows, device)
-        idx = [torch.as_tensor(v.indices, device=device).long().clamp(min=0) for v in views]
+        idx = [torch.as_tensor(model_indices(v), device=device).long().clamp(min=0) for v in views]
         return torch.stack([palette[i] for i in idx]), torch.stack([m == 1 for m in masks])
 
     origins = torch.stack([pixel_rays(h, w, pivot, offset, right[d], up[d], forward[d])[0] for d in train_dirs])
@@ -753,12 +768,9 @@ def main():
             for d in train_dirs:
                 r, u, f, vm, _ = camera(float(yaws[d]))
                 _, alpha, depth = model.rest_points(j, vm, K, w, h)
-                v = all_views[k][d]
-                idx = torch.as_tensor(v.indices, device=device).long()
-                m = masks_for([v], preset.shadows, device)[0]
                 sources.append({"view": d, "slot": j, "yaw": float(yaws[d]), "right": r, "up": u, "forward": f,
                                 "pivot": pivot, "offset": offset,
-                                "indices": torch.where(m == 1, idx, torch.full_like(idx, -1)),
+                                "indices": torch.as_tensor(model_indices(all_views[k][d]), device=device).long(),
                                 "depth": source_depth(depth, alpha >= 0.5, warp)})
         copier = PixelCopier(model, sources, warp, Ramps(palette), len(frames))
 
