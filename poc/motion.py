@@ -10,7 +10,9 @@ model changing pose, which has to be learned. So the model here is one set of Ga
 whose shape, opacity and color are shared by every frame, moved per frame by a few hundred nodes
 (embedded deformation, as in SC-GS): each node has a rotation and a translation per frame, each
 Gaussian follows its nearest nodes, and neighbouring nodes are held rigid to each other. Moving
-whole limbs through a few nodes is far better posed than moving every Gaussian on its own.
+whole limbs through a few nodes is far better posed than moving every Gaussian on its own. Long,
+thin, straight parts, such as a sword, move as one rigid body instead, on a node of their own
+(--rigid, the default): blended from several nodes, a blade bends.
 
 1. Every frame is fitted like a still (fit.py --model gaussians); the stills are saved and reused.
    Frame 0 calibrates the camera, and its Gaussians become the moving ones; the other stills are
@@ -19,7 +21,8 @@ whole limbs through a few nodes is far better posed than moving every Gaussian o
    things pull from afar, where the images' gradients don't reach: blurred copies of the images are
    compared first, and each Gaussian is drawn to where optimal transport takes the surface around it,
    from the model as it is to the surface of that frame's still (transported again now and then, as
-   in ICP). Transport, unlike nearest neighbours, follows a sword through its swing.
+   in ICP). Transport, unlike nearest neighbours, follows a sword through its swing; a rigid part
+   jumps there at once.
 3. The rest shape and the colors are then refitted to all frames at once, through the tracked
    motion: as parts move, the frames show them from more directions than frame 0 alone. With the
    lighting model (the default), colors are albedo, shaded by a light fixed to the camera, held where
@@ -77,6 +80,26 @@ def quat_rotate(q, v):
     return v + w * t + torch.cross(xyz, t, dim=-1)
 
 
+def quat_of_matrix(r):
+    """The unit quaternion (w, x, y, z) of a rotation matrix (3, 3), by Shepperd's method: from its
+    largest diagonal term, so that it holds for turns near half a turn too."""
+    t = r[0, 0] + r[1, 1] + r[2, 2]
+    i = int(torch.stack([t, r[0, 0], r[1, 1], r[2, 2]]).argmax())
+    if i == 0:
+        s = torch.sqrt(1 + t) * 2
+        q = [s / 4, (r[2, 1] - r[1, 2]) / s, (r[0, 2] - r[2, 0]) / s, (r[1, 0] - r[0, 1]) / s]
+    elif i == 1:
+        s = torch.sqrt(1 + r[0, 0] - r[1, 1] - r[2, 2]) * 2
+        q = [(r[2, 1] - r[1, 2]) / s, s / 4, (r[0, 1] + r[1, 0]) / s, (r[0, 2] + r[2, 0]) / s]
+    elif i == 2:
+        s = torch.sqrt(1 + r[1, 1] - r[0, 0] - r[2, 2]) * 2
+        q = [(r[0, 2] - r[2, 0]) / s, (r[0, 1] + r[1, 0]) / s, s / 4, (r[1, 2] + r[2, 1]) / s]
+    else:
+        s = torch.sqrt(1 + r[2, 2] - r[0, 0] - r[1, 1]) * 2
+        q = [(r[1, 0] - r[0, 1]) / s, (r[0, 2] + r[2, 0]) / s, (r[1, 2] + r[2, 1]) / s, s / 4]
+    return F.normalize(torch.stack(q), dim=0)
+
+
 def same_hemisphere(q, reference):
     """q with its sign flipped where it points away from `reference` (q and -q are one rotation)."""
     return q * torch.where((q * reference).sum(-1, keepdim=True) < 0, -1.0, 1.0)
@@ -108,6 +131,63 @@ def farthest_points(points, count: int):
     return chosen
 
 
+def opening(mask, size: int = 5):
+    """A mask (H, W) opened by a size x size square: what remains of it where such a square fits inside
+    (outside the image counts as empty)."""
+    r = size // 2
+    x = mask.float()[None, None]
+    eroded = -F.max_pool2d(-F.pad(x, (r, r, r, r), value=0.0), size, stride=1)
+    return F.max_pool2d(F.pad(eroded, (r, r, r, r), value=0.0), size, stride=1)[0, 0] > 0.5
+
+
+def thin_pixels(mask, size: int = 5):
+    """The pixels of a mask (H, W) in parts thinner than about `size`: what an opening removes."""
+    return mask & ~opening(mask, size)
+
+
+def rigid_parts(means, opacities, masks, viewmats, Ks, min_views: int, min_length: float = 15.0,
+                link: float = 3.0):
+    """Long, thin, straight parts of a still, such as a sword, as a part number per Gaussian (-1 for
+    none). A part is a clump of Gaussians (linked within `link` pixels) whose centers fall on the
+    originals' thin pixels (thin_pixels of each view's mask (H, W)) in at least `min_views` views, at
+    least `min_length` pixels long and close to a straight line (off it by under a seventh of that)."""
+    n = len(means)
+    votes = torch.zeros(n, device=means.device)
+    for mask, vm, K in zip(masks, viewmats, Ks):
+        thin = thin_pixels(mask)
+        cam = means @ vm[:3, :3].T + vm[:3, 3]  # orthographic: pixels from x and y alone
+        x = torch.floor(K[0, 0] * cam[:, 0] + K[0, 2]).long()
+        y = torch.floor(K[1, 1] * cam[:, 1] + K[1, 2]).long()
+        inside = (x >= 0) & (x < mask.shape[1]) & (y >= 0) & (y < mask.shape[0])
+        votes[inside] += thin[y[inside], x[inside]].float()
+    idx = torch.nonzero((votes >= min_views) & (torch.sigmoid(opacities) > 0.05))[:, 0]
+    parts = torch.full((n,), -1, dtype=torch.long, device=means.device)
+    if len(idx) == 0:
+        return parts
+    pts = means[idx]
+    near = torch.cdist(pts, pts) < link
+    label = torch.arange(len(idx), device=means.device)
+    while True:  # each clump takes its smallest member's number
+        lower = torch.where(near, label[None, :], torch.full_like(near, len(idx), dtype=torch.long)).min(1).values
+        if torch.equal(lower, label):
+            break
+        label = lower
+    count = 0
+    for clump in torch.unique(label):
+        members = idx[label == clump]
+        if len(members) < 50:
+            continue
+        p = means[members]
+        axis = torch.linalg.svd(p - p.mean(0), full_matrices=False)[2][0]
+        along = (p - p.mean(0)) @ axis
+        length = float(along.max() - along.min())
+        off = ((p - p.mean(0)) - along[:, None] * axis).norm(dim=-1).square().mean().sqrt()
+        if length >= min_length and off < length / 7:
+            parts[members] = count
+            count += 1
+    return parts
+
+
 def average_down(colors, alpha, s: int):
     """A render s times finer, averaged over s x s blocks: colors with expected depth (C, H*s, W*s, k+1),
     premultiplied, and opacity (C, H*s, W*s, 1). Colors and opacity average plainly; depth is weighted
@@ -128,7 +208,7 @@ class MovingGaussians(torch.nn.Module):
     nodes with a unit quaternion and a translation each, per frame."""
 
     def __init__(self, still, frames: int, nodes: int = 256, bind: int = 4, links: int = 6, lit: bool = False,
-                 supersample: int = 1):
+                 supersample: int = 1, parts=None):
         super().__init__()
         # Each pixel the average of supersample x supersample samples, as the originals' pixels are
         # averages over the edges they partly cover and the colors that mix in them.
@@ -140,14 +220,31 @@ class MovingGaussians(torch.nn.Module):
         self.scales = torch.nn.Parameter(p["scales"].detach().clone())
         self.opacities = torch.nn.Parameter(p["opacities"].detach().clone())
         self.colors = torch.nn.Parameter(p["colors"].detach().clone())
+        # Rigid parts (rigid_parts: a sword) move as one: each has a node of its own (after the others),
+        # its Gaussians follow that node alone, the rest follow the others alone, and it's held to the
+        # nodes around where it's gripped, as any node to its neighbours. Blended from several nodes
+        # that turn apart, a blade bends; a hand partly following a sword that turns half a turn in a
+        # frame tears.
+        if parts is None:
+            parts = torch.full((len(self.means0),), -1, dtype=torch.long, device=self.means0.device)
+        self.register_buffer("parts", parts)
+        n_parts = int(parts.max()) + 1
         with torch.no_grad():
-            opaque = self.means0[torch.sigmoid(self.opacities) > 0.3]
-            centers = opaque[farthest_points(opaque, nodes)]
+            opaque = self.means0[(torch.sigmoid(self.opacities) > 0.3) & (parts < 0)]
+            centers = opaque[farthest_points(opaque, nodes - n_parts)]
+            # A part's node is where it's gripped: its point nearest the rest of the model.
+            grips = [self.means0[parts == k][torch.cdist(self.means0[parts == k], opaque).min(1).values.argmin()]
+                     for k in range(n_parts)]
+            free_nodes = centers
+            centers = torch.cat([centers] + [g[None] for g in grips])
             gaps = torch.cdist(centers, centers).topk(2, largest=False).values[:, 1]
             spacing = float(gaps.median())
             # Each Gaussian follows its nearest nodes, weighted by closeness.
-            d, idx = torch.cdist(self.means0, centers).topk(bind, largest=False)
+            d, idx = torch.cdist(self.means0, free_nodes).topk(bind, largest=False)
             w = torch.exp(-d ** 2 / (2 * spacing ** 2)) + 1e-6
+            rigid = parts >= 0
+            idx[rigid] = (nodes - n_parts + parts[rigid])[:, None]
+            w[rigid] = 1.0
             # Neighbouring nodes, held rigid to each other.
             nd, nidx = torch.cdist(centers, centers).topk(links + 1, largest=False)
         self.register_buffer("centers", centers)
@@ -273,42 +370,70 @@ class MovingGaussians(torch.nn.Module):
         a = alpha[0, ..., 0]
         return out[0, ..., :3] / a.clamp(min=1e-6)[..., None], a, out[0, ..., 3] - DISTANCE
 
-    def unpose_points(self, points, phase):
+    def nodes_of(self, flat, where, part=None):
+        """The nodes (P, bind) that points (P, 3) follow, with their weights (P, bind, 1): the nearest
+        but the rigid parts', given where the nodes are (M, 3), weighted by closeness; a rigid part's
+        points (part (...), -1 for none) follow its node alone."""
+        free = len(self.centers) - int(self.parts.max()) - 1
+        d, idx = torch.cat([torch.cdist(c, where[:free]) for c in torch.split(flat, 8192)]).topk(
+            self.bind_idx.shape[1], largest=False)
+        w = torch.exp(-d ** 2 / (2 * self.spacing ** 2)) + 1e-6
+        if part is not None:
+            part = part.reshape(-1)
+            rigid = part >= 0
+            idx[rigid] = (free + part[rigid])[:, None]
+            w[rigid] = 1.0
+        return idx, (w / w.sum(-1, keepdim=True))[..., None]
+
+    def fit_parts(self, slot: int, goal):
+        """Pose each rigid part's node at a slot by the rigid motion that best takes the part's Gaussians
+        to where they should go (goal (G, 3)), weighted by opacity (Kabsch): a sword can turn half a turn
+        between frames, far more than tracking turns a node by gradients."""
+        n_parts = int(self.parts.max()) + 1
+        free = len(self.centers) - n_parts
+        with torch.no_grad():
+            for k in range(n_parts):
+                mine = self.parts == k
+                c = self.centers[free + k]
+                p, q = self.means0[mine] - c, goal[mine]
+                w = torch.sigmoid(self.opacities[mine])[:, None]
+                pm, qm = (w * p).sum(0) / w.sum(), (w * q).sum(0) / w.sum()
+                u, _, vt = torch.linalg.svd(((p - pm) * w).T @ (q - qm))
+                flip = torch.ones(3, device=p.device)
+                flip[2] = torch.sign(torch.det(vt.T @ u.T))
+                rot = vt.T @ torch.diag(flip) @ u.T
+                # posed = rot (m - c) + c + move
+                self.node_quats[slot, free + k] = quat_of_matrix(rot)
+                self.node_moves[slot, free + k] = qm - rot @ pm - c
+
+    def unpose_points(self, points, phase, part=None):
         """Points (..., 3) of the model posed at a phase, moved back to the rest pose: each by the
-        inverse of its nearest nodes' poses, weighted by closeness to where those nodes are then.
-        (The Gaussians' own per-frame corrections, a fraction of a pixel, are left out.)"""
+        inverse of its nearest nodes' poses, weighted by closeness to where those nodes are then (or a
+        rigid part's, given which part each point is on). (The Gaussians' own per-frame corrections, a
+        fraction of a pixel, are left out.)"""
         rot, move = self.node_pose(phase)
         posed = self.centers + move
         flat = points.reshape(-1, 3)
-        d, idx = torch.cat([torch.cdist(c, posed) for c in torch.split(flat, 8192)]).topk(
-            self.bind_idx.shape[1], largest=False)
-        w = torch.exp(-d ** 2 / (2 * self.spacing ** 2)) + 1e-6
-        w = (w / w.sum(-1, keepdim=True))[..., None]
+        idx, w = self.nodes_of(flat, posed, part)
         back = rot[idx] * torch.tensor([1.0, -1, -1, -1], device=rot.device)  # inverse rotations
         rest = (w * (quat_rotate(back, flat[:, None] - posed[idx]) + self.centers[idx])).sum(1)
         return rest.reshape(points.shape)
 
-    def turn_at(self, rest, phase):
+    def turn_at(self, rest, phase, part=None):
         """The blended rotation (..., 4) that the nodes near rest-pose points (..., 3) apply at a phase."""
         rot, _ = self.node_pose(phase)
         flat = rest.reshape(-1, 3)
-        d, idx = torch.cat([torch.cdist(c, self.centers) for c in torch.split(flat, 8192)]).topk(
-            self.bind_idx.shape[1], largest=False)
-        w = torch.exp(-d ** 2 / (2 * self.spacing ** 2)) + 1e-6
-        w = (w / w.sum(-1, keepdim=True))[..., None]
+        idx, w = self.nodes_of(flat, self.centers, part)
         turns = rot[idx]
         turn = F.normalize((w * same_hemisphere(turns, turns[:, :1])).sum(1), dim=-1)
         return turn.reshape(rest.shape[:-1] + (4,))
 
-    def deform_points(self, rest, slot: int, nearest_gaussian=None):
+    def deform_points(self, rest, slot: int, nearest_gaussian=None, part=None):
         """Rest-pose points (..., 3) moved to a frame by the nodes, plus the per-frame correction of
         each point's nearest Gaussian (indices, if given)."""
         rot, move = self.node_pose(slot)
         flat = rest.reshape(-1, 3)
-        d, idx = torch.cat([torch.cdist(c, self.centers) for c in torch.split(flat, 8192)]).topk(
-            self.bind_idx.shape[1], largest=False)
-        w = torch.exp(-d ** 2 / (2 * self.spacing ** 2)) + 1e-6
-        w = (w / w.sum(-1, keepdim=True))[..., None]
+        idx, w = self.nodes_of(flat, self.centers, part)
         moved = (w * (quat_rotate(rot[idx], flat[:, None] - self.centers[idx]) + self.centers[idx] + move[idx])).sum(1)
         if nearest_gaussian is not None:
             moved = moved + self.residuals[slot][nearest_gaussian.reshape(-1)]
@@ -379,21 +504,30 @@ class PixelCopier:
                            supersample=scale)[0] + depth[..., None] * forward
         rest = model.unpose_points(posed, slot_phase)
         near_gaussian = torch.zeros(solid.shape, dtype=torch.long, device=rest.device)
+        part = None
         if solid.any():
             near_gaussian[solid] = nearest(rest[solid], model.means0)
-            rest = model.unpose_points(posed - model.residual(slot_phase)[near_gaussian], slot_phase)
+            if (model.parts >= 0).any():
+                # On a rigid part, a point follows the part's node, not the nodes nearest it; which
+                # part, by the nearest Gaussian where the cell shows it, posed.
+                means, _ = model.pose(slot_phase)
+                near_posed = nearest(posed[solid], means)
+                on_part = model.parts[near_posed] >= 0
+                near_gaussian[solid] = torch.where(on_part, near_posed, near_gaussian[solid])
+                part = torch.where(solid, model.parts[near_gaussian], torch.full_like(near_gaussian, -1))
+            rest = model.unpose_points(posed - model.residual(slot_phase)[near_gaussian], slot_phase, part)
         points_by_slot, normals_by_slot = {}, {}
         if model.lit:
             here, _ = model.shading(normal, right, up, forward)
-            turn_here = model.turn_at(rest, slot_phase)
+            turn_here = model.turn_at(rest, slot_phase, part)
         index, seen, shade, cost = [], [], [], []
         for i in chosen:
             s = self.sources[i]
             if s["slot"] not in points_by_slot:
-                points_by_slot[s["slot"]] = model.deform_points(rest, s["slot"], near_gaussian)
+                points_by_slot[s["slot"]] = model.deform_points(rest, s["slot"], near_gaussian, part)
                 if model.lit:
                     # The surface's normal as it was in the source frame: turned by the nodes' motion.
-                    relative = quat_multiply(model.turn_at(rest, s["slot"]), turn_here * torch.tensor(
+                    relative = quat_multiply(model.turn_at(rest, s["slot"], part), turn_here * torch.tensor(
                         [1.0, -1, -1, -1], device=rest.device))
                     normals_by_slot[s["slot"]] = F.normalize(quat_rotate(relative, normal), dim=-1)
             idx, ok, lum = fetch(points_by_slot[s["slot"]], s, warp.tolerance, self.ramps)
@@ -590,6 +724,10 @@ def main():
     ap.add_argument("--keyed", action="store_true",
                     help="in the refinement, fit opacity as the sprites' 1-bit transparency (any above a half is "
                          "solid)")
+    ap.add_argument("--rigid", action=argparse.BooleanOptionalAction, default=True,
+                    help="find long, thin, straight parts in frame 0 (rigid_parts: a sword) and move each as one "
+                         "rigid body, rather than bent by the several nodes its Gaussians would follow (the "
+                         "default; --no-rigid bends them)")
     ap.add_argument("--load", default=None,
                     help="a saved motion.pt to score and draw again, instead of tracking and refining")
     ap.add_argument("--no-sheet", action="store_true", help="score, but skip the 16-direction sheet and GIF")
@@ -668,10 +806,20 @@ def main():
     def surface_of(colors, alphas):
         return surface_points(colors, alphas, origins, forward[dirs])
 
+    parts = None
+    if args.rigid:
+        p = still_scene.field.params
+        views0 = [all_views[0][d] for d in train_dirs]
+        parts = rigid_parts(p["means"].detach(), p["opacities"].detach(), [m == 1 for m in masks_for(
+            views0, preset.shadows, device)], viewmats[dirs], Ks[dirs], min_views=math.ceil(0.6 * len(train_dirs)))
+        for k in range(int(parts.max()) + 1):
+            print("rigid part %d: %d Gaussians" % (k, int((parts == k).sum())))
     model = MovingGaussians(still_scene.field, len(frames), nodes=args.nodes, lit=args.lighting != "none",
-                            supersample=args.supersample)
+                            supersample=args.supersample, parts=parts)
     if args.load:
-        model.load_state_dict(torch.load(args.load, map_location=device)["model"])
+        saved = torch.load(args.load, map_location=device)["model"]
+        saved.setdefault("parts", torch.full((len(model.means0),), -1, dtype=torch.long, device=device))
+        model.load_state_dict(saved)
     print("%d Gaussians, %d nodes %.1f pixels apart" % (len(model.means0), args.nodes, model.spacing))
 
     def only_slot(j):
@@ -712,7 +860,7 @@ def main():
             model.node_quats[j] = model.node_quats[j - 1]
             model.node_moves[j] = model.node_moves[j - 1]
         targets, masks = targets_of(frames[j])
-        goal = None
+        goal, jumped = None, ""
         opt = torch.optim.Adam([{"params": [model.node_moves], "lr": 0.1}, {"params": [model.node_quats], "lr": 0.01}])
         # Three stages, blurred by 4, 2 and 1 pixels. Each ends early once its image loss stops improving
         # (checked every 10 iterations), so that a frame that barely moves doesn't take as long as a swing.
@@ -723,6 +871,17 @@ def main():
                 if args.matching and it % args.rematch == 0:
                     model.supersample = args.supersample
                     goal = transport_goal(j)
+                    if it == 0 and (model.parts >= 0).any():
+                        # Where transport takes a rigid part, in one jump, if the images agree.
+                        with torch.no_grad():
+                            before = image_loss(*model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)[:2], targets, masks)
+                            kept = model.node_quats[j].clone(), model.node_moves[j].clone()
+                            model.fit_parts(j, goal)
+                            after = image_loss(*model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)[:2], targets, masks)
+                            if after > before:
+                                model.node_quats[j], model.node_moves[j] = kept
+                            else:
+                                jumped = ", rigid parts jumped"
                 model.supersample = args.supersample if blur == 1 else args.blurred_supersample
                 colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
                 fit_loss = image_loss(colors, alphas, targets, masks, blur)
@@ -746,8 +905,8 @@ def main():
                         stale += 10
                     if stale >= args.patience:
                         break
-        print("tracked frame %d (%d of %d): loss %.5f, %d iterations (%.0fs)" % (
-            frames[j], j, len(frames) - 1, loss.item(), it, time.time() - t0))
+        print("tracked frame %d (%d of %d): loss %.5f, %d iterations%s (%.0fs)" % (
+            frames[j], j, len(frames) - 1, loss.item(), it, jumped, time.time() - t0))
     model.supersample = args.supersample
 
     # 3. The rest shape and colors, refitted to every frame at once through the tracked motion: frame 0's

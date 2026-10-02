@@ -720,6 +720,48 @@ against 0.811, and 69% of the thin pixels covered against 72%), and the walks th
 sword is lost at the fastest part of the swing, it's already lost in the tracked frames on either
 side, not between them.
 
+#### Rigid parts
+
+A Gaussian follows a blend of its nearest nodes, and where those nodes turn apart, the model bends.
+Through the attack's swing the sword bent so: in the new cells its tip hooked and its blade curved,
+though every original draws it straight. Most of the model's bending was in the sword; the torso,
+the head and most of the limbs move rigidly, and the zombie's walk barely bends anywhere (half its
+Gaussians within 0.12 pixels of moving rigidly). Drawn with one rigid motion, the best fit to where
+its nodes put it, the same blade came out straight.
+
+`--rigid` (the default; `--no-rigid` turns it off) moves long, thin, straight parts as one:
+
+- **Found in frame 0's still:** Gaussians whose centers fall on the originals' thin pixels (what a
+  5 x 5 opening removes from the outline) in 60% of the views, in clumps linked within 3 pixels. A
+  clump at least 15 pixels long, and off its straight line by under a seventh of that, is a part:
+  on the attack, the sword; on the zombie's walk, a forearm, and a shin with its foot.
+- **Moved as one:** a part's Gaussians follow a node of their own, where it's gripped (its point
+  nearest the rest of the model), held to the nodes around it as any node to its neighbours. No
+  other Gaussian follows a part's node: a hand partly following a sword that turns half a turn in a
+  frame tears. The copier moves the points on a part with its node too.
+- **Tracked in jumps:** the sword turns up to 160° between frames, far more than tracking turns a
+  node by gradients, and tracked so, it was lost from frame 8 on (its loss 0.049, against 0.028
+  bent). So at each frame's start, a part jumps to the rigid motion that best takes its Gaussians to
+  where transport puts them (Kabsch), if the images then fit better.
+
+| | Bent (`--no-rigid`) | Rigid |
+|---|---|---|
+| Attack, every frame fitted: known cells, own colors (IoU / exact) | 0.933 / 49.3% | 0.933 / 49.2% |
+| Attack, SW hidden: copied (IoU / exact / RGB error) | 0.887 / 27.8% / 16.4 | 0.884 / 27.3% / 16.6 |
+| Attack, SW hidden: thin pixels exact, copied / own colors | 20.4% / 23.6% | 21.2% / 22.0% |
+| Attack, odd frames hidden: copied (IoU / exact / RGB error) | 0.796 / 37.3% / 16.4 | 0.793 / 38.1% / 15.8 |
+| Zombie's walk, odd frames hidden: copied (IoU / exact / RGB error) | 0.918 / 53.6% / 7.3 | 0.927 / 54.0% / 7.1 |
+| Zombie's walk, odd frames hidden: shadow IoU | 0.841 | 0.855 |
+
+- **In the new cells the sword is straight,** its crossguard showing, through the whole swing;
+  bent, it hooks and curves (frames 6.5 to 8.5).
+- **The scores barely move:** exact palette indices on thin pixels mostly measure their colors,
+  which the copier still scrambles (see Next steps).
+- **The zombie's hidden frames gain a little:** its forearm and shin keep their shape between
+  frames.
+- **The blade stays as spread in depth** (1.7 pixels off a straight line, RMS, against 1.8 bent):
+  moved rigidly, every frame's views see the same blade, but they didn't pin it down closer.
+
 #### Supersampled
 
 Like the stills (see [Supersampled fitting](#gaussians)), the moving Gaussians make each pixel the
@@ -944,8 +986,8 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset zombie-walk --tv 0.005 -
   stills relit copied pixels too.
 - **Cleaner surfaces:** 2D Gaussians (flat discs) would give sharper depth than 3D ones, but gsplat's
   2D rasterizer has no orthographic mode.
-- **Thin parts:** blades and bows still break up. A blade's silhouette survives (its opacity stays
-  above a half along its length), but its colors don't. The original blade is two lines, light and
+- **Thin parts:** a blade moved as one keeps its shape (see [Rigid parts](#rigid-parts); bows are
+  untried), but its colors still break up in copied pixels. The original blade is two lines, light and
   dark, and the warp's fetch positions zigzag between them, because the reconstruction's depth along
   something a pixel or two wide is poor. Blending the source colors across materials in parts under
   3 pixels wide, then snapping them to the palette, helped only a little: the arrow's exact matches
