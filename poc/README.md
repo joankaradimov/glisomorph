@@ -800,6 +800,57 @@ the zombie's walk.
   more than a body has joints.
 - **It costs** a minute or two more per fit, for the grouping and the second tracking.
 
+#### Several animations, one model
+
+A model has several animations: the warrior with a sword stands, walks, attacks, is hit, casts.
+`--preset` takes several of one model (one variant: the warrior with an axe is another model) and
+fits them as one: one set of Gaussians, the first animation's frame 0 as the rest pose, and a slot of
+node poses for every frame of every animation, each interpolated within its own animation. Its skeleton
+comes from every animation's frames, and its rest shape from every animation's views.
+
+```
+python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand warrior-walk warrior-attack
+```
+
+The animations make a graph. Against the stand's frame 0 (silhouettes in common, over the 8
+directions), the attack (0.94), the lightning cast (0.93), the fire cast (0.82) and the magic cast
+(0.77) start there and come back toward it, and the hit recovers into it (0.75 at its last frame): the
+stand's frame 0 is a hub they pass through. The walk never does (0.45 to 0.48 at every frame), nor do
+the town's stand and walk (0.36 to 0.41): loops of their own.
+
+Fitted as one, naively, every animation came out worse than fitted alone. Three things closed the gap:
+
+- **One camera, calibrated on every frame:** calibrated on its own frame 0, the stand came out at
+  25.5°, the attack at 26.0°, and a model shared under the stand's camera fitted the attack's
+  silhouettes worse (0.892 against 0.919). Calibrated on all 17 fitted frames at once (fit.py
+  `--calibrate-with`), the camera is the attack's.
+- **The hub held:** an animation whose frame 0 shares 0.9 of its silhouette with the first one's (the
+  attack) keeps that frame at the rest pose, one state both pass through.
+- **A jump for the others:** an animation apart from the hub (the walk) starts with every node's jump
+  to where transport takes it (the rigid motion that best takes its Gaussians there, if the images
+  then fit better), rather than tracked from the stand's pose: its first frame fits to 0.024, against
+  0.033.
+
+| Odd frames hidden, copied: IoU / exact / RGB error | Alone | Shared, naively | Shared |
+|---|---|---|---|
+| Stand (10 frames) | 0.947 / 60.2% / 5.7 | 0.937 / 59.1% / 6.0 | 0.948 / 59.4% / 5.9 |
+| Walk (8 frames) | 0.736 / 32.0% / 14.2 | 0.732 / 30.9% / 14.7 | 0.737 / 31.3% / 14.3 |
+| Attack (16 frames) | 0.794 / 38.3% / 15.3 | 0.773 / 36.6% / 16.4 | 0.803 / 38.2% / 15.0 |
+
+"Naively" is the stand's camera, every first frame tracked from the stand's pose, and 6000
+iterations of refinement; shared, 10000 (about as many per frame as alone).
+
+- **In the hidden frames the shared model does as well as each alone,** within the runs' noise, the
+  attack's silhouettes better, and the shadows too (0.883, 0.613 and 0.732, against 0.876, 0.614 and
+  0.724).
+- **Its own colors on the known cells are lower:** the stand's 56.2% exact against 68.7%, the walk's
+  47.9% against 67.4%, the attack's 45.7% against 46.4%, as one set of colors serves every
+  animation's views. The sheets show copied pixels, and show little of it.
+- **Its skeleton has more pieces** than any animation's alone (104), as a piece has to move as one in
+  every frame of every animation.
+- **It takes** as long as the animations alone together, and the calibration on every frame (6
+  minutes for 17).
+
 #### Supersampled
 
 Like the stills (see [Supersampled fitting](#gaussians)), the moving Gaussians make each pixel the

@@ -3,6 +3,13 @@
     python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk
     python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --hide-direction 1
     python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --hide-frames odd
+    python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand warrior-walk warrior-attack
+
+Several animations of one model (one variant: a warrior with a sword, standing, walking and attacking)
+are fitted as one: one rest shape, the first animation's frame 0, and a slot of node poses for every
+frame of every animation, each animation interpolated within itself. Its skeleton then comes from
+every animation, and its rest shape from every animation's views. Different variants (a sword, an axe)
+are different models.
 
 A looping animation is a torus: 8 directions around one circle, the frames around another. A
 direction is the camera turning around the model, which calibration already knows; a frame is the
@@ -49,6 +56,7 @@ import json
 import math
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -324,6 +332,9 @@ class MovingGaussians(torch.nn.Module):
         identity = torch.tensor([1.0, 0, 0, 0], device=centers.device)
         self.node_quats = torch.nn.Parameter(identity.repeat(frames, nodes, 1))
         self.node_moves = torch.nn.Parameter(torch.zeros((frames, nodes, 3), device=centers.device))
+        # The slots' animations, as (first slot, slots): a phase between frames interpolates within its
+        # own animation, looping around it. One animation by default.
+        self.spans = [(0, frames)]
         # Tied into a skeleton (tie), node_quats and node_moves are the pieces' instead, about their
         # centers, and each node takes its piece's.
         self.register_buffer("node_group", None)
@@ -350,14 +361,21 @@ class MovingGaussians(torch.nn.Module):
             self.register_buffer("light_raw", torch.tensor([math.log(math.expm1(0.6))], device=device))
             self.register_buffer("ambient_raw", torch.tensor(math.log(math.expm1(0.6)), device=device))
 
+    def between(self, values, phase: float, quaternions: bool = False):
+        """Per-slot values (slots, ...) at a phase between slots: periodic Catmull-Rom within the
+        animation the phase falls in (spans)."""
+        phase = phase % values.shape[0]
+        start, n = next((s, n) for s, n in self.spans if s <= math.floor(phase) < s + n)
+        return catmull_rom(values[start:start + n], phase - start, quaternions=quaternions)
+
     def node_pose(self, phase: float):
         """The nodes' unit quaternions (M, 4) and translations (M, 3) at a phase in model frames."""
         if float(phase).is_integer():
             k = int(phase) % self.node_quats.shape[0]
             rot, move = F.normalize(self.node_quats[k], dim=-1), self.node_moves[k]
         else:
-            rot, move = (catmull_rom(F.normalize(self.node_quats, dim=-1), phase, quaternions=True),
-                         catmull_rom(self.node_moves, phase))
+            rot, move = (self.between(F.normalize(self.node_quats, dim=-1), phase, quaternions=True),
+                         self.between(self.node_moves, phase))
         if self.node_group is None:
             return rot, move
         # Each node moves with its piece: turned about the piece's center, and carried along.
@@ -400,7 +418,7 @@ class MovingGaussians(torch.nn.Module):
     def residual(self, phase: float):
         if float(phase).is_integer():
             return self.residuals[int(phase) % self.residuals.shape[0]]
-        return catmull_rom(self.residuals, phase)
+        return self.between(self.residuals, phase)
 
     def pose(self, phase: float):
         """The Gaussians' means (G, 3) and unit quaternions (G, 4) at a phase."""
@@ -517,6 +535,33 @@ class MovingGaussians(torch.nn.Module):
                 self.node_quats[slot, free + k] = quat_of_matrix(rot)
                 self.node_moves[slot, free + k] = qm - rot @ pm - c
 
+    def fit_nodes(self, slot: int, goal):
+        """Pose every node at a slot by the rigid motion that best takes the Gaussians following it to where
+        they should go (goal (G, 3)), weighted by how much each follows it, and by opacity (Kabsch); a node
+        with too few Gaussians to tell a turn only moves. For a frame far from any tracked one, such as the
+        first of an animation that never passes through the rest pose."""
+        with torch.no_grad():
+            m, bind = len(self.centers), self.bind_idx.shape[1]
+            node = self.bind_idx.reshape(-1)
+            w = (self.bind_w * torch.sigmoid(self.opacities)[:, None]).reshape(-1)
+            p = self.means0[:, None].expand(-1, bind, -1).reshape(-1, 3)
+            q = goal[:, None].expand(-1, bind, -1).reshape(-1, 3)
+            weight = torch.zeros(m, device=p.device).index_add_(0, node, w)
+            pm = torch.zeros((m, 3), device=p.device).index_add_(0, node, w[:, None] * p) / weight.clamp(min=1e-6)[:, None]
+            qm = torch.zeros((m, 3), device=p.device).index_add_(0, node, w[:, None] * q) / weight.clamp(min=1e-6)[:, None]
+            cross = (w[:, None, None] * (p - pm[node])[:, :, None] * (q - qm[node])[:, None, :])
+            u, _, vt = torch.linalg.svd(torch.zeros((m, 3, 3), device=p.device).index_add_(0, node, cross))
+            flip = torch.ones((m, 3), device=p.device)
+            flip[:, 2] = torch.sign(torch.det(vt.transpose(1, 2) @ u.transpose(1, 2)))
+            rot = vt.transpose(1, 2) @ torch.diag_embed(flip) @ u.transpose(1, 2)
+            rot[weight < 2.0] = torch.eye(3, device=p.device)
+            moved = weight > 1e-3
+            for n in torch.nonzero(moved)[:, 0].tolist():
+                self.node_quats[slot, n] = quat_of_matrix(rot[n])
+            # posed = rot (m - center) + center + move
+            moves = qm - (rot @ (pm - self.centers)[..., None])[..., 0] - self.centers
+            self.node_moves[slot] = torch.where(moved[:, None], moves, self.node_moves[slot])
+
     def unpose_points(self, points, phase, part=None):
         """Points (..., 3) of the model posed at a phase, moved back to the rest pose: each by the
         inverse of its nearest nodes' poses, weighted by closeness to where those nodes are then (or a
@@ -565,12 +610,16 @@ class MovingGaussians(torch.nn.Module):
         return r.square().sum(-1).mean() + (r[self.gaussian_links] - r[:, None]).square().sum(-1).mean()
 
     def smoothness(self):
-        """Node paths around the loop: squared second differences of translations and quaternions."""
-        m = self.node_moves
-        q = F.normalize(self.node_quats, dim=-1)
-        accel = (m.roll(-1, 0) - 2 * m + m.roll(1, 0)).square().sum(-1).mean()
-        qn, qp = same_hemisphere(q.roll(-1, 0), q), same_hemisphere(q.roll(1, 0), q)
-        return accel + 100 * (qn - 2 * q + qp).square().sum(-1).mean()
+        """Node paths around each animation's loop: squared second differences of translations and
+        quaternions."""
+        total = 0.0
+        for start, n in self.spans:
+            m = self.node_moves[start:start + n]
+            q = F.normalize(self.node_quats[start:start + n], dim=-1)
+            accel = (m.roll(-1, 0) - 2 * m + m.roll(1, 0)).square().sum(-1).mean()
+            qn, qp = same_hemisphere(q.roll(-1, 0), q), same_hemisphere(q.roll(1, 0), q)
+            total = total + accel + 100 * (qn - 2 * q + qp).square().sum(-1).mean()
+        return total / len(self.spans)
 
 
 class PixelCopier:
@@ -776,7 +825,10 @@ def image_loss(colors, alphas, targets, masks, blur: int = 1, snap=None, keyed: 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
-    ap.add_argument("--preset", required=True, choices=sorted(PRESETS))
+    ap.add_argument("--preset", required=True, nargs="+", choices=sorted(PRESETS),
+                    help="one animation, or several of one model (the same variant: a warrior with a sword "
+                         "standing, walking, attacking), fitted as one model; the first one's frame 0 is the "
+                         "rest pose and calibrates the camera")
     ap.add_argument("--hide-direction", type=int, default=None, help="leave this direction out of every frame")
     ap.add_argument("--hide-frames", choices=["odd"], default=None, help="leave every other frame out")
     ap.add_argument("--nodes", type=int, default=256, help="how many nodes move the Gaussians")
@@ -860,77 +912,133 @@ def main():
     device = torch.device("cuda")
     t_start = time.time()
 
-    preset = PRESETS[args.preset]
-    count = frame_count(args.mpq, preset)
-    frames = list(range(0, count, 2)) if args.hide_frames == "odd" else list(range(count))
+    names = args.preset
     split = "all" if args.hide_direction is None else "holdout:%d" % args.hide_direction
     test = "" if args.hide_direction is None and args.hide_frames is None else (
         "-hide%d" % args.hide_direction if args.hide_direction is not None else "-hideodd")
-    out_dir = Path(args.out) / ("%s-motion%s%s" % (args.preset, test, "-" + args.tag if args.tag else ""))
+    out_dir = Path(args.out) / ("%s-motion%s%s" % ("+".join(names), test, "-" + args.tag if args.tag else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Every fitted frame as a still; frame 0 calibrates the camera, and the others share it.
-    def still(k, camera=None):
-        iters = args.still_iters if k and args.still_iters else None
-        tag = "motion-f%d%s%s%s%s" % (k, test, "-ss%d" % args.still_supersample if args.still_supersample != 1 else "",
-                                      "-" + args.edges if args.edges != "none" else "", "-i%d" % iters if iters else "")
-        folder = Path(args.out) / fit.run_name(args.preset, split, tag=tag, model="gaussians")
+    # The animations, one after another in the model's slots: slots[s] = (a, k), frame k of animation a.
+    # The first animation's frame 0 is the rest pose, and calibrates the camera for all of them.
+    anims = []
+    for name in names:
+        preset = PRESETS[name]
+        count = frame_count(args.mpq, preset)
+        anims.append(SimpleNamespace(
+            name=name, preset=preset, count=count, start=sum(len(a.frames) for a in anims),
+            frames=list(range(0, count, 2)) if args.hide_frames == "odd" else list(range(count)),
+            views={k: load_views(args.mpq, dataclasses.replace(preset, frame=k))[0] for k in range(count)}))
+    base = anims[0]
+    slots = [(a, k) for a in anims for k in a.frames]
+    many = len(anims) > 1
+
+    # 1. Every fitted frame as a still; frame 0 calibrates the camera, and the others share it. With several
+    #    animations, frame 0 is calibrated on every fitted frame of all of them (one camera; calibrated on
+    #    one frame alone, the stand and the attack came out half a degree apart), and their stills are
+    #    saved apart ("-joint-<animations>").
+    joint = "-joint-" + "+".join(names) if many else ""
+
+    def still(a, k, camera=None):
+        iters = args.still_iters if (k or a is not base) and args.still_iters else None
+        tag = "motion-f%d%s%s%s%s%s" % (k, test, "-ss%d" % args.still_supersample if args.still_supersample != 1 else "",
+                                        "-" + args.edges if args.edges != "none" else "", "-i%d" % iters if iters else "",
+                                        joint)
+        folder = Path(args.out) / fit.run_name(a.name, split, tag=tag, model="gaussians")
         if (folder / "scene.pt").exists() and not args.refit_stills:
             saved = Scene.load(folder / "scene.pt", args.mpq)
             if saved.supersample == args.still_supersample:  # else it was fitted otherwise
                 return saved, folder
-        argv = ["--mpq", args.mpq, "--preset", args.preset, "--split", split, "--frame", str(k), "--model",
+        argv = ["--mpq", args.mpq, "--preset", a.name, "--split", split, "--frame", str(k), "--model",
                 "gaussians", "--supersample", str(args.still_supersample), "--tag", tag, "--out", args.out,
                 "--no-evaluate", "--edges", args.edges] + (["--iters", str(iters)] if iters else [])
-        return fit.main(argv + (["--camera", str(camera)] if camera else []))
+        if camera:
+            argv += ["--camera", str(camera)]
+        elif many:
+            argv += ["--calibrate-with"] + ["%s:%d" % (b.name, j) for b, j in slots if b is not a or j != k]
+        return fit.main(argv)
 
-    still_scene, still_dir = still(0)
-    stills = {0: still_scene.field}
-    for k in frames[1:]:
-        stills[k] = still(k, still_dir)[0].field
+    still_scene, still_dir = still(base, 0)
+    stills = [still_scene.field if s == 0 else still(a, k, still_dir)[0].field for s, (a, k) in enumerate(slots)]
     elevation, offset, sign = still_scene.elevation, still_scene.offset, still_scene.sign
     train_dirs = still_scene.train
     palette = still_scene.palette
 
-    all_views = {k: load_views(args.mpq, dataclasses.replace(preset, frame=k))[0] for k in range(count)}
-    h, w = all_views[0][0].shape
-    pivot = all_views[0][0].pivot
-    yaws = sign * torch.tensor([v.yaw for v in all_views[0]], dtype=torch.float32, device=device)
+    yaws = sign * torch.tensor([v.yaw for v in base.views[0]], dtype=torch.float32, device=device)
     right, up, forward = camera_basis(yaws, elevation)
     viewmats = torch.stack([viewmat(right[d], up[d], forward[d]) for d in range(len(yaws))])
-    K = intrinsics(pivot, offset, device)
-    Ks = K[None].repeat(len(yaws), 1, 1)
     dirs = torch.tensor(train_dirs, device=device)
+    for a in anims:
+        # Cells may differ in size between animations (the attack's are larger); each has its own ground
+        # point, (width / 2, height - 16), where the originals stand alike.
+        a.h, a.w = a.views[0][0].shape
+        a.pivot = a.views[0][0].pivot
+        a.K = intrinsics(a.pivot, offset, device)
+        a.Ks = a.K[None].repeat(len(yaws), 1, 1)
+        a.origins = torch.stack([pixel_rays(a.h, a.w, a.pivot, offset, right[d], up[d], forward[d])[0]
+                                 for d in train_dirs])
 
-    def model_indices(v, redraw=True):
+    def overlap(a, b):
+        """How much of their silhouettes animations a's and b's frames 0 share (IoU), placed by their ground
+        points, over the fitted directions."""
+        ious = []
+        for d in train_dirs:
+            placed = []
+            for x in (a, b):
+                v = x.views[0][d]
+                m = masks_for([v], x.preset.shadows, device)[0] == 1
+                canvas = torch.zeros((256, 256), dtype=torch.bool, device=device)
+                y0, x0 = 128 - int(v.pivot[1]), 128 - int(v.pivot[0])
+                canvas[y0:y0 + m.shape[0], x0:x0 + m.shape[1]] = m
+                placed.append(canvas)
+            ious.append(float((placed[0] & placed[1]).sum() / (placed[0] | placed[1]).sum().clamp(min=1)))
+        return sum(ious) / len(ious)
+
+    # The animations' graph: an animation whose frame 0 is the first one's frame 0 (the attack starts from
+    # the stand, 0.94 of their silhouettes in common) keeps that frame at the rest pose, one state that
+    # both pass through, the hub. One that never passes through it (the walk) starts by every node's jump
+    # to where transport takes it.
+    for a in anims:
+        a.hub = a is not base and overlap(a, base) >= 0.9
+        if a is not base:
+            print("%s's frame 0 shares %.2f of its silhouette with %s's: %s" % (
+                a.name, overlap(a, base), base.name, "the hub, held at the rest pose" if a.hub else "apart"))
+
+    def model_indices(v, a, redraw=True):
         """A view's palette indices where the model is (-1 elsewhere: the background, a baked shadow), its
         edges redrawn under --edges (unless not to redraw)."""
-        idx = np.where(masks_for([v], preset.shadows, device)[0].cpu().numpy() == 1, v.indices, -1)
+        idx = np.where(masks_for([v], a.preset.shadows, device)[0].cpu().numpy() == 1, v.indices, -1)
         if args.edges == "none" or not redraw:
             return idx
         return (edges_over_black if args.edges == "black" else clean_edges)(idx, palette.cpu().numpy())
 
-    def targets_of(k):
-        views = [all_views[k][d] for d in train_dirs]
-        masks = masks_for(views, preset.shadows, device)
-        idx = [torch.as_tensor(model_indices(v), device=device).long().clamp(min=0) for v in views]
+    def targets_of(s):
+        a, k = slots[s]
+        views = [a.views[k][d] for d in train_dirs]
+        masks = masks_for(views, a.preset.shadows, device)
+        idx = [torch.as_tensor(model_indices(v, a), device=device).long().clamp(min=0) for v in views]
         return torch.stack([palette[i] for i in idx]), torch.stack([m == 1 for m in masks])
 
-    origins = torch.stack([pixel_rays(h, w, pivot, offset, right[d], up[d], forward[d])[0] for d in train_dirs])
+    def render_slot(s):
+        """The model posed in slot s, in its animation's fitted directions."""
+        a = slots[s][0]
+        return model.rasterize(s, viewmats[dirs], a.Ks[dirs], a.w, a.h)
 
-    def surface_of(colors, alphas):
-        return surface_points(colors, alphas, origins, forward[dirs])
+    def surface_of(colors, alphas, a):
+        return surface_points(colors, alphas, a.origins, forward[dirs])
 
     parts = None
     if args.rigid:
         p = still_scene.field.params
-        views0 = [all_views[0][d] for d in train_dirs]
+        views0 = [base.views[0][d] for d in train_dirs]
         parts = rigid_parts(p["means"].detach(), p["opacities"].detach(), [m == 1 for m in masks_for(
-            views0, preset.shadows, device)], viewmats[dirs], Ks[dirs], min_views=math.ceil(0.6 * len(train_dirs)))
+            views0, base.preset.shadows, device)], viewmats[dirs], base.Ks[dirs],
+            min_views=math.ceil(0.6 * len(train_dirs)))
         for k in range(int(parts.max()) + 1):
             print("rigid part %d: %d Gaussians" % (k, int((parts == k).sum())))
-    model = MovingGaussians(still_scene.field, len(frames), nodes=args.nodes, lit=args.lighting != "none",
+    model = MovingGaussians(still_scene.field, len(slots), nodes=args.nodes, lit=args.lighting != "none",
                             supersample=args.supersample, parts=parts)
+    model.spans = [(a.start, len(a.frames)) for a in anims]
     if args.load:
         saved = torch.load(args.load, map_location=device)["model"]
         saved.setdefault("parts", torch.full((len(model.means0),), -1, dtype=torch.long, device=device))
@@ -946,37 +1054,59 @@ def main():
             keep[j] = False
             p.grad[keep] = 0
 
-    # 2. Tracking, frame by frame (slot j holds frame frames[j]). Images only pull a Gaussian from a
-    #    pixel or so away; a blade can swing tens of pixels between frames. So each Gaussian is also
-    #    pulled to where optimal transport takes the surface around it, from the model as it is to the
-    #    surface of the frame's own still, transported again every `rematch` iterations (as in ICP).
+    def frame_name(s):
+        a, k = slots[s]
+        return "%sframe %d" % (a.name + " " if many else "", k)
+
+    # 2. Tracking, frame by frame. Images only pull a Gaussian from a pixel or so away; a blade can swing
+    #    tens of pixels between frames. So each Gaussian is also pulled to where optimal transport takes
+    #    the surface around it, from the model as it is to the surface of the frame's own still,
+    #    transported again every `rematch` iterations (as in ICP). Each animation's first frame starts
+    #    from the rest pose, the others from the frame before.
     still_surfaces = {}
 
-    def still_surface(j):
-        if j not in still_surfaces:
+    def still_surface(s):
+        if s not in still_surfaces:
+            a = slots[s][0]
             with torch.no_grad():
-                s = args.supersample  # the still sampled as the moving Gaussians are
-                fine = Ks[dirs].clone()
-                fine[:, :2] *= s
-                colors, alphas, _ = stills[frames[j]].rasterize(viewmats[dirs], fine, w * s, h * s)
-                still_surfaces[j] = surface_of(*average_down(colors, alphas, s))
-        return still_surfaces[j]
+                ss = args.supersample  # the still sampled as the moving Gaussians are
+                fine = a.Ks[dirs].clone()
+                fine[:, :2] *= ss
+                colors, alphas, _ = stills[s].rasterize(viewmats[dirs], fine, a.w * ss, a.h * ss)
+                still_surfaces[s] = surface_of(*average_down(colors, alphas, ss), a)
+        return still_surfaces[s]
 
-    def transport_goal(j):
+    def transport_goal(s):
         """Where each Gaussian goes (G, 3) if it follows the surface around it, from the model posed in
-        slot j to the surface of frame frames[j]'s still."""
+        slot s to the surface of that frame's still."""
         with torch.no_grad():
-            here = surface_of(*model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)[:2])
-            there = transport(here, still_surface(j), iterations=args.sinkhorn_iters)
-            means, _ = model.pose(j)
+            here = surface_of(*render_slot(s)[:2], slots[s][0])
+            there = transport(here, still_surface(s), iterations=args.sinkhorn_iters)
+            means, _ = model.pose(s)
             return means + follow(means, here[:, :3], there[:, :3] - here[:, :3])
 
-    for j in range(1, 1 if args.load else len(frames)):  # a loaded model is tracked already
-        t0 = time.time()
+    def guarded(j, targets, masks, jump):
+        """Make a jump of slot j's node poses, kept only if the images then fit better: whether it was."""
         with torch.no_grad():
-            model.node_quats[j] = model.node_quats[j - 1]
-            model.node_moves[j] = model.node_moves[j - 1]
-        targets, masks = targets_of(frames[j])
+            before = image_loss(*render_slot(j)[:2], targets, masks)
+            kept = model.node_quats[j].clone(), model.node_moves[j].clone()
+            jump()
+            if image_loss(*render_slot(j)[:2], targets, masks) > before:
+                model.node_quats[j], model.node_moves[j] = kept
+                return False
+        return True
+
+    for j in range(1, 1 if args.load else len(slots)):  # a loaded model is tracked already
+        t0 = time.time()
+        a = slots[j][0]
+        if j == a.start and a.hub:
+            print("tracked %s: the hub, the rest pose" % frame_name(j))
+            continue
+        if j != a.start:
+            with torch.no_grad():
+                model.node_quats[j] = model.node_quats[j - 1]
+                model.node_moves[j] = model.node_moves[j - 1]
+        targets, masks = targets_of(j)
         goal, jumped = None, ""
         opt = torch.optim.Adam([{"params": [model.node_moves], "lr": 0.1}, {"params": [model.node_quats], "lr": 0.01}])
         # Three stages, blurred by 4, 2 and 1 pixels. Each ends early once its image loss stops improving
@@ -988,19 +1118,15 @@ def main():
                 if args.matching and it % args.rematch == 0:
                     model.supersample = args.supersample
                     goal = transport_goal(j)
-                    if it == 0 and (model.parts >= 0).any():
+                    if it == 0 and j == a.start and guarded(j, targets, masks, lambda: model.fit_nodes(j, goal)):
+                        # An animation's first frame, apart from the rest pose: every node at once.
+                        jumped += ", every node jumped"
+                        goal = transport_goal(j)
+                    if it == 0 and (model.parts >= 0).any() and guarded(j, targets, masks, lambda: model.fit_parts(j, goal)):
                         # Where transport takes a rigid part, in one jump, if the images agree.
-                        with torch.no_grad():
-                            before = image_loss(*model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)[:2], targets, masks)
-                            kept = model.node_quats[j].clone(), model.node_moves[j].clone()
-                            model.fit_parts(j, goal)
-                            after = image_loss(*model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)[:2], targets, masks)
-                            if after > before:
-                                model.node_quats[j], model.node_moves[j] = kept
-                            else:
-                                jumped = ", rigid parts jumped"
+                        jumped += ", rigid parts jumped"
                 model.supersample = args.supersample if blur == 1 else args.blurred_supersample
-                colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
+                colors, alphas, _ = render_slot(j)
                 fit_loss = image_loss(colors, alphas, targets, masks, blur)
                 loss = fit_loss + args.arap * model.arap(j)
                 if goal is not None:
@@ -1022,26 +1148,28 @@ def main():
                         stale += 10
                     if stale >= args.patience:
                         break
-        print("tracked frame %d (%d of %d): loss %.5f, %d iterations%s (%.0fs)" % (
-            frames[j], j, len(frames) - 1, loss.item(), it, jumped, time.time() - t0))
+        print("tracked %s (%d of %d): loss %.5f, %d iterations%s (%.0fs)" % (
+            frame_name(j), j, len(slots) - 1, loss.item(), it, jumped, time.time() - t0))
     model.supersample = args.supersample
 
-    # With --skeleton, the nodes are then tied into the pieces they move as (skeleton), and each frame
-    # is tracked again, piece by piece, from the pieces' fit to their nodes. Between frames a piece's
-    # one rigid motion is interpolated, rather than each of its nodes' own.
+    # With --skeleton, the nodes are then tied into the pieces they move as (skeleton), over every
+    # animation's frames, and each frame is tracked again, piece by piece, from the pieces' fit to their
+    # nodes. Between frames a piece's one rigid motion is interpolated, rather than each of its nodes'.
     if args.skeleton and not args.load:
-        groups = skeleton(model, len(frames), args.skeleton)
+        groups = skeleton(model, len(slots), args.skeleton)
         model.tie(groups)
         sizes = torch.bincount(groups).tolist()
         print("skeleton: %d pieces (%d of more than one node); nodes per piece %s" % (
             len(sizes), sum(s > 1 for s in sizes), [s for s in sizes if s > 1]))
-        for j in range(1, len(frames)):
+        for j in range(1, len(slots)):
+            if j == slots[j][0].start and slots[j][0].hub:
+                continue  # the rest pose
             t0 = time.time()
-            targets, masks = targets_of(frames[j])
+            targets, masks = targets_of(j)
             opt = torch.optim.Adam([{"params": [model.node_moves], "lr": 0.02}, {"params": [model.node_quats], "lr": 0.002}])
             best, stale = float("inf"), 0
             for step in range(args.track_iters // 3):
-                colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
+                colors, alphas, _ = render_slot(j)
                 fit_loss = image_loss(colors, alphas, targets, masks)
                 loss = fit_loss + args.arap * model.arap(j)
                 opt.zero_grad()
@@ -1055,8 +1183,8 @@ def main():
                         stale += 10
                     if stale >= args.patience:
                         break
-            print("tracked frame %d again, by pieces: loss %.5f, %d iterations (%.0fs)" % (
-                frames[j], fit_loss.item(), step + 1, time.time() - t0))
+            print("tracked %s again, by pieces: loss %.5f, %d iterations (%.0fs)" % (
+                frame_name(j), fit_loss.item(), step + 1, time.time() - t0))
 
     # 3. The rest shape and colors, refitted to every frame at once through the tracked motion: frame 0's
     #    still saw the model from 8 directions, but as parts move, the other frames show them from more.
@@ -1065,7 +1193,7 @@ def main():
     #    smoothness of the node paths, with the opacities and small per-frame corrections of each
     #    Gaussian) fits the known cells closer, but at the cost of consistency between frames, which
     #    copying pixels relies on; and a thin blade that's a pixel off in some frames fades out in all.
-    all_targets = [targets_of(k) for k in frames]
+    all_targets = [targets_of(s) for s in range(len(slots))]
     groups = [{"params": [model.colors], "lr": 0.01}]
     if model.lit:
         groups.append({"params": model.highlight_parameters(), "lr": 0.01})
@@ -1084,9 +1212,9 @@ def main():
     neighbours = None
     t0 = time.time()
     for it in range(0 if args.load else args.refine_iters):
-        j = it % len(frames)
+        j = it % len(slots)
         targets, masks = all_targets[j]
-        colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
+        colors, alphas, _ = render_slot(j)
         loss = image_loss(colors, alphas, targets, masks, snap=snap, keyed=args.keyed)
         if args.tv:
             loss = loss + args.tv * sample_variation(*model.last_samples)
@@ -1109,41 +1237,56 @@ def main():
             print("refine %5d  loss %.5f  (%.0fs)" % (it, loss.item(), time.time() - t0))
     model.keep_samples, model.last_samples = False, None
 
-    # 4. Scores and pictures.
-    per_frame = len(frames) / count  # model slots per animation frame
-    results = {key: [] for key in ("fitted", "hidden_direction", "hidden_direction_copied", "hidden_frames",
-                                   "hidden_frames_copied", "hidden_frames_repeat_previous")}
-    shadow_scores = {"hidden_direction": [], "hidden_frames": []}
-    hidden_cells = {}
-    with torch.no_grad():
+    # 4. Scores and pictures, per animation.
+    pal = (palette.cpu().numpy() * 255).round().astype(np.uint8)
+    warp = Warp()
+    summary = {"presets": names, "directions": train_dirs, "elevation_deg": math.degrees(float(elevation)),
+               "gaussians": len(model.means0), "nodes": args.nodes, "lighting": args.lighting}
+    if model.lit:
+        summary["light"] = {"direction_camera_space": F.normalize(model.light_dirs, dim=-1).tolist(),
+                            "power": F.softplus(model.light_raw).tolist(),
+                            "ambient": F.softplus(model.ambient_raw).item()}
+        print("light (camera space):", json.dumps(summary["light"]))
+
+    def report(a):
+        """Scores, the hidden cells, the sheet and GIFs of animation a; its summary."""
+        per_frame = len(a.frames) / a.count  # model slots per animation frame
+        prefix, suffix = (a.name + " ", "-" + a.name) if many else ("", "")
+        results = {key: [] for key in ("fitted", "hidden_direction", "hidden_direction_copied", "hidden_frames",
+                                       "hidden_frames_copied", "hidden_frames_repeat_previous")}
+        shadow_scores = {"hidden_direction": [], "hidden_frames": []}
+        hidden_cells = {}
+
+        def phase(frame_phase):
+            return a.start + frame_phase * per_frame
+
         def camera(d_yaw):
             r, u, f = (x[0] for x in camera_basis(torch.tensor([d_yaw], device=device), elevation))
-            return r, u, f, viewmat(r, u, f), K
+            return r, u, f, viewmat(r, u, f), a.K
 
         def render(frame_phase, d_yaw):
             vm = camera(d_yaw)[3]
-            colors, alphas, _ = model.rasterize(frame_phase * per_frame, vm[None], K[None], w, h)
+            colors, alphas, _ = model.rasterize(phase(frame_phase), vm[None], a.K[None], a.w, a.h)
             return quantize(colors[0, ..., :3], alphas[0, ..., 0], palette, candidates)
 
-        # The originals the copier may take pixels from: every fitted frame in every fitted direction,
-        # with the model's depth there for the visibility test.
-        warp = Warp()
+        # The originals the copier may take pixels from: every fitted frame of the animation in every
+        # fitted direction, with the model's depth there for the visibility test.
         sources = []
-        for j, k in enumerate(frames):
+        for i, k in enumerate(a.frames):
             for d in train_dirs:
                 r, u, f, vm, _ = camera(float(yaws[d]))
-                _, alpha, depth = model.rest_points(j, vm, K, w, h)
-                sources.append({"view": d, "slot": j, "yaw": float(yaws[d]), "right": r, "up": u, "forward": f,
-                                "pivot": pivot, "offset": offset,
-                                "indices": torch.as_tensor(model_indices(all_views[k][d], redraw=False),
+                _, alpha, depth = model.rest_points(a.start + i, vm, a.K, a.w, a.h)
+                sources.append({"view": d, "slot": a.start + i, "yaw": float(yaws[d]), "right": r, "up": u,
+                                "forward": f, "pivot": a.pivot, "offset": offset,
+                                "indices": torch.as_tensor(model_indices(a.views[k][d], a, redraw=False),
                                                            device=device).long(),
                                 "depth": source_depth(depth, alpha >= 0.5, warp)})
-        copier = PixelCopier(model, sources, warp, Ramps(palette), len(frames))
+        copier = PixelCopier(model, sources, warp, Ramps(palette), len(a.frames))
 
         def copied(frame_phase, d_yaw, own=None):
             if own is None:
                 own = render(frame_phase, d_yaw)
-            return copier(frame_phase * per_frame, d_yaw, camera(d_yaw), own)
+            return copier(phase(frame_phase), d_yaw, camera(d_yaw), own)
 
         # Shadows, made as the originals' were (shadow.py): a cell's own outline, squashed and sheared
         # about its direction's ground row, the lowest row of the direction's outline in frame 0 (an
@@ -1153,7 +1296,7 @@ def main():
         def ground_row(n):
             if n not in grounds:
                 if n % 2 == 0 and n // 2 != args.hide_direction:
-                    idx = torch.as_tensor(all_views[0][n // 2].indices, device=device).long()
+                    idx = torch.as_tensor(a.views[0][n // 2].indices, device=device).long()
                     grounds[n] = lowest_row((idx >= 0) & ~baked_shadow(idx))
                 else:
                     grounds[n] = lowest_row(copied(0, sign * n * 22.5) >= 0)
@@ -1164,21 +1307,21 @@ def main():
 
         def with_shadow(indices, n):
             """The cell as a sprite: its colors over its shadow (index 0)."""
-            if not preset.shadows:
+            if not a.preset.shadows:
                 return indices
             return torch.where(shadow_of(indices, n), torch.zeros_like(indices), indices)
 
         def shadow_match(k, d, indices):
-            original = torch.as_tensor(all_views[k][d].indices, device=device).long()
+            original = torch.as_tensor(a.views[k][d].indices, device=device).long()
             return float(iou(shadow_of(indices, 2 * d), baked_shadow(original)))
 
         def truth(k, d):
-            v = all_views[k][d]
+            v = a.views[k][d]
             idx = torch.as_tensor(v.indices, device=device).long()
-            m = masks_for([v], preset.shadows, device)[0]
+            m = masks_for([v], a.preset.shadows, device)[0]
             return torch.where(m == 1, idx, torch.full_like(idx, -1))
 
-        for k in range(count):
+        for k in range(a.count):
             for d in range(len(yaws)):
                 own = render(k, float(yaws[d]))
                 s = score(own, truth(k, d), palette)
@@ -1187,92 +1330,95 @@ def main():
                     cell = copied(k, float(yaws[d]), own)
                     results["hidden_direction_copied"].append(score(cell, truth(k, d), palette))
                     hidden_cells["f%d_d%d" % (k, d)] = cell.cpu().numpy().astype(np.int16)
-                    if preset.shadows:
+                    if a.preset.shadows:
                         shadow_scores["hidden_direction"].append(shadow_match(k, d, cell))
                 elif args.hide_frames and k % 2:
                     results["hidden_frames"].append(s)
                     cell = copied(k, float(yaws[d]), own)
                     results["hidden_frames_copied"].append(score(cell, truth(k, d), palette))
                     hidden_cells["f%d_d%d" % (k, d)] = cell.cpu().numpy().astype(np.int16)
-                    if preset.shadows:
+                    if a.preset.shadows:
                         shadow_scores["hidden_frames"].append(shadow_match(k, d, cell))
                     results["hidden_frames_repeat_previous"].append(score(truth(k - 1, d), truth(k, d), palette))
                 else:
                     results["fitted"].append(s)
-        summary = {"preset": args.preset, "frames": count, "fitted_frames": frames, "directions": train_dirs,
-                   "elevation_deg": math.degrees(float(elevation)), "gaussians": len(model.means0),
-                   "nodes": args.nodes, "lighting": args.lighting, "seconds": time.time() - t_start}
-        if model.lit:
-            summary["light"] = {"direction_camera_space": F.normalize(model.light_dirs, dim=-1).tolist(),
-                                "power": F.softplus(model.light_raw).tolist(),
-                                "ambient": F.softplus(model.ambient_raw).item()}
-            print("light (camera space):", json.dumps(summary["light"]))
+        out = {"preset": a.name, "frames": a.count, "fitted_frames": a.frames}
         for key, rows in results.items():
             if rows:
-                summary[key] = {m: float(np.mean([r[m] for r in rows])) for m in rows[0]}
-                print(key, json.dumps({m: round(v, 3) for m, v in summary[key].items()}))
-        if preset.shadows:
+                out[key] = {m: float(np.mean([r[m] for r in rows])) for m in rows[0]}
+                print(prefix + key, json.dumps({m: round(v, 3) for m, v in out[key].items()}))
+        if a.preset.shadows:
             for key, rows in shadow_scores.items():
                 if rows:
-                    summary[key + "_shadow_iou"] = float(np.mean(rows))
-                    print(key, "shadow IoU %.3f" % summary[key + "_shadow_iou"])
-        (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
+                    out[key + "_shadow_iou"] = float(np.mean(rows))
+                    print(prefix + key, "shadow IoU %.3f" % out[key + "_shadow_iou"])
         if hidden_cells:  # the hidden cells as generated (copied pixels, no shadows), for a closer look
-            np.savez_compressed(out_dir / "hidden.npz", **hidden_cells)
+            np.savez_compressed(out_dir / ("hidden%s.npz" % suffix), **hidden_cells)
 
         # 16 directions by twice the frames: originals where they exist and were fitted (with their baked
         # shadows), copied pixels over generated shadows elsewhere.
-        pal = (palette.cpu().numpy() * 255).round().astype(np.uint8)
         sheet = []
-        for step in range(0 if args.no_sheet else 2 * count):
+        for step in range(0 if args.no_sheet else 2 * a.count):
             column = []
             for n in range(16):
-                known = n % 2 == 0 and step % 2 == 0 and n // 2 != args.hide_direction and step // 2 in frames
+                known = n % 2 == 0 and step % 2 == 0 and n // 2 != args.hide_direction and step // 2 in a.frames
                 if known:
-                    column.append(all_views[step // 2][n // 2].indices.astype(np.int64))
+                    column.append(a.views[step // 2][n // 2].indices.astype(np.int64))
                 else:
                     cell = copied(step / 2, sign * n * 22.5)
                     column.append(with_shadow(cell, n).cpu().numpy())
             sheet.append(column)
         if sheet:
-            write_sheet(sheet, pal, out_dir / "sheet.png")
+            write_sheet(sheet, pal, out_dir / ("sheet%s.png" % suffix))
             # Twice the frames at the game's speed: 25 ms each, which a GIF (in steps of 10 ms) shows as
             # 20 and 30 in turn.
-            write_gif(sheet, pal, out_dir / "directions.gif", duration=[20, 30] * count)
+            write_gif(sheet, pal, out_dir / ("directions%s.gif" % suffix), duration=[20, 30] * a.count)
         if args.scale > 1:
             # Larger, every cell is the model's: there are no originals at that size. One sample per
             # pixel, where that's the fit's own grid; copied pixels come from the originals with their
             # edges redrawn, as the colors were fitted, since a blended edge would show as a rim.
             S, fine = args.scale, model.supersample
-            K_big = intrinsics(pivot, offset, device, S)
+            K_big = intrinsics(a.pivot, offset, device, S)
             model.supersample = max(1, fine // S)
-            big_copier = PixelCopier(model, [dict(s, indices=torch.as_tensor(
-                model_indices(all_views[frames[s["slot"]]][s["view"]]), device=device).long()) for s in sources],
-                warp, Ramps(palette), len(frames))
+            big_copier = PixelCopier(model, [dict(s, indices=torch.as_tensor(model_indices(
+                a.views[a.frames[s["slot"] - a.start]][s["view"]], a), device=device).long()) for s in sources],
+                warp, Ramps(palette), len(a.frames))
 
             def big_cell(step, n):
                 d_yaw = sign * n * 22.5
                 r, u, f, vm, _ = camera(d_yaw)
-                colors, alphas, _ = model.rasterize(step / 2 * per_frame, vm[None], K_big[None], w * S, h * S)
+                colors, alphas, _ = model.rasterize(phase(step / 2), vm[None], K_big[None], a.w * S, a.h * S)
                 own = quantize(colors[0, ..., :3], alphas[0, ..., 0], palette, candidates)
                 if args.scale_colors == "own":
                     return own
-                return big_copier(step / 2 * per_frame, d_yaw, (r, u, f, vm, K_big), own)
+                return big_copier(phase(step / 2), d_yaw, (r, u, f, vm, K_big), own)
 
             big_grounds = {n: lowest_row(big_cell(0, n) >= 0) for n in range(16)}
             big = []
-            for step in range(2 * count):
+            for step in range(2 * a.count):
                 column = []
                 for n in range(16):
                     cell = big_cell(step, n)
-                    if preset.shadows:
+                    if a.preset.shadows:
                         shade = outline_shadow(cell >= 0, big_grounds[n], scale=S)
                         cell = torch.where(shade, torch.zeros_like(cell), cell)
                     column.append(cell.cpu().numpy())
                 big.append(column)
             model.supersample = fine
-            write_gif(big, pal, out_dir / ("directions-%dx.gif" % S), scale=1, duration=[20, 30] * count, columns=4)
-    torch.save({"model": model.state_dict(), "frames": frames}, out_dir / "motion.pt")
+            write_gif(big, pal, out_dir / ("directions-%dx%s.gif" % (S, suffix)), scale=1,
+                      duration=[20, 30] * a.count, columns=4)
+        return out
+
+    with torch.no_grad():
+        reports = [report(a) for a in anims]
+    summary["seconds"] = time.time() - t_start
+    if many:
+        summary["animations"] = {r["preset"]: r for r in reports}
+    else:
+        summary.update(reports[0])
+    (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
+    torch.save({"model": model.state_dict(), "frames": [k for _, k in slots],
+                "animations": [(a.name, a.frames) for a in anims]}, out_dir / "motion.pt")
     print("wrote", out_dir, "(%.0fs)" % (time.time() - t_start))
 
 
