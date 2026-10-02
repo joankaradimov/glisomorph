@@ -883,6 +883,37 @@ exact against 37.2%, own colors 32.1% against 33.5%; the fitted cells' own color
 44.0%), so they're options for rendering larger. The blade's outline needs something else: drawn as
 a line, or made of flat Gaussians.
 
+Blurring and sharpening again didn't give a clean look:
+
+- **Blurring the larger render** by half an original pixel, coverage and colors, then keeping
+  what's over half covered, averages needles and dithered edges away: the blade becomes a solid band
+  with a smooth outline, but the texture goes soft everywhere.
+- **Fitting to blurred originals** (coverage and colors blurred by 0.5 or 0.7 pixels, sharpened back
+  by the render's threshold) evened the blade's colors, but not its outline: a pixel's partial
+  coverage can be met by opaque Gaussians covering part of it, a dither, as well as by smooth half
+  cover. It cost the fitted cells' own colors 6 points.
+
+A blur that loses nothing, undone by a layer, didn't help either. The Gaussians' samples were fitted
+to the originals softened (each pixel a square of 4 x 4 samples, blurred by sigma), and a learned
+filter, its taps a pixel apart, sharpened their pixels back into the originals. At sigma 0.5 that
+blur can still be undone exactly (it damps no pattern of pixels more than 16-fold; at 0.7, the finest
+170-fold), but the detail it leaves is smaller than the Gaussians' own errors, the views and frames
+they can't all match. On the attack's fitted cells (exact palette index, refined 2000 iterations from
+the model above, at 43.8%):
+
+- **Learned freely,** the layer settled on a mild sharpening (37.9%, soft at 4x); the blur's exact
+  undo turned the Gaussians' errors into speckle (30.3%).
+- **With the undo computed from the blur's own sigma, learned,** the two can't drift apart and the
+  fit is back (46.6%), but sigma shrinks from 0.5 to 0.31, where it barely touches the Gaussians:
+  at 1x a blur only costs (refined as long without it, 49.8%), and what it buys at 4x the fit can't
+  see. At 4x it looks as the plain refinement does.
+- **Held at 0.5,** the undo turned the errors into noise (its taps 4 pixels apart at 4x) or into a
+  grid of soft squares (its correction made on the pixels and added back as the blur's squares), at
+  38.6%.
+
+Any linear blur and its exact inverse trade alike: the more it smooths, the more the inverse
+amplifies the patterns it smoothed, errors included.
+
 **Rendering larger.** `--scale 4` also draws the 16 directions by twice the frames 4 times larger,
 as `directions-4x.gif`, four directions to a row. Every cell is the model's, as there are no
 originals at that size: its own colors, one sample per pixel where that's the fit's own grid, or
