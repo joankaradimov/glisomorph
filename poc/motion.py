@@ -12,7 +12,9 @@ whose shape, opacity and color are shared by every frame, moved per frame by a f
 Gaussian follows its nearest nodes, and neighbouring nodes are held rigid to each other. Moving
 whole limbs through a few nodes is far better posed than moving every Gaussian on its own. Long,
 thin, straight parts, such as a sword, move as one rigid body instead, on a node of their own
-(--rigid, the default): blended from several nodes, a blade bends.
+(--rigid, the default): blended from several nodes, a blade bends. Once tracked, the nodes are tied
+into the pieces they move as, a skeleton found from the motion (--skeleton), each moving by one rigid
+motion, interpolated as one between frames.
 
 1. Every frame is fitted like a still (fit.py --model gaussians); the stills are saved and reused.
    Frame 0 calibrates the camera, and its Gaussians become the moving ones; the other stills are
@@ -188,6 +190,72 @@ def rigid_parts(means, opacities, masks, viewmats, Ks, min_views: int, min_lengt
     return parts
 
 
+def rigid_residual(rest, posed):
+    """How far points (P, 3) are from moving as one rigid body through frames (posed (F, P, 3)): how
+    far the point that strays most is from the rigid motion that fits them best (Kabsch), in the frame
+    where it strays most. (An RMS over a large group would let it swallow a small one that moves
+    apart: the zombie's legs went into its body.)"""
+    p = rest - rest.mean(0)
+    q = posed - posed.mean(1, keepdim=True)
+    u, _, vt = torch.linalg.svd(p.T[None] @ q)
+    flip = torch.ones(len(q), 3, device=rest.device)
+    flip[:, 2] = torch.sign(torch.det(vt.transpose(1, 2) @ u.transpose(1, 2)))
+    rot = vt.transpose(1, 2) @ torch.diag_embed(flip) @ u.transpose(1, 2)
+    return float(((p[None] @ rot.transpose(1, 2) - q) ** 2).sum(-1).sqrt().max())
+
+
+def skeleton(model, slots: int, threshold: float):
+    """The tracked nodes grouped into pieces that move rigidly together, a group per node (M,): a
+    skeleton, found from the motion. Each node stands for 4 points (its center, and a node spacing
+    along each axis, turned by its rotation); linked groups merge, the pair whose union fits one rigid
+    motion best first (rigid_residual, over the slots), while that stays under `threshold` pixels. A
+    limb splits where its nodes stop moving together, at a joint; a slow bend isn't chained into one
+    piece, as each merge is checked as a whole."""
+    with torch.no_grad():
+        m = len(model.centers)
+        axes = model.spacing * torch.cat([torch.zeros(1, 3, device=model.centers.device),
+                                          torch.eye(3, device=model.centers.device)])
+        rest = model.centers[:, None] + axes
+        posed = []
+        for k in range(slots):
+            rot, move = model.node_pose(k)
+            posed.append(quat_rotate(rot[:, None].expand(-1, 4, -1), axes.expand(m, 4, 3)) + (model.centers + move)[:, None])
+        posed = torch.stack(posed)
+    members = {i: [i] for i in range(m)}
+    neighbours = {i: set() for i in range(m)}
+    for i in range(m):
+        for j in model.links[i].tolist():
+            if i != j:
+                neighbours[i].add(j)
+                neighbours[j].add(i)
+    costs = {}
+
+    def cost(a, b):
+        if (a, b) not in costs:
+            nodes = members[a] + members[b]
+            costs[a, b] = rigid_residual(rest[nodes].reshape(-1, 3), posed[:, nodes].reshape(slots, -1, 3))
+        return costs[a, b]
+
+    while True:
+        pairs = [(cost(a, b), a, b) for a in members for b in neighbours[a] if a < b]
+        if not pairs:
+            break
+        best, a, b = min(pairs)
+        if best > threshold:
+            break
+        members[a] += members.pop(b)
+        for n in neighbours.pop(b) - {a}:
+            neighbours[n].discard(b)
+            neighbours[n].add(a)
+            neighbours[a].add(n)
+        neighbours[a] -= {a, b}
+        costs = {key: v for key, v in costs.items() if a not in key and b not in key}
+    group = torch.zeros(m, dtype=torch.long, device=model.centers.device)
+    for g, nodes in enumerate(sorted(members.values(), key=len, reverse=True)):
+        group[nodes] = g
+    return group
+
+
 def average_down(colors, alpha, s: int):
     """A render s times finer, averaged over s x s blocks: colors with expected depth (C, H*s, W*s, k+1),
     premultiplied, and opacity (C, H*s, W*s, 1). Colors and opacity average plainly; depth is weighted
@@ -256,6 +324,10 @@ class MovingGaussians(torch.nn.Module):
         identity = torch.tensor([1.0, 0, 0, 0], device=centers.device)
         self.node_quats = torch.nn.Parameter(identity.repeat(frames, nodes, 1))
         self.node_moves = torch.nn.Parameter(torch.zeros((frames, nodes, 3), device=centers.device))
+        # Tied into a skeleton (tie), node_quats and node_moves are the pieces' instead, about their
+        # centers, and each node takes its piece's.
+        self.register_buffer("node_group", None)
+        self.register_buffer("group_centers", None)
         # Small per-frame corrections of each Gaussian's position, on top of the nodes' motion, so that
         # each frame can match its views as closely as a still; and each Gaussian's nearest neighbours,
         # whose corrections should be alike.
@@ -282,9 +354,48 @@ class MovingGaussians(torch.nn.Module):
         """The nodes' unit quaternions (M, 4) and translations (M, 3) at a phase in model frames."""
         if float(phase).is_integer():
             k = int(phase) % self.node_quats.shape[0]
-            return F.normalize(self.node_quats[k], dim=-1), self.node_moves[k]
-        return (catmull_rom(F.normalize(self.node_quats, dim=-1), phase, quaternions=True),
-                catmull_rom(self.node_moves, phase))
+            rot, move = F.normalize(self.node_quats[k], dim=-1), self.node_moves[k]
+        else:
+            rot, move = (catmull_rom(F.normalize(self.node_quats, dim=-1), phase, quaternions=True),
+                         catmull_rom(self.node_moves, phase))
+        if self.node_group is None:
+            return rot, move
+        # Each node moves with its piece: turned about the piece's center, and carried along.
+        g = self.node_group
+        rot = rot[g]
+        return rot, quat_rotate(rot, self.centers - self.group_centers[g]) + self.group_centers[g] + move[g] - self.centers
+
+    def tie(self, groups):
+        """Tie the nodes into rigid pieces (groups (M,), a piece per node: skeleton), each moving by one
+        rigid motion per frame, at first the one that best fits its nodes' (Kabsch, on their centers and
+        a spacing along each axis)."""
+        with torch.no_grad():
+            n = int(groups.max()) + 1
+            device = self.centers.device
+            counts = torch.bincount(groups, minlength=n).float()
+            centers = torch.zeros((n, 3), device=device).index_add_(0, groups, self.centers) / counts[:, None]
+            axes = self.spacing * torch.cat([torch.zeros(1, 3, device=device), torch.eye(3, device=device)])
+            rest = self.centers[:, None] + axes
+            frames = self.node_quats.shape[0]
+            quats = torch.zeros((frames, n, 4), device=device)
+            moves = torch.zeros((frames, n, 3), device=device)
+            for k in range(frames):
+                rot, move = self.node_pose(k)
+                posed = quat_rotate(rot[:, None].expand(-1, 4, -1), axes.expand(len(rot), 4, 3)) + (self.centers + move)[:, None]
+                for g in range(n):
+                    p = rest[groups == g].reshape(-1, 3) - centers[g]
+                    q = posed[groups == g].reshape(-1, 3)
+                    pm, qm = p.mean(0), q.mean(0)
+                    u, _, vt = torch.linalg.svd((p - pm).T @ (q - qm))
+                    flip = torch.ones(3, device=device)
+                    flip[2] = torch.sign(torch.det(vt.T @ u.T))
+                    r = vt.T @ torch.diag(flip) @ u.T
+                    quats[k, g] = quat_of_matrix(r)
+                    moves[k, g] = qm - r @ pm - centers[g]  # posed = r (x - center) + center + move
+        self.register_buffer("node_group", groups)
+        self.register_buffer("group_centers", centers)
+        self.node_quats = torch.nn.Parameter(quats)
+        self.node_moves = torch.nn.Parameter(moves)
 
     def residual(self, phase: float):
         if float(phase).is_integer():
@@ -442,7 +553,7 @@ class MovingGaussians(torch.nn.Module):
     def arap(self, slot: int):
         """As rigid as possible: where a node's pose puts each neighbouring node, against where that
         neighbour's own pose puts it (embedded deformation's regularizer), in node spacings."""
-        rot, move = F.normalize(self.node_quats[slot], dim=-1), self.node_moves[slot]
+        rot, move = self.node_pose(slot)
         c, n = self.centers, self.links
         predicted = quat_rotate(rot[:, None].expand(-1, n.shape[1], -1), c[n] - c[:, None]) + c[:, None] + move[:, None]
         actual = c[n] + move[n]
@@ -728,6 +839,10 @@ def main():
                     help="find long, thin, straight parts in frame 0 (rigid_parts: a sword) and move each as one "
                          "rigid body, rather than bent by the several nodes its Gaussians would follow (the "
                          "default; --no-rigid bends them)")
+    ap.add_argument("--skeleton", type=float, default=2.0,
+                    help="after tracking, tie the nodes into pieces that move rigidly together (skeleton: no "
+                         "node of a piece strays more than this many pixels from the piece's motion, in any "
+                         "frame), then track each frame again, piece by piece (0: leave the nodes apart)")
     ap.add_argument("--load", default=None,
                     help="a saved motion.pt to score and draw again, instead of tracking and refining")
     ap.add_argument("--no-sheet", action="store_true", help="score, but skip the 16-direction sheet and GIF")
@@ -819,6 +934,8 @@ def main():
     if args.load:
         saved = torch.load(args.load, map_location=device)["model"]
         saved.setdefault("parts", torch.full((len(model.means0),), -1, dtype=torch.long, device=device))
+        if "node_group" in saved:
+            model.tie(saved["node_group"])
         model.load_state_dict(saved)
     print("%d Gaussians, %d nodes %.1f pixels apart" % (len(model.means0), args.nodes, model.spacing))
 
@@ -908,6 +1025,38 @@ def main():
         print("tracked frame %d (%d of %d): loss %.5f, %d iterations%s (%.0fs)" % (
             frames[j], j, len(frames) - 1, loss.item(), it, jumped, time.time() - t0))
     model.supersample = args.supersample
+
+    # With --skeleton, the nodes are then tied into the pieces they move as (skeleton), and each frame
+    # is tracked again, piece by piece, from the pieces' fit to their nodes. Between frames a piece's
+    # one rigid motion is interpolated, rather than each of its nodes' own.
+    if args.skeleton and not args.load:
+        groups = skeleton(model, len(frames), args.skeleton)
+        model.tie(groups)
+        sizes = torch.bincount(groups).tolist()
+        print("skeleton: %d pieces (%d of more than one node); nodes per piece %s" % (
+            len(sizes), sum(s > 1 for s in sizes), [s for s in sizes if s > 1]))
+        for j in range(1, len(frames)):
+            t0 = time.time()
+            targets, masks = targets_of(frames[j])
+            opt = torch.optim.Adam([{"params": [model.node_moves], "lr": 0.02}, {"params": [model.node_quats], "lr": 0.002}])
+            best, stale = float("inf"), 0
+            for step in range(args.track_iters // 3):
+                colors, alphas, _ = model.rasterize(j, viewmats[dirs], Ks[dirs], w, h)
+                fit_loss = image_loss(colors, alphas, targets, masks)
+                loss = fit_loss + args.arap * model.arap(j)
+                opt.zero_grad()
+                loss.backward()
+                only_slot(j)
+                opt.step()
+                if args.patience and step % 10 == 9:
+                    if fit_loss.item() < best * (1 - 1e-3):
+                        best, stale = fit_loss.item(), 0
+                    else:
+                        stale += 10
+                    if stale >= args.patience:
+                        break
+            print("tracked frame %d again, by pieces: loss %.5f, %d iterations (%.0fs)" % (
+                frames[j], fit_loss.item(), step + 1, time.time() - t0))
 
     # 3. The rest shape and colors, refitted to every frame at once through the tracked motion: frame 0's
     #    still saw the model from 8 directions, but as parts move, the other frames show them from more.

@@ -762,6 +762,44 @@ its nodes put it, the same blade came out straight.
 - **The blade stays as spread in depth** (1.7 pixels off a straight line, RMS, against 1.8 bent):
   moved rigidly, every frame's views see the same blade, but they didn't pin it down closer.
 
+#### Skeleton
+
+Beyond thin parts, the models barely bend: the torso, the head and most of the limbs move rigidly,
+and where they bend, it's in narrow bands at the joints. So once tracked, the nodes are tied into the
+pieces they move as, a skeleton found from the motion (`--skeleton P`, 2 pixels by default; 0 leaves
+the nodes apart):
+
+- **Grouped by how they moved:** each node stands for 4 points, its center and a node spacing along
+  each of its axes, so that its turn counts as well as its move. Linked groups merge, the pair that
+  one rigid motion per frame fits best first (Kabsch), while no point of the merged group strays more
+  than P pixels from it in any frame. The pieces are what moves together in that animation: head,
+  torso, the sword with its hand and forearm, the scabbard, thighs, shins and feet.
+- **Moved as one:** each piece moves by one rigid motion per frame, at first the one that best fits
+  its nodes', and every frame is then tracked again, piece by piece. Between frames, each piece's
+  motion is interpolated as one, rather than each of its nodes'. A Gaussian near a joint follows
+  nodes of two pieces and blends them, so the joints stay smooth.
+- **The worst point, not the RMS:** tested by the RMS over the whole group, a large piece swallows a
+  small one that moves apart: on the zombie's walk, which barely moves, 201 of the 256 nodes became
+  one piece, legs and all, and its hidden frames got worse (0.907 IoU and 51.4% exact copied, against
+  0.927 and 54.0%).
+
+| Copied pixels: IoU / exact / RGB error | Rigid parts alone | Skeleton (2 px) |
+|---|---|---|
+| Attack, odd frames hidden (76 pieces) | 0.793 / 38.1% / 15.8 | 0.794 / 38.3% / 15.3 |
+| Attack, SW hidden (46 pieces) | 0.884 / 27.3% / 16.6 | 0.886 / 27.6% / 16.4 |
+| Zombie's walk, odd frames hidden (22 pieces) | 0.927 / 54.0% / 7.1 | 0.929 / 54.7% / 6.9 |
+
+The pieces count every node; those of more than one node number 26 and 24 on the attack, and 9 on
+the zombie's walk.
+
+- **Every test gains a little,** each within the runs' noise, all the same way; the models' own
+  colors most (the attack with SW hidden: 34.4% exact against 33.0%), and the known cells too (0.4
+  to 1.4 points). The new cells look as they did.
+- **The pieces are this animation's, not anatomy:** a joint that never bends in it isn't found (the
+  zombie's head and torso are one piece), and a frame tracked badly splits pieces, so the attack has
+  more than a body has joints.
+- **It costs** a minute or two more per fit, for the grouping and the second tracking.
+
 #### Supersampled
 
 Like the stills (see [Supersampled fitting](#gaussians)), the moving Gaussians make each pixel the
