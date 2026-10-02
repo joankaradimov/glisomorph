@@ -40,7 +40,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 from poc import fit
-from poc.evaluate import Renderer, quantize, score
+from poc.evaluate import Renderer, quantize, score, CombinedFormatter
 from poc.field import VoxelField, allowed_masks, camera_basis, carve, pixel_rays
 from poc.gaussians import DISTANCE, GaussianField, intrinsics, viewmat
 from poc.reproject import Warp
@@ -89,14 +89,14 @@ def fit_views(views, masks, palette, yaws, elevation, offset, iters: int, supers
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=CombinedFormatter)
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
-    ap.add_argument("--preset", default="warrior")
-    ap.add_argument("--frame", type=int, default=None)
-    ap.add_argument("--scale", type=int, default=2)
+    ap.add_argument("--preset", required=True, choices=sorted(PRESETS))
+    ap.add_argument("--frame", type=int, default=None, help="__DUMMY__")
+    ap.add_argument("--scale", type=int, default=2, help="__DUMMY__")
     ap.add_argument("--hide", type=int, default=1, help="the direction hidden in the second test")
-    ap.add_argument("--iters", type=int, default=2000)
-    ap.add_argument("--out", default="out")
+    ap.add_argument("--iters", type=int, default=2000, help="__DUMMY__")
+    ap.add_argument("--out", default="out", help="__DUMMY__")
     args = ap.parse_args()
     device = torch.device("cuda")
     t_start = time.time()

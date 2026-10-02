@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 from poc.edges import clean_edges, edges_over_black
-from poc.evaluate import add_warp_arguments, evaluate, warp_from_args
+from poc.evaluate import add_warp_arguments, evaluate, warp_from_args, CombinedFormatter
 from poc.field import VoxelField, allowed_masks, camera_basis, carve, silhouettes
 from poc.scene import Scene, make_field, masks_for
 from poc.views import PRESETS, load_views
@@ -86,7 +86,7 @@ def calibrate(field, views, masks, yaws, device, elevations, offsets):
 
 def main(argv=None):
     """Fit and evaluate, as the command line (or argv) says. Returns the fitted scene and its folder."""
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=CombinedFormatter)
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
     ap.add_argument("--preset", required=True, choices=sorted(PRESETS))
     ap.add_argument("--split", default="alternate",
@@ -99,8 +99,8 @@ def main(argv=None):
     ap.add_argument("--lighting", default="phong", choices=["none", "lambert", "phong"],
                     help="shade albedo with directional lights fixed relative to the camera; 'none' fits plain "
                          "colors")
-    ap.add_argument("--lights", type=int, default=1, choices=[1, 2])
-    ap.add_argument("--light-lr", type=float, default=0.01)
+    ap.add_argument("--lights", type=int, default=1, choices=[1, 2], help="__DUMMY__")
+    ap.add_argument("--light-lr", type=float, default=0.01, help="__DUMMY__")
     ap.add_argument("--coupled-normals", action="store_true",
                     help="let shading gradients reshape the density through the normals")
     ap.add_argument("--supersample", type=int, default=None,
@@ -126,15 +126,15 @@ def main(argv=None):
                     help="take the camera from another fit (its output folder) instead of calibrating: for the "
                          "frames of one animation, so that they share it")
     ap.add_argument("--voxel", type=float, default=1.0, help="voxel size in pixels (0.6 suits thin sprites)")
-    ap.add_argument("--iters", type=int, default=2000)
-    ap.add_argument("--lr", type=float, default=0.05)
+    ap.add_argument("--iters", type=int, default=2000, help="__DUMMY__")
+    ap.add_argument("--lr", type=float, default=0.05, help="__DUMMY__")
     ap.add_argument("--tv", type=float, default=1e-4, help="total-variation weight on density")
     ap.add_argument("--color-tv", type=float, default=1e-4, help="total-variation weight on color")
     ap.add_argument("--sparsity", type=float, default=0.0, help="weight of the per-ray opacity-sum penalty")
     ap.add_argument("--tag", default="", help="suffix for the output folder")
     ap.add_argument("--no-hull", action="store_true", help="don't confine density to the visual hull")
-    ap.add_argument("--out", default="out")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out", default="out", help="__DUMMY__")
+    ap.add_argument("--seed", type=int, default=0, help="__DUMMY__")
     ap.add_argument("--no-evaluate", action="store_true", help="save the fit without scoring it or drawing pictures")
     add_warp_arguments(ap)
     args = ap.parse_args(argv)

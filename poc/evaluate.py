@@ -45,11 +45,11 @@ def add_warp_arguments(ap: argparse.ArgumentParser) -> None:
                     help="how new views fetch colors from the known directions: 'plain' fetches each pixel "
                          "on its own; 'coherent' smooths depth and keeps regions to one direction")
     for name, options in OVERRIDES.items():
-        ap.add_argument("--" + name, default=None, **{**options, "help": "override: " + options["help"]})
+        ap.add_argument("--" + name, default=argparse.SUPPRESS, **{**options, "help": "override: " + options["help"]})
 
 
 def warp_from_args(args) -> Warp:
-    changes = {k: getattr(args, k) for k in OVERRIDES if getattr(args, k) is not None}
+    changes = {k: getattr(args, k) for k in OVERRIDES if hasattr(args, k)}
     return Warp(**{**WARPS[args.warp].__dict__, **changes})
 
 
@@ -326,11 +326,40 @@ def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
     return summary
 
 
+class CombinedFormatter(
+    argparse.RawDescriptionHelpFormatter,
+    argparse.ArgumentDefaultsHelpFormatter,
+    argparse.MetavarTypeHelpFormatter
+):
+    def _get_default_metavar_for_optional(self, action):
+        # If type is None, temporarily mock it as str to get its name safely
+        atype = action.type
+        action.type = str if atype is None else atype
+        result = super()._get_default_metavar_for_optional(action)
+        action.type = atype # Restore original state
+        return result
+
+    def _get_default_metavar_for_positional(self, action):
+        atype = action.type
+        action.type = str if atype is None else atype
+        result = super()._get_default_metavar_for_positional(action)
+        action.type = atype
+        return result
+
+    def _get_help_string(self, action):
+        # If help is __DUMMY__, temporarily mock it as empty
+        ahelp = action.help
+        action.help = "" if ahelp == "__DUMMY__" else ahelp
+        result = super()._get_help_string(action)
+        action.help = ahelp # Restore original state
+        return result
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=CombinedFormatter)
     ap.add_argument("run", help="output folder of a fit (with scene.pt)")
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
-    ap.add_argument("--out", default=None, help="where to write (default: the run's folder)")
+    ap.add_argument("--out", default=argparse.SUPPRESS, help="where to write (default: the run's folder)")
     add_warp_arguments(ap)
     args = ap.parse_args()
     scene = Scene.load(Path(args.run) / "scene.pt", args.mpq)
