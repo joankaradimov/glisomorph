@@ -23,7 +23,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 from poc import fit
-from poc.evaluate import Renderer, add_warp_arguments, warp_from_args, with_shadow
+from poc.evaluate import Renderer, add_warp_arguments, warp_from_args, with_shadow, CombinedFormatter
 from poc.scene import Scene
 from poc.shadow import lowest_row
 from poc.views import PRESETS, frame_count
@@ -94,13 +94,13 @@ def write_gif(frames: list[list[np.ndarray]], palette: np.ndarray, path: Path, s
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=CombinedFormatter)
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
     ap.add_argument("--preset", required=True, choices=sorted(PRESETS))
     ap.add_argument("--frames", type=int, default=None, help="only the first N frames (default: all)")
-    ap.add_argument("--lighting", default="phong", choices=["none", "lambert", "phong"])
-    ap.add_argument("--iters", type=int, default=2000)
-    ap.add_argument("--out", default="out")
+    ap.add_argument("--lighting", default="phong", choices=["none", "lambert", "phong"], help="__DUMMY__")
+    ap.add_argument("--iters", type=int, default=2000, help="__DUMMY__")
+    ap.add_argument("--out", default="out", help="__DUMMY__")
     add_warp_arguments(ap)
     args = ap.parse_args()
 

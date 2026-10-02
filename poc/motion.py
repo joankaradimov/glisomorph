@@ -52,7 +52,7 @@ from gsplat import rasterization
 from poc import fit
 from poc.animate import write_gif, write_sheet
 from poc.edges import clean_edges, edges_over_black
-from poc.evaluate import quantize, score
+from poc.evaluate import quantize, score, CombinedFormatter
 from poc.field import camera_basis, pixel_rays
 from poc.gaussians import DISTANCE, intrinsics, viewmat
 from poc.ramps import Ramps
@@ -503,7 +503,7 @@ def image_loss(colors, alphas, targets, masks, blur: int = 1, snap=None, keyed: 
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=CombinedFormatter)
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
     ap.add_argument("--preset", required=True, choices=sorted(PRESETS))
     ap.add_argument("--hide-direction", type=int, default=None, help="leave this direction out of every frame")
@@ -554,7 +554,7 @@ def main():
                     help="a saved motion.pt to score and draw again, instead of tracking and refining")
     ap.add_argument("--no-sheet", action="store_true", help="score, but skip the 16-direction sheet and GIF")
     ap.add_argument("--tag", default="", help="suffix for the output folder")
-    ap.add_argument("--out", default="out")
+    ap.add_argument("--out", default="out", help="__DUMMY__")
     args = ap.parse_args()
     if args.still_supersample is None:
         args.still_supersample = args.supersample
