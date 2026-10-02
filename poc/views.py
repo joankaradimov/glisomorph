@@ -1,8 +1,11 @@
 """Diablo 1 sprites as turntable views: one image per facing direction, each with its yaw."""
 
 from dataclasses import dataclass
+from pathlib import Path
 
+import os
 import numpy as np
+from typing import BinaryIO
 
 from blizzard_common.mpq import MpqArchive
 from diablo1.palette import load_pal
@@ -46,6 +49,28 @@ PRESETS = {
     "skeleton": Preset("monsters/skelaxe/sklaxn.cl2", 128, "sheet", shadows=True),
 }
 
+class AssetReader:
+    """Read assets from an MPQ archive or directly from a directory."""
+
+    def __init__(self, path: str, offset: int | None = None):
+        self.folder = path
+        self.mpq = None if os.path.isdir(path) else MpqArchive(path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return
+
+    def read(self, name: str) -> bytes:
+        if self.mpq is None:
+            file = BinaryIO = open(Path(self.folder) / name, "rb")
+            data = file.read()
+            file.close()
+        else:
+            data = self.mpq.read(name)
+        return data
+
 
 def _frame_to_array(frame: Frame) -> np.ndarray:
     return np.array([-1 if p is None else p for p in frame.pixels], dtype=np.int16).reshape(
@@ -57,14 +82,14 @@ def frame_count(mpq_path: str, preset: Preset) -> int:
     direction)."""
     if preset.layout == "frames":
         return 1
-    with MpqArchive(mpq_path) as mpq:
+    with AssetReader(mpq_path) as mpq:
         path = preset.path if preset.layout == "sheet" else preset.path.format(1)
         return len(load_cl2(mpq.read(path), preset.width)[0])
 
 
 def load_views(mpq_path: str, preset: Preset) -> tuple[list[View], np.ndarray]:
     """The views, in increasing yaw, and the palette (256, 3) as floats in [0, 1]."""
-    with MpqArchive(mpq_path) as mpq:
+    with AssetReader(mpq_path) as mpq:
         palette = np.array(load_pal(mpq.read("levels/towndata/town.pal")), dtype=np.float32) / 255
         if preset.layout == "sheet":
             groups = load_cl2(mpq.read(preset.path), preset.width)
