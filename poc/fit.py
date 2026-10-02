@@ -61,23 +61,24 @@ def split_indices(n: int, split: str) -> tuple[list[int], list[int]]:
     raise ValueError(split)
 
 
-def calibrate(field, views, masks, yaws, device, elevations, offsets):
-    """Pick the elevation and pivot offset whose visual hull best explains every silhouette."""
+def calibrate(field, frames, yaws, device, elevations, offsets):
+    """Pick the elevation and pivot offset whose visual hulls best explain every silhouette: frames is a list
+    of (views, masks), each carved into a hull of its own (one pose each), all seen by one camera."""
     best = (0.0, None, None)
-    allowed = allowed_masks(masks)
+    allowed = [allowed_masks(masks) for _, masks in frames]
     for elev_deg in elevations:
         elev = torch.tensor(math.radians(elev_deg), device=device)
         right, up, _ = camera_basis(yaws, elev)
         for off in offsets:
-            inside = carve(field, allowed, views, right, up, off)
-            if not inside.any():
-                continue
-            projected = silhouettes(inside, field, views, right, up, off)
             covered = total = 0
-            for m, p in zip(masks, projected):
-                solid = m == 1
-                covered += int((p & solid).sum())
-                total += int(solid.sum())
+            for (views, masks), allow in zip(frames, allowed):
+                inside = carve(field, allow, views, right, up, off)
+                projected = silhouettes(inside, field, views, right, up, off) if inside.any() else [
+                    torch.zeros_like(m, dtype=torch.bool) for m in masks]
+                for m, p in zip(masks, projected):
+                    solid = m == 1
+                    covered += int((p & solid).sum())
+                    total += int(solid.sum())
             score = covered / max(total, 1)
             if score > best[0]:
                 best = (score, elev_deg, off)
@@ -125,6 +126,9 @@ def main(argv=None):
     ap.add_argument("--camera", default=None,
                     help="take the camera from another fit (its output folder) instead of calibrating: for the "
                          "frames of one animation, so that they share it")
+    ap.add_argument("--calibrate-with", nargs="*", default=[], metavar="PRESET:FRAME",
+                    help="calibrate on these frames' silhouettes too (other frames and animations of the same "
+                         "model): one camera for all, less noisy than one frame's")
     ap.add_argument("--voxel", type=float, default=1.0, help="voxel size in pixels (0.6 suits thin sprites)")
     ap.add_argument("--iters", type=int, default=2000)
     ap.add_argument("--lr", type=float, default=0.05)
@@ -156,11 +160,21 @@ def main(argv=None):
                                         args.model)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # A box generous enough for any elevation we try.
-    width = max(v.shape[1] for v in views)
+    # Other frames to calibrate with (--calibrate-with), in the same directions.
+    others = []
+    for spec in args.calibrate_with:
+        name, frame = spec.rsplit(":", 1)
+        other = dataclasses.replace(PRESETS[name], frame=int(frame))
+        other_views = load_views(args.mpq, other)[0]
+        other_masks = masks_for(other_views, other.shadows, device)
+        others.append(([other_views[i] for i in train], [other_masks[i] for i in train]))
+
+    # A box generous enough for any elevation we try, and every frame calibrated on.
+    every_view = views + [v for other_views, _ in others for v in other_views]
+    width = max(v.shape[1] for v in every_view)
     radius = width / 2 + 4
-    top = max(v.pivot[1] for v in views)
-    bottom = max(v.shape[0] - v.pivot[1] for v in views)
+    top = max(v.pivot[1] for v in every_view)
+    bottom = max(v.shape[0] - v.pivot[1] for v in every_view)
     theta = math.radians(40)
     box_min = [-radius, -(bottom + radius * math.sin(theta)) / math.cos(theta), -radius]
     box_max = [radius, (top + radius * math.sin(theta)) / math.cos(theta), radius]
@@ -181,20 +195,21 @@ def main(argv=None):
         print("camera from %s: yaw sign %+d, elevation %.1f deg, pivot offset %s" % (args.camera, sign, elev_deg, off))
     else:
         coarse = VoxelField(box_min, box_max, 1.0, device)
+        frames = [(train_views, train_masks)] + others
         offsets = [(dx, dy) for dx in (-2, -1, 0, 1, 2) for dy in range(-6, 7, 2)]
         candidates_by_sign = {}
         for sign in (1, -1):
-            candidates_by_sign[sign] = calibrate(coarse, train_views, train_masks, sign * train_yaws, device,
-                                                 range(20, 41, 2), offsets)
+            candidates_by_sign[sign] = calibrate(coarse, frames, sign * train_yaws, device, range(20, 41, 2), offsets)
         sign = max(candidates_by_sign, key=lambda s: candidates_by_sign[s][0])
         _, elev_deg, off = candidates_by_sign[sign]
         fine_offsets = [(off[0] + dx, off[1] + dy) for dx in (-0.5, 0, 0.5) for dy in (-1, 0, 1)]
-        best = calibrate(coarse, train_views, train_masks, sign * train_yaws, device,
+        best = calibrate(coarse, frames, sign * train_yaws, device,
                          [elev_deg + d for d in (-1.5, -1, -0.5, 0, 0.5, 1, 1.5)], fine_offsets)
         coverage, elev_deg, off = best
-        print("calibration: yaw sign %+d (coverage %.3f vs %.3f mirrored), elevation %.1f deg, pivot offset %s, "
-              "coverage %.3f (%.0fs)" % (sign, candidates_by_sign[sign][0], candidates_by_sign[-sign][0],
-                                         elev_deg, off, coverage, time.time() - t0))
+        print("calibration%s: yaw sign %+d (coverage %.3f vs %.3f mirrored), elevation %.1f deg, pivot offset %s, "
+              "coverage %.3f (%.0fs)" % (" on %d frames" % len(frames) if others else "", sign,
+                                         candidates_by_sign[sign][0], candidates_by_sign[-sign][0], elev_deg, off,
+                                         coverage, time.time() - t0))
     yaws = sign * yaws
     elev = torch.tensor(math.radians(elev_deg), device=device)
     right, up, _ = camera_basis(yaws, elev)
