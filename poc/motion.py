@@ -130,6 +130,20 @@ def catmull_rom(points, phase, quaternions: bool = False):
     return F.normalize(out, dim=-1) if quaternions else out
 
 
+def catmull_rom_open(points, phase, quaternions: bool = False):
+    """Catmull-Rom interpolation through points (N, ...) at a phase in [0, N - 1), not around a loop:
+    the ends held. As catmull_rom otherwise."""
+    n = points.shape[0]
+    k = min(int(math.floor(phase)), n - 2)
+    t = phase - k
+    p0, p1, p2, p3 = (points[i] for i in (max(k - 1, 0), k, k + 1, min(k + 2, n - 1)))
+    if quaternions:
+        p0, p2, p3 = (same_hemisphere(p, p1) for p in (p0, p2, p3))
+    out = 0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t ** 2
+                 + (-p0 + 3 * p1 - 3 * p2 + p3) * t ** 3)
+    return F.normalize(out, dim=-1) if quaternions else out
+
+
 def farthest_points(points, count: int):
     """Indices of `count` points spread over the set by farthest point sampling."""
     chosen = torch.zeros(count, dtype=torch.long, device=points.device)
@@ -332,9 +346,10 @@ class MovingGaussians(torch.nn.Module):
         identity = torch.tensor([1.0, 0, 0, 0], device=centers.device)
         self.node_quats = torch.nn.Parameter(identity.repeat(frames, nodes, 1))
         self.node_moves = torch.nn.Parameter(torch.zeros((frames, nodes, 3), device=centers.device))
-        # The slots' animations, as (first slot, slots): a phase between frames interpolates within its
-        # own animation, looping around it. One animation by default.
-        self.spans = [(0, frames)]
+        # The slots' animations, as (first slot, slots, then): a phase between frames interpolates within
+        # its own animation, looping around it, or, after its last frame, toward slot `then` (an animation
+        # that returns to another's state; None loops). One animation by default.
+        self.spans = [(0, frames, None)]
         # Tied into a skeleton (tie), node_quats and node_moves are the pieces' instead, about their
         # centers, and each node takes its piece's.
         self.register_buffer("node_group", None)
@@ -365,8 +380,11 @@ class MovingGaussians(torch.nn.Module):
         """Per-slot values (slots, ...) at a phase between slots: periodic Catmull-Rom within the
         animation the phase falls in (spans)."""
         phase = phase % values.shape[0]
-        start, n = next((s, n) for s, n in self.spans if s <= math.floor(phase) < s + n)
-        return catmull_rom(values[start:start + n], phase - start, quaternions=quaternions)
+        start, n, then = next((s, n, t) for s, n, t in self.spans if s <= math.floor(phase) < s + n)
+        if then is None:
+            return catmull_rom(values[start:start + n], phase - start, quaternions=quaternions)
+        return catmull_rom_open(torch.cat([values[start:start + n], values[then:then + 1]]), phase - start,
+                                quaternions=quaternions)
 
     def node_pose(self, phase: float):
         """The nodes' unit quaternions (M, 4) and translations (M, 3) at a phase in model frames."""
@@ -613,7 +631,7 @@ class MovingGaussians(torch.nn.Module):
         """Node paths around each animation's loop: squared second differences of translations and
         quaternions."""
         total = 0.0
-        for start, n in self.spans:
+        for start, n, _ in self.spans:
             m = self.node_moves[start:start + n]
             q = F.normalize(self.node_quats[start:start + n], dim=-1)
             accel = (m.roll(-1, 0) - 2 * m + m.roll(1, 0)).square().sum(-1).mean()
@@ -934,9 +952,9 @@ def main():
     many = len(anims) > 1
 
     # 1. Every fitted frame as a still; frame 0 calibrates the camera, and the others share it. With several
-    #    animations, frame 0 is calibrated on every fitted frame of all of them (one camera; calibrated on
-    #    one frame alone, the stand and the attack came out half a degree apart), and their stills are
-    #    saved apart ("-joint-<animations>").
+    #    animations, frame 0 is calibrated on up to 4 frames of each of them (one camera; calibrated on one
+    #    frame alone, the stand and the attack came out half a degree apart), and their stills are saved
+    #    apart ("-joint-<animations>").
     joint = "-joint-" + "+".join(names) if many else ""
 
     def still(a, k, camera=None):
@@ -954,8 +972,9 @@ def main():
                 "--no-evaluate", "--edges", args.edges] + (["--iters", str(iters)] if iters else [])
         if camera:
             argv += ["--camera", str(camera)]
-        elif many:
-            argv += ["--calibrate-with"] + ["%s:%d" % (b.name, j) for b, j in slots if b is not a or j != k]
+        elif many:  # up to 4 frames of each animation, evenly spaced
+            argv += ["--calibrate-with"] + ["%s:%d" % (b.name, j) for b in anims
+                                            for j in b.frames[::max(1, len(b.frames) // 4)][:4] if b is not a or j != k]
         return fit.main(argv)
 
     still_scene, still_dir = still(base, 0)
@@ -978,14 +997,14 @@ def main():
         a.origins = torch.stack([pixel_rays(a.h, a.w, a.pivot, offset, right[d], up[d], forward[d])[0]
                                  for d in train_dirs])
 
-    def overlap(a, b):
-        """How much of their silhouettes animations a's and b's frames 0 share (IoU), placed by their ground
-        points, over the fitted directions."""
+    def overlap(a, b, k=0):
+        """How much of their silhouettes animation a's frame k and b's frame 0 share (IoU), placed by their
+        ground points, over the fitted directions."""
         ious = []
         for d in train_dirs:
             placed = []
-            for x in (a, b):
-                v = x.views[0][d]
+            for x, f in ((a, k), (b, 0)):
+                v = x.views[f][d]
                 m = masks_for([v], x.preset.shadows, device)[0] == 1
                 canvas = torch.zeros((256, 256), dtype=torch.bool, device=device)
                 y0, x0 = 128 - int(v.pivot[1]), 128 - int(v.pivot[0])
@@ -997,12 +1016,15 @@ def main():
     # The animations' graph: an animation whose frame 0 is the first one's frame 0 (the attack starts from
     # the stand, 0.94 of their silhouettes in common) keeps that frame at the rest pose, one state that
     # both pass through, the hub. One that never passes through it (the walk) starts by every node's jump
-    # to where transport takes it.
+    # to where transport takes it. One that starts apart but ends near the hub (the hit: a flinch, 0.61,
+    # recovering to 0.75) goes on to it after its last frame, rather than back to its first.
     for a in anims:
         a.hub = a is not base and overlap(a, base) >= 0.9
+        a.returns = a is not base and not a.hub and overlap(a, base, a.count - 1) >= 0.7
         if a is not base:
-            print("%s's frame 0 shares %.2f of its silhouette with %s's: %s" % (
-                a.name, overlap(a, base), base.name, "the hub, held at the rest pose" if a.hub else "apart"))
+            print("%s's frame 0 shares %.2f of its silhouette with %s's, its last frame %.2f: %s" % (
+                a.name, overlap(a, base), base.name, overlap(a, base, a.count - 1),
+                "the hub, held at the rest pose" if a.hub else "apart, returning to the hub" if a.returns else "apart"))
 
     def model_indices(v, a, redraw=True):
         """A view's palette indices where the model is (-1 elsewhere: the background, a baked shadow), its
@@ -1038,7 +1060,7 @@ def main():
             print("rigid part %d: %d Gaussians" % (k, int((parts == k).sum())))
     model = MovingGaussians(still_scene.field, len(slots), nodes=args.nodes, lit=args.lighting != "none",
                             supersample=args.supersample, parts=parts)
-    model.spans = [(a.start, len(a.frames)) for a in anims]
+    model.spans = [(a.start, len(a.frames), 0 if a.returns else None) for a in anims]
     if args.load:
         saved = torch.load(args.load, map_location=device)["model"]
         saved.setdefault("parts", torch.full((len(model.means0),), -1, dtype=torch.long, device=device))

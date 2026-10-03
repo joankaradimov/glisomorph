@@ -816,14 +816,19 @@ The animations make a graph. Against the stand's frame 0 (silhouettes in common,
 directions), the attack (0.94), the lightning cast (0.93), the fire cast (0.82) and the magic cast
 (0.77) start there and come back toward it, and the hit recovers into it (0.75 at its last frame): the
 stand's frame 0 is a hub they pass through. The walk never does (0.45 to 0.48 at every frame), nor do
-the town's stand and walk (0.36 to 0.41): loops of their own.
+the town's stand and walk (0.36 to 0.41): loops of their own. The hit starts apart (a flinch, 0.61)
+and ends near the hub, so after its last frame it goes on to the hub, not back to its first: an
+animation whose last frame shares 0.7 of its silhouette with the first one's frame 0 is drawn into it
+(the in-between after its last frame, `warrior-hit` among the presets).
 
 Fitted as one, naively, every animation came out worse than fitted alone. Three things closed the gap:
 
 - **One camera, calibrated on every frame:** calibrated on its own frame 0, the stand came out at
   25.5°, the attack at 26.0°, and a model shared under the stand's camera fitted the attack's
   silhouettes worse (0.892 against 0.919). Calibrated on all 17 fitted frames at once (fit.py
-  `--calibrate-with`), the camera is the attack's.
+  `--calibrate-with`), the camera is the attack's. It's calibrated on up to 4 frames of each
+  animation, which take about 20 seconds each; with the hit too, on 16 frames, it came out at 26.5°:
+  every camera within half a degree explains the silhouettes about as well.
 - **The hub held:** an animation whose frame 0 shares 0.9 of its silhouette with the first one's (the
   attack) keeps that frame at the rest pose, one state both pass through.
 - **A jump for the others:** an animation apart from the hub (the walk) starts with every node's jump
