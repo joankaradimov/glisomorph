@@ -5,6 +5,7 @@ format, and references that aren't specific to one game. Read this before a game
 
 - [Diablo 1](../../diablo1/docs/AGENTS.md)
 - [Diablo 2](../../diablo2/docs/AGENTS.md)
+- [StarCraft](../../starcraft/docs/AGENTS.md)
 
 ## This folder
 
@@ -39,7 +40,7 @@ It's laid out like a game folder:
 
 | Format | Spec | What it is | Status |
 |--------|------|------------|--------|
-| MPQ | [mpq.md](filespecs/mpq.md) | Blizzard's archive format, including PKWARE DCL | specified; checked on Diablo 1 and Diablo II |
+| MPQ | [mpq.md](filespecs/mpq.md) | Blizzard's archive format, including PKWARE DCL | specified; checked on Diablo 1, Diablo II and StarCraft |
 
 ## References
 
