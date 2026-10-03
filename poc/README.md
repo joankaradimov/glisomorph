@@ -269,9 +269,8 @@ One rule for everything: it reproduces the originals' shadows at 0.944 IoU over 
 warrior, rogue, zombie and skeleton standing, the warrior's and the zombie's walks and the warrior's
 attack, every frame, all 8 directions), the worst cell at 0.87. New cells get their shadows the same
 way, from their own outlines; a new direction's ground row comes from its own first frame. (Black
-pixels inside the model are part of its texture, so only groups of index-0 pixels that touch the
-background count as an original's shadow.) So a shadow tells nothing about the shape that its own
-sprite doesn't.
+pixels of the model are part of its texture, not shadow: see Black texture below.) So a shadow tells
+nothing about the shape that its own sprite doesn't.
 
 **How it was found.** The shadows were first cast in 3D, by a light that turned with the camera, found
 by searching for the shadows that best match the originals': a ground point was shaded if the
@@ -299,6 +298,21 @@ contacts would catch some of them, but also some of the straps.
 
 The fitted directions gain most, their silhouettes no longer holed by the straps: 0.977 to 0.987 IoU
 with voxels. Other tables in this README predate the fix.
+
+**Black texture at the edge.** Black lines that reach the model's edge touch the background too: a
+strap across the chest or the back, a belt, a seam at the shoulder. Taken for shadow, they made the
+model transparent there, and renders showed holes: the shared model of the warrior's stand, walk,
+attack and hit (see Several animations, one model) left 369 of the 871 such pixels in its known cells
+open. So the shadow must also lie where the rule puts it, within 3 pixels (`baked_shadow`). The
+rule's ground row is the first frame's lowest row, which one cell doesn't know: in a walk, the feet
+leave the ground, and the cell's own lowest row dropped the shadow under them. So it's the row,
+within 12 of the cell's lowest, whose shadow best matches the index-0 pixels that touch the
+background: the first frame's ground row in all 856 cells of the warrior's, rogue's, zombie's and
+skeleton's animations. The test now keeps 871 fewer of the warrior's 84,904 index-0 pixels that
+touch the background, and 5 fewer of the 108,815 of the rogue, zombie and skeleton, which have no
+black texture. Refitted, the shared model leaves 2 of the 871 open, and its scores on the known
+cells barely move. (Against the new test, the rule's IoU is 0.947 and its worst cell 0.89, partly
+because the test uses the rule.)
 
 **Results** (IoU with the originals' shadows, warrior standing, SW hidden):
 

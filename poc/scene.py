@@ -18,8 +18,8 @@ def masks_for(views: list[View], shadows: bool, device) -> list[torch.Tensor]:
     """1 where the model is seen, 0 elsewhere.
 
     A baked shadow (index 0 on a character) is on the ground, and the model doesn't cover it, so it
-    counts as transparent. Black pixels inside the model (index 0 not touching the background, see
-    shadow.baked_shadow) are part of its texture, and stay.
+    counts as transparent. Black pixels of the model (index 0 that doesn't touch the background, or
+    isn't where the shadow falls: see shadow.baked_shadow) are part of its texture, and stay.
     """
     out = []
     for v in views:
