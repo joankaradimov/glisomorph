@@ -35,7 +35,8 @@ motion, interpolated as one between frames.
 3. The rest shape and the colors are then refitted to all frames at once, through the tracked
    motion: as parts move, the frames show them from more directions than frame 0 alone. With the
    lighting model (the default), colors are albedo, shaded by a light fixed to the camera, held where
-   the voxel fits find it.
+   the voxel fits find it. Colors and outlines are kept smooth between the originals' pixels (--tv,
+   --color-smooth, --outline-tv), so that the model renders cleanly larger.
 
 A phase between frames interpolates the node poses periodically (Catmull-Rom). A new cell of the
 torus takes the artist's pixels (PixelCopier): its surface points are moved to nearby original frames
@@ -884,19 +885,19 @@ def main():
                     help="what the joint refinement changes: the colors (and highlights) only; also the rest "
                          "shape, fitted to every frame through the tracked motion; or also the motion, the "
                          "opacities and per-frame corrections, which fit the known cells closer but copy worse")
-    ap.add_argument("--tv", type=float, default=0.0,
+    ap.add_argument("--tv", type=float, default=0.005,
                     help="in the refinement, weight of the samples' total variation (sample_variation): flat "
                          "patches of color between edges, for a clean look at the samples' resolution, 4x "
-                         "(0: none; 0.005 suits the zombie)")
+                         "(0: none)")
     ap.add_argument("--edges", default="black", choices=["black", "inside", "none"],
                     help="fit colors to the originals with their edges' share of the background they were drawn "
                          "over taken out (edges.py): redrawn over black, given an inside neighbour's color, or kept "
                          "('none'). Rendered larger, the model's edges then show no bluish rim. The copier keeps "
                          "the originals' edges: the sheet's new cells sit beside original ones")
-    ap.add_argument("--outline-tv", type=float, default=0.0,
+    ap.add_argument("--outline-tv", type=float, default=0.02,
                     help="in the refinement, weight of the samples' coverage's total variation "
                          "(coverage_variation): smooth outlines, without needles (0: none)")
-    ap.add_argument("--color-smooth", type=float, default=0.0,
+    ap.add_argument("--color-smooth", type=float, default=0.2,
                     help="in the refinement, weight of each Gaussian's albedo pulled toward its 8 nearest "
                          "Gaussians' (color_smoothness): even colors along thin parts (0: none)")
     ap.add_argument("--snap", type=float, default=0.0,

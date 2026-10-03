@@ -988,7 +988,7 @@ saved models, as `--scale` below does):
 
 Pulling colors together evens out only the albedo; lit, each Gaussian's normal still shades it a
 little differently. Total variation, on the shaded samples, smooths both. It costs the 1x sheets
-about a point of copied pixels, so it's off by default: it's for rendering larger.
+about a point of copied pixels.
 
 **Edges.** At 4x, a thin blue-gray line ran around the sprite. It's in the originals: they were
 rendered over a dark blue-gray background before it was keyed out, and their edge pixels kept a
@@ -1032,8 +1032,15 @@ hundreds of small Gaussians each fit a few pixels of a staircase that shifts fro
 
 Together, with `--tv 0.005`, they cost the attack's hidden frames little at 1x (copied pixels 36.9%
 exact against 37.2%, own colors 32.1% against 33.5%; the fitted cells' own colors 39.1% against
-44.0%), so they're options for rendering larger. The blade's outline needs something else: drawn as
-a line, or made of flat Gaussians.
+44.0%). The blade's outline needs something else: drawn as a line, or made of flat Gaussians.
+
+**They're the defaults:** `--tv 0.005 --color-smooth 0.2 --outline-tv 0.02` (0 turns each off).
+Without them, the shared model of the warrior's stand, walk, attack and hit (see Several animations,
+one model) came out as scaly at 4x as any plain fit: 30% speckle, against 8% with them, refined
+from the same tracking. They cost its fitted cells 5 to 8 points of exact own colors at 1x (the
+stand 57.0% to 49.3%, the hit 50.9% to 44.9%), but the sheets' new cells are copied pixels, and 2x
+and 4x show nothing but the model's own colors. The fits elsewhere in this README were made without
+them.
 
 Blurring and sharpening again didn't give a clean look:
 
@@ -1071,10 +1078,10 @@ as `directions-4x.gif`, four directions to a row. Every cell is the model's, as 
 originals at that size: its own colors, one sample per pixel where that's the fit's own grid, or
 with `--scale-colors copied`, copied pixels, from the originals with their edges redrawn. Shadows
 follow the 2D rule, their offset grown with the scale. A saved model draws again without fitting
-(`--load`, in half a minute for the zombie's walk in its own colors). For the look above:
+(`--load`, in half a minute for the zombie's walk in its own colors). With the defaults' look above:
 
 ```
-python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset zombie-walk --tv 0.005 --scale 4
+python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset zombie-walk --scale 4
 ```
 
 ## Next steps
