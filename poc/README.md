@@ -854,7 +854,9 @@ iterations of refinement; shared, 10000 (about as many per frame as alone).
 - **Its skeleton has more pieces** than any animation's alone (104), as a piece has to move as one in
   every frame of every animation.
 - **It takes** as long as the animations alone together, and the calibration on every frame (6
-  minutes for 17).
+  minutes for 17). A fit stopped on the way takes up where it was with `--resume`: the model is saved
+  once tracked (tracked.pt), and again once refined (motion.pt), before the pictures, which `--load`
+  draws again.
 
 #### Supersampled
 

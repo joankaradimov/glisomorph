@@ -915,6 +915,9 @@ def main():
                          "frame), then track each frame again, piece by piece (0: leave the nodes apart)")
     ap.add_argument("--load", default=None,
                     help="a saved motion.pt to score and draw again, instead of tracking and refining")
+    ap.add_argument("--resume", action="store_true",
+                    help="take up a fit that was stopped: if its output folder has the tracked model (tracked.pt, "
+                         "saved once tracking ends), refine and draw it rather than track again")
     ap.add_argument("--no-sheet", action="store_true", help="score, but skip the 16-direction sheet and GIF")
     ap.add_argument("--scale", type=int, default=1,
                     help="also draw the 16 directions by twice the frames this many times larger, as a GIF "
@@ -1061,13 +1064,21 @@ def main():
     model = MovingGaussians(still_scene.field, len(slots), nodes=args.nodes, lit=args.lighting != "none",
                             supersample=args.supersample, parts=parts)
     model.spans = [(a.start, len(a.frames), 0 if a.returns else None) for a in anims]
-    if args.load:
-        saved = torch.load(args.load, map_location=device)["model"]
+    checkpoint = out_dir / "tracked.pt"  # the model once tracked, before refining (--resume)
+    tracked = bool(args.load) or (args.resume and checkpoint.exists())
+    if tracked:
+        saved = torch.load(args.load or checkpoint, map_location=device)["model"]
         saved.setdefault("parts", torch.full((len(model.means0),), -1, dtype=torch.long, device=device))
         if "node_group" in saved:
             model.tie(saved["node_group"])
         model.load_state_dict(saved)
+        if not args.load:
+            print("resumed from", checkpoint)
     print("%d Gaussians, %d nodes %.1f pixels apart" % (len(model.means0), args.nodes, model.spacing))
+
+    def save(path):
+        torch.save({"model": model.state_dict(), "frames": [k for _, k in slots],
+                    "animations": [(a.name, a.frames) for a in anims]}, path)
 
     def only_slot(j):
         """Zero the gradients of every frame's node poses but slot j's."""
@@ -1118,7 +1129,7 @@ def main():
                 return False
         return True
 
-    for j in range(1, 1 if args.load else len(slots)):  # a loaded model is tracked already
+    for j in range(1, 1 if tracked else len(slots)):  # a loaded or resumed model is tracked already
         t0 = time.time()
         a = slots[j][0]
         if j == a.start and a.hub:
@@ -1177,7 +1188,7 @@ def main():
     # With --skeleton, the nodes are then tied into the pieces they move as (skeleton), over every
     # animation's frames, and each frame is tracked again, piece by piece, from the pieces' fit to their
     # nodes. Between frames a piece's one rigid motion is interpolated, rather than each of its nodes'.
-    if args.skeleton and not args.load:
+    if args.skeleton and not tracked:
         groups = skeleton(model, len(slots), args.skeleton)
         model.tie(groups)
         sizes = torch.bincount(groups).tolist()
@@ -1207,6 +1218,9 @@ def main():
                         break
             print("tracked %s again, by pieces: loss %.5f, %d iterations (%.0fs)" % (
                 frame_name(j), fit_loss.item(), step + 1, time.time() - t0))
+
+    if not tracked:
+        save(checkpoint)
 
     # 3. The rest shape and colors, refitted to every frame at once through the tracked motion: frame 0's
     #    still saw the model from 8 directions, but as parts move, the other frames show them from more.
@@ -1258,6 +1272,8 @@ def main():
         if it % 500 == 0 or it == args.refine_iters - 1:
             print("refine %5d  loss %.5f  (%.0fs)" % (it, loss.item(), time.time() - t0))
     model.keep_samples, model.last_samples = False, None
+    if not args.load:
+        save(out_dir / "motion.pt")  # refined: drawn again with --load if what follows is stopped
 
     # 4. Scores and pictures, per animation.
     pal = (palette.cpu().numpy() * 255).round().astype(np.uint8)
@@ -1439,8 +1455,7 @@ def main():
     else:
         summary.update(reports[0])
     (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
-    torch.save({"model": model.state_dict(), "frames": [k for _, k in slots],
-                "animations": [(a.name, a.frames) for a in anims]}, out_dir / "motion.pt")
+    save(out_dir / "motion.pt")
     print("wrote", out_dir, "(%.0fs)" % (time.time() - t_start))
 
 
