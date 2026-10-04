@@ -1042,11 +1042,14 @@ def main():
     # The animations' graph: an animation whose frame 0 is the first one's frame 0 (the attack starts from
     # the stand, 0.94 of their silhouettes in common) keeps that frame at the rest pose, one state that
     # both pass through, the hub. One that never passes through it (the walk) starts by every node's jump
-    # to where transport takes it. One that starts apart but ends near the hub (the hit: a flinch, 0.61,
-    # recovering to 0.75) goes on to it after its last frame, rather than back to its first.
+    # to where transport takes it. One that starts apart but ends near the hub, nearer than to its own
+    # start (the hit: a flinch, 0.61, recovering to 0.75, against 0.70), goes on to it after its last
+    # frame, rather than back to its first. A walk that ends as near its own start loops (the town walk,
+    # with the town stand as the hub: 0.76, against 0.77).
     for a in anims:
         a.hub = a is not base and overlap(a, base) >= 0.9
-        a.returns = a is not base and not a.hub and overlap(a, base, a.count - 1) >= 0.7
+        a.returns = (a is not base and not a.hub and overlap(a, base, a.count - 1) >= 0.7
+                     and overlap(a, base, a.count - 1) > overlap(a, a, a.count - 1))
         if a is not base:
             print("%s's frame 0 shares %.2f of its silhouette with %s's, its last frame %.2f: %s" % (
                 a.name, overlap(a, base), base.name, overlap(a, base, a.count - 1),

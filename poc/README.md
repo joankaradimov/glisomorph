@@ -830,11 +830,14 @@ The animations make a graph. Against the stand's frame 0 (silhouettes in common,
 directions), the attack starts there (0.94) and the hit recovers into it (0.75 at its last frame): the
 stand's frame 0 is a hub they pass through. The casts start near it (the lightning cast 0.93, the fire
 cast 0.82, the magic cast 0.77, the three cleaned into one 0.89: see [Casts](#casts-without-their-spells))
-but end apart (0.40 to 0.57), and the walk never comes near (0.45 to 0.48 at every frame), nor do the
-town's stand and walk (0.36 to 0.41): loops of their own. The hit starts apart (a flinch, 0.61) and
-ends near the hub, so after its last frame it goes on to the hub, not back to its first: an animation
-whose last frame shares 0.7 of its silhouette with the first one's frame 0 is drawn into it (the
-in-between after its last frame, `warrior-hit` among the presets).
+but end apart (0.40 to 0.57), and the walk never comes near (0.45 to 0.48 at every frame): loops of
+their own. The town's stand and walk (0.36 to 0.41) are a graph of their own (see
+[The town's animations](#the-towns-animations)). The hit starts apart (a flinch, 0.61) and ends near
+the hub, so after its last frame it goes on to the hub, not back to its first: an animation whose last
+frame shares 0.7 of its silhouette with the first one's frame 0, and more than with its own frame 0
+(the hit: 0.75, against 0.70), is drawn into it (the in-between after its last frame, `warrior-hit`
+among the presets). The town walk ends as near its own start as the town stand's (0.77, against 0.76),
+and loops.
 
 Fitted as one, naively, every animation came out worse than fitted alone. Three things closed the gap:
 
@@ -911,6 +914,41 @@ skeleton has 75 pieces.
 
 ```
 python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand warrior-walk warrior-attack warrior-hit warrior-cast --refine-iters 18000
+```
+
+#### The town's animations
+
+In town, the game draws a stand of its own (20 frames) and a walk (8) instead of the dungeon's
+(`warrior-town-stand`, `warrior-town-walk`). They're no part of the dungeon's graph, and not alike:
+
+- **The sword is sheathed:** no blade, only the scabbard.
+- **They're lit darker:** their colors' mean luminance is 40, against 47 for every dungeon animation,
+  lower in every channel.
+- **They're drawn about 0.4 pixels to the right**, in every direction: their visual hulls explain them
+  best that far from where the dungeon animations' do.
+
+Fitted into the dungeon's model, its shape and colors kept and only their poses tracked, their
+silhouettes came to 0.87 to 0.88 IoU, against 0.92 to 0.95 for the dungeon animations it was fitted
+on. Each with its own light, place across, and the blade hidden (tried on the first frame, tracked both
+ways, kept if the frame fit 3% better without it), and refined with all seven animations, they came to
+0.94 to 0.95. But their in-betweens and new directions came out garbled: bent from the dungeon's rest
+pose, the arm raised and the sword drawn, into the town's, the arm down, the shoulder folds into the
+torso, its outline right but its surface not, and pixels are copied from the wrong places. And one set
+of colors for both costs the dungeon's animations 2 to 4 points of exact pixels.
+
+A model of their own, the town stand's frame 0 its rest pose, has none of that, and its in-betweens
+and new directions come out as clean as the dungeon's:
+
+| Fitted cells: IoU / exact / RGB error | In the dungeon's model | A model of their own |
+|---|---|---|
+| Town stand | 0.946 / 35.3% / 9.2 | 0.971 / 51.0% / 6.1 |
+| Town walk | 0.940 / 33.0% / 10.0 | 0.959 / 44.8% / 7.2 |
+
+Its skeleton has 62 pieces, against 163 for the dungeon's and town's together. So a variant is a model
+per graph: the dungeon's animations, and the town's.
+
+```
+python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-town-stand warrior-town-walk --refine-iters 8400
 ```
 
 #### Supersampled
@@ -1127,11 +1165,11 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset zombie-walk --scale 4
 
 ## Next steps
 
-- **Animations:** the warrior with a sword's stand, walk, attack, hit and casts make one model; the
-  attack's sword swing needed the tracking of [Fast motion](#fast-motion). The town's stand and walk,
-  deaths (only the unarmed variants have one) and the other variants and characters are still to be
-  seen; every animation needs its own preset, with its frame width, and other variants' casts drift
-  apart otherwise (see [diablo1/casts](../diablo1/casts/README.md#the-drift)).
+- **Animations:** the warrior with a sword's stand, walk, attack, hit and casts make one model, and
+  its town stand and walk another; the attack's sword swing needed the tracking of
+  [Fast motion](#fast-motion). Deaths (only the unarmed variants have one) and the other variants and
+  characters are still to be seen; every animation needs its own preset, with its frame width, and
+  other variants' casts drift apart otherwise (see [diablo1/casts](../diablo1/casts/README.md#the-drift)).
 - **Surfaces frame 0 hides:** the rest shape has only frame 0's Gaussians, refitted. Surfaces that
   only other frames show (the inside of an arm, the far side of a blade) could get Gaussians of
   their own. Densifying in the rest pose from every frame's views (gsplat's strategy, clones and

@@ -52,6 +52,9 @@ PRESETS = {
     "warrior-walk": Preset("plrgfx/warrior/wls/wlsaw.cl2", 96, "sheet", shadows=True),  # 8 frames
     "warrior-attack": Preset("plrgfx/warrior/wls/wlsat.cl2", 128, "sheet", shadows=True),  # 16 frames
     "warrior-hit": Preset("plrgfx/warrior/wls/wlsht.cl2", 96, "sheet", shadows=True),  # 6 frames
+    # In town the game draws these instead of the stand and walk
+    "warrior-town-stand": Preset("plrgfx/warrior/wls/wlsst.cl2", 96, "sheet", shadows=True),  # 20 frames
+    "warrior-town-walk": Preset("plrgfx/warrior/wls/wlswl.cl2", 96, "sheet", shadows=True),  # 8 frames
     # Casting, 20 frames each, a spell's effect drawn over them (diablo1/overlays), and the three cleaned
     # into one, without the spells (casts.py)
     "warrior-fire": Preset("plrgfx/warrior/wls/wlsfm.cl2", 96, "sheet", shadows=True),
