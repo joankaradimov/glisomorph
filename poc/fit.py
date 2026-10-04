@@ -287,7 +287,8 @@ def main(argv=None):
         field.fit(torch.stack([viewmat(r[k], u[k], f[k]) for k in range(len(train))]),
                   torch.stack([intrinsics(views[i].pivot, off, device) for i in train]),
                   torch.stack([t[0] for t in targets]), torch.stack([t[1] == 1 for t in targets]),
-                  iters=args.iters, lr=args.lr, supersample=args.supersample, snap=snap, keyed=args.keyed)
+                  iters=args.iters, lr=args.lr, supersample=args.supersample, snap=snap, keyed=args.keyed,
+                  care=torch.stack([t[1] >= 0 for t in targets]))
     else:
         t0 = time.time()
         for it in range(args.iters):
@@ -305,9 +306,10 @@ def main(argv=None):
                 rgb, alpha = field.render(h, w, views[i].pivot, off_param, r[0], u[0], f[0], samples,
                                           jitter=True, yaw_rad=yaw_rad[i], supersample=args.supersample)
                 color, m = targets[k]
-                solid = m == 1
+                solid, care = m == 1, m >= 0  # nothing pulls where neither is known (-1)
                 loss = ((rgb - color) ** 2)[solid].mean()
-                loss = loss + 0.5 * torch.nn.functional.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), solid.float())
+                loss = loss + 0.5 * torch.nn.functional.binary_cross_entropy(alpha[care].clamp(1e-5, 1 - 1e-5),
+                                                                             solid[care].float())
                 if args.sparsity and not gaussians:
                     # Prefer the fewest voxels that explain every view: phantom copies cost extra.
                     loss = loss + args.sparsity * field.last_alpha[solid].sum(-1).mean()

@@ -66,6 +66,7 @@ from gsplat import rasterization
 
 from poc import fit
 from poc.animate import write_gif, write_sheet
+from poc.casts import effect_pixels
 from poc.edges import clean_edges, edges_over_black
 from poc.evaluate import quantize, score
 from poc.field import camera_basis, pixel_rays
@@ -819,14 +820,20 @@ def neighbours_of(points, k: int):
 
 def image_loss(colors, alphas, targets, masks, blur: int = 1, snap=None, keyed: bool = False):
     """Color error inside the silhouettes and silhouette error, at full size or averaged over blur x blur.
-    At full size, as GaussianField.fit: with `snap` (the palette colors a pixel can snap to (K, 3) and a
-    temperature), colors are fitted as they'll be snapped, so any color nearest the right palette color
-    will do; with `keyed`, any opacity above a half is solid, and any below it transparent."""
+    Masks are bool (True where the model is seen) or as masks_for makes them (1 seen, 0 transparent, -1
+    neither known: a spell's effect drawn over a cast, where nothing pulls). At full size, as
+    GaussianField.fit: with `snap` (the palette colors a pixel can snap to (K, 3) and a temperature),
+    colors are fitted as they'll be snapped, so any color nearest the right palette color will do; with
+    `keyed`, any opacity above a half is solid, and any below it transparent."""
     rgb, alpha = colors[..., :3], alphas[..., 0]
+    care = None if masks.dtype == torch.bool else masks >= 0
+    masks = masks if care is None else masks == 1
     solid = masks.float()
     if blur > 1:
         def down(x):
             return F.avg_pool2d(x.movedim(-1, 1) if x.dim() == 4 else x[:, None], blur).movedim(1, -1).squeeze(-1)
+        if care is not None:  # what's unknown counts on neither side
+            rgb, alpha = rgb * care[..., None], alpha * care
         rgb, alpha, targets, solid = down(rgb), down(alpha), down(targets * solid[..., None]), down(solid)
         return ((rgb - targets) ** 2).mean() + 0.5 * ((alpha - solid) ** 2).mean()
     if snap is None:
@@ -838,6 +845,8 @@ def image_loss(colors, alphas, targets, masks, blur: int = 1, snap=None, keyed: 
         loss = tau * F.cross_entropy(-((color[:, None] - palette) ** 2).sum(-1) / tau, classes)
     if keyed:
         alpha = torch.sigmoid((alpha - 0.5) * 12)  # past a half, little more pull either way
+    if care is not None:
+        alpha, solid = alpha[care], solid[care]
     return loss + 0.5 * F.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), solid)
 
 
@@ -976,10 +985,23 @@ def main():
                 "--no-evaluate", "--edges", args.edges] + (["--iters", str(iters)] if iters else [])
         if camera:
             argv += ["--camera", str(camera)]
-        elif many:  # up to 4 frames of each animation, evenly spaced
-            argv += ["--calibrate-with"] + ["%s:%d" % (b.name, j) for b in anims
-                                            for j in b.frames[::max(1, len(b.frames) // 4)][:4] if b is not a or j != k]
+        elif many:  # up to 4 frames of each animation
+            argv += ["--calibrate-with"] + ["%s:%d" % (b.name, j) for b in anims for j in calibration_frames(b)
+                                            if b is not a or j != k]
         return fit.main(argv)
+
+    def calibration_frames(b):
+        """Up to 4 of animation b's frames to calibrate with: evenly spaced, or for a cast, the 4 that its
+        spells' effects cover least (where they cover much, little is left to pin the camera down, and a
+        cast cleaned of them is more reconstruction than original)."""
+        if b.preset.layout == "casts":
+            amount = effect_pixels(b.preset)
+            covered = {j: amount[j] if j < len(amount) else 0 for j in b.frames}
+        elif any(v.ignore is not None for views in b.views.values() for v in views):
+            covered = {j: sum(int(v.ignore.sum()) for v in b.views[j] if v.ignore is not None) for j in b.frames}
+        else:
+            return b.frames[::max(1, len(b.frames) // 4)][:4]
+        return sorted(sorted(b.frames, key=lambda j: covered[j])[:4])
 
     still_scene, still_dir = still(base, 0)
     stills = [still_scene.field if s == 0 else still(a, k, still_dir)[0].field for s, (a, k) in enumerate(slots)]
@@ -1039,11 +1061,13 @@ def main():
         return (edges_over_black if args.edges == "black" else clean_edges)(idx, palette.cpu().numpy())
 
     def targets_of(s):
+        """Slot s's target colors and masks (1 seen, 0 transparent, -1 under a spell's effect) in the
+        fitted directions."""
         a, k = slots[s]
         views = [a.views[k][d] for d in train_dirs]
         masks = masks_for(views, a.preset.shadows, device)
         idx = [torch.as_tensor(model_indices(v, a), device=device).long().clamp(min=0) for v in views]
-        return torch.stack([palette[i] for i in idx]), torch.stack([m == 1 for m in masks])
+        return torch.stack([palette[i] for i in idx]), torch.stack(masks)
 
     def render_slot(s):
         """The model posed in slot s, in its animation's fitted directions."""
@@ -1097,7 +1121,14 @@ def main():
     #    the surface around it, from the model as it is to the surface of the frame's own still,
     #    transported again every `rematch` iterations (as in ICP). Each animation's first frame starts
     #    from the rest pose, the others from the frame before.
-    still_surfaces = {}
+    still_surfaces, cares = {}, {}
+
+    def known(s, alphas):
+        """Alphas (C, H, W, 1) of slot s's fitted directions, cleared where a spell's effect hides what's
+        there: neither surface counts there."""
+        if s not in cares:
+            cares[s] = (targets_of(s)[1] >= 0)[..., None]
+        return alphas * cares[s]
 
     def still_surface(s):
         if s not in still_surfaces:
@@ -1107,14 +1138,16 @@ def main():
                 fine = a.Ks[dirs].clone()
                 fine[:, :2] *= ss
                 colors, alphas, _ = stills[s].rasterize(viewmats[dirs], fine, a.w * ss, a.h * ss)
-                still_surfaces[s] = surface_of(*average_down(colors, alphas, ss), a)
+                colors, alphas = average_down(colors, alphas, ss)
+                still_surfaces[s] = surface_of(colors, known(s, alphas), a)
         return still_surfaces[s]
 
     def transport_goal(s):
         """Where each Gaussian goes (G, 3) if it follows the surface around it, from the model posed in
         slot s to the surface of that frame's still."""
         with torch.no_grad():
-            here = surface_of(*render_slot(s)[:2], slots[s][0])
+            colors, alphas = render_slot(s)[:2]
+            here = surface_of(colors, known(s, alphas), slots[s][0])
             there = transport(here, still_surface(s), iterations=args.sinkhorn_iters)
             means, _ = model.pose(s)
             return means + follow(means, here[:, :3], there[:, :3] - here[:, :3])
@@ -1335,8 +1368,7 @@ def main():
         def ground_row(n):
             if n not in grounds:
                 if n % 2 == 0 and n // 2 != args.hide_direction:
-                    idx = torch.as_tensor(a.views[0][n // 2].indices, device=device).long()
-                    grounds[n] = lowest_row((idx >= 0) & ~baked_shadow(idx))
+                    grounds[n] = lowest_row(masks_for([a.views[0][n // 2]], a.preset.shadows, device)[0] == 1)
                 else:
                     grounds[n] = lowest_row(copied(0, sign * n * 22.5) >= 0)
             return grounds[n]
@@ -1360,21 +1392,27 @@ def main():
             m = masks_for([v], a.preset.shadows, device)[0]
             return torch.where(m == 1, idx, torch.full_like(idx, -1))
 
+        def scored(cell, k, d):
+            """A cell's scores against the original of frame k in direction d, leaving out what a spell's
+            effect hides there (masks_for's -1)."""
+            unknown = masks_for([a.views[k][d]], a.preset.shadows, device)[0] == -1
+            return score(torch.where(unknown, torch.full_like(cell, -1), cell), truth(k, d), palette)
+
         for k in range(a.count):
             for d in range(len(yaws)):
                 own = render(k, float(yaws[d]))
-                s = score(own, truth(k, d), palette)
+                s = scored(own, k, d)
                 if d == args.hide_direction:
                     results["hidden_direction"].append(s)
                     cell = copied(k, float(yaws[d]), own)
-                    results["hidden_direction_copied"].append(score(cell, truth(k, d), palette))
+                    results["hidden_direction_copied"].append(scored(cell, k, d))
                     hidden_cells["f%d_d%d" % (k, d)] = cell.cpu().numpy().astype(np.int16)
                     if a.preset.shadows:
                         shadow_scores["hidden_direction"].append(shadow_match(k, d, cell))
                 elif args.hide_frames and k % 2:
                     results["hidden_frames"].append(s)
                     cell = copied(k, float(yaws[d]), own)
-                    results["hidden_frames_copied"].append(score(cell, truth(k, d), palette))
+                    results["hidden_frames_copied"].append(scored(cell, k, d))
                     hidden_cells["f%d_d%d" % (k, d)] = cell.cpu().numpy().astype(np.int16)
                     if a.preset.shadows:
                         shadow_scores["hidden_frames"].append(shadow_match(k, d, cell))
@@ -1395,14 +1433,23 @@ def main():
             np.savez_compressed(out_dir / ("hidden%s.npz" % suffix), **hidden_cells)
 
         # 16 directions by twice the frames: originals where they exist and were fitted (with their baked
-        # shadows), copied pixels over generated shadows elsewhere.
+        # shadows), copied pixels over generated shadows elsewhere. An original with a spell's effect drawn
+        # over it keeps the artist's pixels where they're the body's, and is copied where the effect was,
+        # over a generated shadow.
         sheet = []
         for step in range(0 if args.no_sheet else 2 * a.count):
             column = []
             for n in range(16):
                 known = n % 2 == 0 and step % 2 == 0 and n // 2 != args.hide_direction and step // 2 in a.frames
-                if known:
-                    column.append(a.views[step // 2][n // 2].indices.astype(np.int64))
+                v = a.views[step // 2][n // 2] if known else None
+                if known and (v.ignore is None or not v.ignore.any()):
+                    column.append(v.indices.astype(np.int64))
+                elif known:
+                    m = masks_for([v], a.preset.shadows, device)[0]
+                    idx = torch.as_tensor(v.indices, device=device).long()
+                    cell = copied(step / 2, sign * n * 22.5)
+                    body = torch.where(m == 1, idx, torch.where(m == -1, cell, torch.full_like(idx, -1)))
+                    column.append(with_shadow(body, n).cpu().numpy())
                 else:
                     cell = copied(step / 2, sign * n * 22.5)
                     column.append(with_shadow(cell, n).cpu().numpy())

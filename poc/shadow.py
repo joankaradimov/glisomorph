@@ -48,7 +48,7 @@ def outline_shadow(outline: torch.Tensor, ground, scale: float = 1.0) -> torch.T
     return shadow & ~outline
 
 
-def baked_shadow(indices: torch.Tensor, margin: int = 3, search: int = 12) -> torch.Tensor:
+def baked_shadow(indices: torch.Tensor, margin: int = 3, search: int = 12, hidden=None) -> torch.Tensor:
     """An original's shadow (H, W) bool: its index-0 pixels, without the black ones inside the model,
     which are part of its texture. The shadow lies on the ground, so it touches the background; and it's
     where the shadow rule (outline_shadow) puts it, within `margin` pixels. Black texture that reaches
@@ -58,10 +58,16 @@ def baked_shadow(indices: torch.Tensor, margin: int = 3, search: int = 12) -> to
     The rule's ground row is the lowest row of the animation's first frame, which one cell doesn't know:
     in a walk, the feet leave the ground. It's the row, within `search` of the cell's lowest, whose
     shadow best matches the index-0 pixels that touch the background. That's the first frame's ground
-    row in all 856 cells of the warrior's, rogue's, zombie's and skeleton's animations in views.py."""
+    row in all 856 cells of the warrior's, rogue's, zombie's and skeleton's animations in views.py.
+
+    `hidden` (H, W) bool is what a spell's effect drawn over a cast hides (masks_for): the shadow may
+    go on under it, and so may the body, whose hidden parts cast shadow too. Hidden pixels themselves
+    are never shadow."""
     zero = indices == 0
-    region = torch.zeros_like(zero)
     reach = indices < 0
+    if hidden is not None:
+        zero, reach = zero & ~hidden, reach | hidden
+    region = torch.zeros_like(zero)
     while True:
         grown = region | zero & (neighbour(reach, 0, False) | neighbour(reach, 1, False)
                                  | neighbour(reach, 2, False) | neighbour(reach, 3, False))
@@ -69,10 +75,14 @@ def baked_shadow(indices: torch.Tensor, margin: int = 3, search: int = 12) -> to
             break
         region, reach = grown, grown
     body = (indices >= 0) & ~region
+    outline = body
+    if hidden is not None:
+        body = body & ~hidden
+        outline = body | hidden
     lowest = lowest_row(body)
     if lowest is None:
         return region
-    shadows = [outline_shadow(body, lowest + d) for d in range(-search, search + 1)]
+    shadows = [outline_shadow(outline, lowest + d) for d in range(-search, search + 1)]
     rule = max(shadows, key=lambda s: float(iou(s, region))).float()[None, None]
     near = torch.nn.functional.max_pool2d(rule, 2 * margin + 1, stride=1, padding=margin)[0, 0] > 0
     return region & near

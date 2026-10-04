@@ -94,11 +94,13 @@ class GaussianField(torch.nn.Module):
         return pool(colors[..., :3], s), pool(alpha, s)
 
     def fit(self, viewmats, Ks, targets, masks, iters: int = 3000, lr: float = 0.05, densify: bool = True,
-            supersample: int = 1, snap=None, keyed: bool = False):
+            supersample: int = 1, snap=None, keyed: bool = False, care=None):
         """Fit to views: viewmats (C, 4, 4) and Ks (C, 3, 3) as viewmat() and intrinsics() make them,
-        target colors (C, H, W, 3), masks (C, H, W), True where the model is seen. All views render in
-        one call per step. With `densify`, gsplat's default strategy clones and splits Gaussians where
-        the views pull hardest, and prunes transparent ones. With `supersample` s, the views render s
+        target colors (C, H, W, 3), masks (C, H, W), True where the model is seen, and optionally care
+        (C, H, W), False where neither the model nor the background is known (a spell's effect drawn
+        over a cast): nothing pulls there. All views render in one call per step. With `densify`,
+        gsplat's default strategy clones and splits Gaussians where the views pull hardest, and prunes
+        transparent ones. With `supersample` s, the views render s
         times finer and are averaged down, as a renderer with antialiasing makes a pixel: then the model
         can hold detail finer than a pixel, as far as the views pin it down.
 
@@ -138,7 +140,10 @@ class GaussianField(torch.nn.Module):
                 loss = tau * F.cross_entropy(-((color[:, None] - palette) ** 2).sum(-1) / tau, classes[masks])
             if keyed:
                 alpha = torch.sigmoid((alpha - 0.5) * 12)  # past a half, little more pull either way
-            loss = loss + 0.5 * F.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), solid)
+            if care is None:
+                loss = loss + 0.5 * F.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), solid)
+            else:
+                loss = loss + 0.5 * F.binary_cross_entropy(alpha[care].clamp(1e-5, 1 - 1e-5), solid[care])
             loss = loss + F.relu(params["scales"] - math.log(3.0)).square().mean()  # keep Gaussians small
             loss.backward()
             if densify:

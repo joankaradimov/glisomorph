@@ -15,18 +15,24 @@ from poc.views import PRESETS, Preset, View, load_views
 
 
 def masks_for(views: list[View], shadows: bool, device) -> list[torch.Tensor]:
-    """1 where the model is seen, 0 elsewhere.
+    """1 where the model is seen, 0 elsewhere, -1 where neither is known.
 
     A baked shadow (index 0 on a character) is on the ground, and the model doesn't cover it, so it
     counts as transparent. Black pixels of the model (index 0 that doesn't touch the background, or
     isn't where the shadow falls: see shadow.baked_shadow) are part of its texture, and stay.
+
+    What a view doesn't show (View.ignore: a spell's effect drawn over a cast) is -1, and the shadow test
+    knows that the body and its shadow may go on under it.
     """
     out = []
     for v in views:
         idx = torch.as_tensor(v.indices, device=device).long()
+        effect = None if v.ignore is None else torch.as_tensor(v.ignore, device=device)
         m = (idx >= 0).long()
         if shadows:
-            m[baked_shadow(idx)] = 0
+            m[baked_shadow(idx, hidden=effect)] = 0
+        if effect is not None:
+            m[effect] = -1
         out.append(m)
     return out
 

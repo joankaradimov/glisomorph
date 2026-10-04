@@ -388,6 +388,13 @@ lightning arcs, `rhb`'s extra flash.
 - **Five casts have no overlay:** the warrior's lightning in `wlb`, `wmb`, `whn`, `whu` and `whb`.
 - **Three casts lose their last frame:** `wln` and `wmd` lightning (21 frames) and `rhu` magic (17)
   have one more frame than the overlay.
+- **The armed warriors' lightning overlays hold body.** In the armed warriors, the fire and magic
+  casts are drawn up to 9 pixels away from the lightning cast mid-cast (see
+  [The drift](../casts/README.md#the-drift)). So the body test compared each lightning cast's body with
+  the other two's in a different place, and strips of it passed as effect: in `warrior/lightning-1`,
+  `-2` and `-3`, they're 86–98% of the pixels in frames 3–6 and 16–17, about half in frame 8, and
+  14–19% in frame 12, where the arcs are brightest. Laying the casts onto each other before the body
+  test would keep them out.
 - **Specks.** A few pixels of noise sit in frames before and after an effect. A few gray specks of
   the axe head remain in the monk's axe magic (`magic-6`), frames 2–4.
 - **Thresholds are judged by eye.** The two 24s of the body test, the 0.6 linkage, the 0.5 flatness,

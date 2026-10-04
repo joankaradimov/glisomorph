@@ -827,13 +827,14 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand warrior-wa
 ```
 
 The animations make a graph. Against the stand's frame 0 (silhouettes in common, over the 8
-directions), the attack (0.94), the lightning cast (0.93), the fire cast (0.82) and the magic cast
-(0.77) start there and come back toward it, and the hit recovers into it (0.75 at its last frame): the
-stand's frame 0 is a hub they pass through. The walk never does (0.45 to 0.48 at every frame), nor do
-the town's stand and walk (0.36 to 0.41): loops of their own. The hit starts apart (a flinch, 0.61)
-and ends near the hub, so after its last frame it goes on to the hub, not back to its first: an
-animation whose last frame shares 0.7 of its silhouette with the first one's frame 0 is drawn into it
-(the in-between after its last frame, `warrior-hit` among the presets).
+directions), the attack starts there (0.94) and the hit recovers into it (0.75 at its last frame): the
+stand's frame 0 is a hub they pass through. The casts start near it (the lightning cast 0.93, the fire
+cast 0.82, the magic cast 0.77, the three cleaned into one 0.89: see [Casts](#casts-without-their-spells))
+but end apart (0.40 to 0.57), and the walk never comes near (0.45 to 0.48 at every frame), nor do the
+town's stand and walk (0.36 to 0.41): loops of their own. The hit starts apart (a flinch, 0.61) and
+ends near the hub, so after its last frame it goes on to the hub, not back to its first: an animation
+whose last frame shares 0.7 of its silhouette with the first one's frame 0 is drawn into it (the
+in-between after its last frame, `warrior-hit` among the presets).
 
 Fitted as one, naively, every animation came out worse than fitted alone. Three things closed the gap:
 
@@ -871,6 +872,46 @@ iterations of refinement; shared, 10000 (about as many per frame as alone).
   minutes for 17). A fit stopped on the way takes up where it was with `--resume`: the model is saved
   once tracked (tracked.pt), and again once refined (motion.pt), before the pictures, which `--load`
   draws again.
+
+#### Casts, without their spells
+
+A player casting a spell draws its effect over the body, baked into the sprite: the fire, lightning
+and magic casts (`<v>fm.cl2`, `lm.cl2`, `qm.cl2`) are one motion under three effects. The effects alone
+are in [diablo1/overlays](../diablo1/overlays/README.md).
+
+- **Each cast alone, its effect unknown** (presets `warrior-fire`, `warrior-lightning`,
+  `warrior-magic`). Under its overlay, grown by a pixel, neither the model nor the background is known
+  (masks_for's -1): nothing pulls there, in the stills, the tracking (images and transport) and the
+  refinement, and the scores leave it out. The baked shadow may go on under the effect, and so may the
+  body that casts it (shadow.py's `baked_shadow`, told what's hidden). The camera is calibrated on the 4
+  frames that the effects cover least. Fitted with the stand, the three in one model, the lightning
+  cast came out clean (0.895 IoU on the known pixels), but the fire and magic ones patchy (0.736 and
+  0.727): their effects cover most of the body mid-cast, and their light tints what's left.
+- **The three cleaned into one** (preset `warrior-cast`, [casts.py](casts.py)): where one cast's effect
+  hides the body, another usually shows it, and pixels two casts agree on are the body's own colors.
+  The result for `wls` is in [diablo1/casts](../diablo1/casts/README.md), with the method in full.
+
+The casts have to be laid onto each other first. In the armed warriors, the fire and magic casts are
+drawn up to 9 pixels away from the lightning cast mid-cast, a different shift in each direction, which
+no motion explains. With the lightning cast laid onto the magic one by 2 pixels at most, the cleaned
+frames mixed bodies from different places: their 8 views were no shape (a visual hull covered 0.61 to
+0.67 of them in frames 8 to 14, against 0.99 for the stand's), the frames' stills fell to 0.86 to 0.89
+IoU, and the model lost the raised sword. With the fire and magic casts laid onto the lightning one, as
+far as they're drawn apart (up to 10 pixels), the hull covers 0.98 to 1.00, and every still 0.99:
+
+| Fitted cells: IoU / exact | Casts laid on by 2 pixels at most | As far as they're apart |
+|---|---|---|
+| Stand, fitted with the cast | 0.929 / 39.6% | 0.947 / 49.8% |
+| Cast | 0.770 / 19.8% | 0.928 / 40.3% |
+| Cast, each of frames 8 to 15 (IoU over its 8 directions) | 0.65 to 0.71 | 0.90 to 0.94 |
+
+Fitted with the stand, walk, attack and hit, the cast keeps its scores (0.926 / 39.5%), and the others
+lose 0.4 to 0.8 points of IoU and 1 to 2 of exact pixels against the four fitted without it; the
+skeleton has 75 pieces.
+
+```
+python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand warrior-walk warrior-attack warrior-hit warrior-cast --refine-iters 18000
+```
 
 #### Supersampled
 
@@ -1086,9 +1127,11 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset zombie-walk --scale 4
 
 ## Next steps
 
-- **Animations:** checked on two walks and an attack; the attack's sword swing needed the tracking
-  of [Fast motion](#fast-motion). Hits, deaths and spells, and the other characters, are still to
-  be seen; every animation needs its own preset, with its frame width.
+- **Animations:** the warrior with a sword's stand, walk, attack, hit and casts make one model; the
+  attack's sword swing needed the tracking of [Fast motion](#fast-motion). The town's stand and walk,
+  deaths (only the unarmed variants have one) and the other variants and characters are still to be
+  seen; every animation needs its own preset, with its frame width, and other variants' casts drift
+  apart otherwise (see [diablo1/casts](../diablo1/casts/README.md#the-drift)).
 - **Surfaces frame 0 hides:** the rest shape has only frame 0's Gaussians, refitted. Surfaces that
   only other frames show (the inside of an arm, the far side of a blade) could get Gaussians of
   their own. Densifying in the rest pose from every frame's views (gsplat's strategy, clones and
