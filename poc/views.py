@@ -6,7 +6,7 @@ import numpy as np
 
 from blizzard_common.mpq import MpqArchive
 from diablo1.palette import load_pal
-from diablo1.sprites import Frame, load_cl2
+from diablo1.sprites import Frame, load_cl2, _u32
 
 
 @dataclass
@@ -54,28 +54,58 @@ def _frame_to_array(frame: Frame) -> np.ndarray:
         frame.height, frame.width)
 
 
+def _groupped_cel(data: bytes) -> bool:
+    fileSize = len(data)
+    # CEL HEADER CHECKS
+    # Read first DWORD
+    if (fileSize < 4):
+        return false
+
+    firstDword = _u32(data, 0);
+
+    # Trying to find file size in CEL header
+    if (fileSize < (4 + firstDword * 4 + 4)):
+        return false
+
+    fileSizeDword = _u32(data, 4 + firstDword * 4)
+
+    # If the dword is not equal to the file size then
+    # try to read it as a groupped CEL
+    return (firstDword != 0 and fileSize != fileSizeDword)
+
+
 def frame_count(mpq_path: str, preset: Preset) -> int:
     """How many animation frames the preset's sprite has (1 for missiles stored as one frame per
     direction)."""
-    if preset.layout == "frames":
-        return 1
     with MpqArchive(mpq_path) as mpq:
-        path = preset.path if preset.layout == "sheet" else preset.path.format(1)
-        return len(load_cl2(mpq.read(path), preset.width)[0])
+        data = mpq.read(preset.path.format(1))
+        if not _groupped_cel(data) and preset.path.find("{}") == -1:
+            # frames layout
+            return 1
+        # read sheet or files layout
+        return len(load_cl2(data, preset.width)[0])
 
 
 def load_views(mpq_path: str, preset: Preset) -> tuple[list[View], np.ndarray]:
     """The views, in increasing yaw, and the palette (256, 3) as floats in [0, 1]."""
     with MpqArchive(mpq_path) as mpq:
         palette = np.array(load_pal(mpq.read("levels/towndata/town.pal")), dtype=np.float32) / 255
-        if preset.layout == "sheet":
-            groups = load_cl2(mpq.read(preset.path), preset.width)
-            frames = [g[preset.frame] for g in groups]
-        elif preset.layout == "files":
-            frames = [load_cl2(mpq.read(preset.path.format(k)), preset.width)[0][preset.frame]
-                      for k in range(1, 17)]
+
+        if preset.path.find("{}") != -1:
+            # read files layout
+            frames = []
+            for k in range(1, 17):
+                data = mpq.read(preset.path.format(k))
+                frames.append(load_cl2(data, preset.width)[0][preset.frame])
         else:
-            frames = load_cl2(mpq.read(preset.path), preset.width)[0]
+            data = mpq.read(preset.path)
+            if _groupped_cel(data):
+                # read sheet layout
+                groups = load_cl2(data, preset.width)
+                frames = [g[preset.frame] for g in groups]
+            else:
+                # read frames layout
+                frames = load_cl2(data, preset.width)[0]
     step = 360 / len(frames)
     views = []
     for i, frame in enumerate(frames):
