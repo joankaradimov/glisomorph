@@ -121,16 +121,16 @@ def load_views(mpq_path: str, preset: Preset, grown: bool = True) -> tuple[list[
 
 
 def _shifted(a: np.ndarray, dy: int, dx: int, fill) -> np.ndarray:
-    """a (H, W) moved by dy rows down and dx columns right, `fill` where nothing moved in."""
+    """a (..., H, W) moved by dy rows down and dx columns right, `fill` where nothing moved in."""
     out = np.full_like(a, fill)
-    h, w = a.shape
+    h, w = a.shape[-2:]
     rows, cols = slice(max(dy, 0), h + min(dy, 0)), slice(max(dx, 0), w + min(dx, 0))
-    out[rows, cols] = a[max(-dy, 0):h + min(-dy, 0), max(-dx, 0):w + min(-dx, 0)]
+    out[..., rows, cols] = a[..., max(-dy, 0):h + min(-dy, 0), max(-dx, 0):w + min(-dx, 0)]
     return out
 
 
 def _grown(mask: np.ndarray) -> np.ndarray:
-    """A bool mask grown by a pixel, diagonals included."""
+    """A bool mask (..., H, W) grown by a pixel, diagonals included."""
     out = mask.copy()
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):

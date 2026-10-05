@@ -892,7 +892,8 @@ are in [diablo1/overlays](../diablo1/overlays/README.md).
   0.727): their effects cover most of the body mid-cast, and their light tints what's left.
 - **The three cleaned into one** (preset `warrior-cast`, [casts.py](casts.py)): where one cast's effect
   hides the body, another usually shows it, and pixels two casts agree on are the body's own colors.
-  The result for `wls` is in [diablo1/casts](../diablo1/casts/README.md), with the method in full.
+  The results, for 16 of the warrior's 27 variants, are in [diablo1/casts](../diablo1/casts/README.md),
+  with the method in full.
 
 The casts have to be laid onto each other first. In the armed warriors, the fire and magic casts are
 drawn up to 9 pixels away from the lightning cast mid-cast, a different shift in each direction, which
@@ -908,10 +909,16 @@ far as they're drawn apart (up to 10 pixels), the hull covers 0.98 to 1.00, and 
 | Cast | 0.770 / 19.8% | 0.928 / 40.3% |
 | Cast, each of frames 8 to 15 (IoU over its 8 directions) | 0.65 to 0.71 | 0.90 to 0.94 |
 
+In other variants the casts lie apart otherwise, so each is laid on by itself, onto the cast whose first
+frame lies where the stand's does: the lightning cast in the armed warriors, the magic cast in `wln` and
+`wlu`.
+
 Fitted with the stand, walk, attack and hit, the cast scores 0.931 / 40.4% (with the overlays made on
 the casts laid onto each other: see [their second pass](../diablo1/overlays/README.md#laying-the-casts-on)),
 and the others lose 0.4 to 0.9 points of IoU and 1.0 to 2.4 of exact pixels against the four fitted
-without it; the skeleton has 75 pieces.
+without it; the skeleton has 75 pieces. (That's the first version of the cleaned cast, the fire and
+magic casts moved together; laid on each by itself, a cast lies a pixel apart in 25 of its 160 cells,
+and 4% of its pixels differ.)
 
 ```
 python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand warrior-walk warrior-attack warrior-hit warrior-cast --refine-iters 18000
@@ -1169,8 +1176,9 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset zombie-walk --scale 4
 - **Animations:** the warrior with a sword's stand, walk, attack, hit and casts make one model, and
   its town stand and walk another; the attack's sword swing needed the tracking of
   [Fast motion](#fast-motion). Deaths (only the unarmed variants have one) and the other variants and
-  characters are still to be seen; every animation needs its own preset, with its frame width, and
-  other variants' casts drift apart otherwise (see [diablo1/casts](../diablo1/casts/README.md#the-drift)).
+  characters are still to be seen; every animation needs its own preset, with its frame width. The
+  casts of 16 of the warrior's variants are cleaned (see [diablo1/casts](../diablo1/casts/README.md));
+  the others' want better lightning overlays.
 - **Surfaces frame 0 hides:** the rest shape has only frame 0's Gaussians, refitted. Surfaces that
   only other frames show (the inside of an arm, the far side of a blade) could get Gaussians of
   their own. Densifying in the rest pose from every frame's views (gsplat's strategy, clones and
