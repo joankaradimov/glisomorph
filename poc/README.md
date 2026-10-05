@@ -908,9 +908,10 @@ far as they're drawn apart (up to 10 pixels), the hull covers 0.98 to 1.00, and 
 | Cast | 0.770 / 19.8% | 0.928 / 40.3% |
 | Cast, each of frames 8 to 15 (IoU over its 8 directions) | 0.65 to 0.71 | 0.90 to 0.94 |
 
-Fitted with the stand, walk, attack and hit, the cast keeps its scores (0.926 / 39.5%), and the others
-lose 0.4 to 0.8 points of IoU and 1 to 2 of exact pixels against the four fitted without it; the
-skeleton has 75 pieces.
+Fitted with the stand, walk, attack and hit, the cast scores 0.931 / 40.4% (with the overlays made on
+the casts laid onto each other: see [their second pass](../diablo1/overlays/README.md#laying-the-casts-on)),
+and the others lose 0.4 to 0.9 points of IoU and 1.0 to 2.4 of exact pixels against the four fitted
+without it; the skeleton has 75 pieces.
 
 ```
 python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand warrior-walk warrior-attack warrior-hit warrior-cast --refine-iters 18000

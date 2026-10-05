@@ -141,10 +141,7 @@ it. The file was written as the overlays are (see
 - **It decodes back exactly** with [sprites.py](../sprites.py) to the frames that were encoded.
 - **Each frame is one shape.** The visual hull carved from a frame's 8 directions, with the stand's
   camera, covers 0.98–1.00 of their pixels, as for the stand's own frames (0.99).
-- **A model fits it.** `poc/motion.py`'s model of the stand and this cast together matched it at 0.93
-  silhouette intersection over union and 40% exact pixels (the stand: 0.95 and 50%), and each frame's
-  own still at 0.99. That was the file as first made, with the lightning overlay that held strips of
-  the body (see the overlays' [second pass](../overlays/README.md#laying-the-casts-on)). With them
-  out, the body's pixels where two casts agree went from 78.8% to 81.4%, and those filled from 1.7%
-  to 0.8%.
+- **A model fits it.** `poc/motion.py`'s model of the stand, walk, attack, hit and this cast together
+  matches it at 0.93 silhouette intersection over union and 40% exact pixels (the stand, in the same
+  model: 0.95 and 47%), and each frame's own still at 0.99.
 - **Looked at:** every frame in every direction.
