@@ -110,8 +110,8 @@ them. Each cast's effect is the pixels of its overlay (its row of `../overlays/o
    neighbours, growing inward. Pieces farther than 2 pixels from the largest one are dropped.
 8. **Shadow.** It's drawn by the rule (see [The CL2 file](#the-cl2-file)).
 
-Of the body's pixels, 78.8% are where two casts agree, 19.5% come from one cast, and 1.7% are filled in
-step 7. Nothing is filled in frames 0–2 and 17–19. The most is 6.9%, in frame 14, where all three
+Of the body's pixels, 81.4% are where two casts agree, 17.8% come from one cast, and 0.8% are filled in
+step 7. Nothing is filled in frames 0–8 and 16–19. The most is 4.0%, in frame 11, where all three
 effects are large.
 
 [poc/casts.py](../../poc/casts.py) does this, and the preset `warrior-cast` in `poc/views.py` loads
@@ -129,14 +129,11 @@ it. The file was written as the overlays are (see
 
 ## Limits
 
-- **The effects' light.** Where one cast alone shows the body (19.5% of its pixels), its colors carry
+- **The effects' light.** Where one cast alone shows the body (17.8% of its pixels), its colors carry
   that cast's effect's light.
-- **Gaps** are filled from neighbours' colors: 1.7% of the body is a guess.
+- **Gaps** are filled from neighbours' colors: 0.8% of the body is a guess.
 - **The shadow** is the rule's, which matches the casts' at about 0.94 intersection over union, not the
   artist's.
-- **The lightning overlay** (`warrior/lightning-1`) holds strips of the body, mostly in frames 3–8 and
-  15–18, because the drift fooled the overlays' body test too. The lightning cast counts as hidden
-  there, and the other two casts show the body instead.
 - **One variant:** `wls`.
 
 ## Checked
@@ -144,7 +141,10 @@ it. The file was written as the overlays are (see
 - **It decodes back exactly** with [sprites.py](../sprites.py) to the frames that were encoded.
 - **Each frame is one shape.** The visual hull carved from a frame's 8 directions, with the stand's
   camera, covers 0.98–1.00 of their pixels, as for the stand's own frames (0.99).
-- **A model fits it.** `poc/motion.py`'s model of the stand and this cast together matches it at 0.93
-  silhouette intersection over union and 40% exact pixels (the stand: 0.95 and 50%). Each frame's own
-  still matches it at 0.99.
+- **A model fits it.** `poc/motion.py`'s model of the stand and this cast together matched it at 0.93
+  silhouette intersection over union and 40% exact pixels (the stand: 0.95 and 50%), and each frame's
+  own still at 0.99. That was the file as first made, with the lightning overlay that held strips of
+  the body (see the overlays' [second pass](../overlays/README.md#laying-the-casts-on)). With them
+  out, the body's pixels where two casts agree went from 78.8% to 81.4%, and those filled from 1.7%
+  to 0.8%.
 - **Looked at:** every frame in every direction.

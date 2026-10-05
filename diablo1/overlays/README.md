@@ -98,9 +98,9 @@ least 5% of its busiest frame's pixels.
 
 - **Fire:** a fireball forms in the hands (frame 1), opens into a ring of flame around the body (3–12),
   and spreads into flame wings that die down (13–18). The same in every direction.
-- **Lightning:** arcs crackle around and over the body (4–17, brightest at 12). The armed variants
-  have different arcs in every direction. In light and medium armor, the unarmed and shield-only
-  variants have one set of arcs for all directions.
+- **Lightning:** a ring flashes on the ground (8), then arcs crackle around and over the body (9–15,
+  brightest at 12). The armed variants have different arcs in every direction. In light and medium
+  armor, the unarmed and shield-only variants have one set of arcs for all directions.
 - **Magic:** a trail of sparks spirals out from the feet, around and up the body (1–19). The same in
   every direction.
 
@@ -110,10 +110,10 @@ least 5% of its busiest frame's pixels.
 | `fire-2` | same | wls wld | 1–16 |
 | `fire-3` | same | whn | 1–17 |
 | `fire-4` | same | whu | 1–16 |
-| `lightning-1` | each | wls wld wla wlm wlh wlt | 5–17 |
-| `lightning-2` | each | wms wmd wma wmm wmh wmt | 4–17 |
-| `lightning-3` | each | whs whd wha whm whh wht | 4–17 |
-| `lightning-4` | same | wln wlu | 5–14 |
+| `lightning-1` | each | wls wld wla wlm wlh wlt | 8–15 |
+| `lightning-2` | each | wms wmd wma wmm wmh wmt | 8–15 |
+| `lightning-3` | each | whs whd wha whm whh wht | 8–15 |
+| `lightning-4` | same | wln wlu | 9–14 |
 | `lightning-5` | same | wmn wmu | 9–14 |
 | `magic-1` | same | wlu wls wld wlb wla wlm wlh wlt wms wmd wmb wma wmm wmh wmt | 1–19 |
 | `magic-2` | same | whs whd whb wha whm whh wht | 1–19 |
@@ -187,7 +187,7 @@ The two shifted fires, compared with where direction S draws them:
 | `fire-2` | same | slu sls sma smt sha sht | 2–10 |
 | `fire-3` | same | sln sld slb sla slt | 2–10 |
 | `fire-4` | same | smu shn shh | 1–10 |
-| `fire-5` | same | slm | 2–11 |
+| `fire-5` | same | slm | 1–11 |
 | `lightning-1` | same | all but slb | 4–10 |
 | `lightning-2` | same | slb | 4–10 |
 | `magic-1` | same | slb smn smu sms smd smb smh shn shu shs shd shb shm shh | 1–11 |
@@ -281,7 +281,8 @@ decoder in [sprites.py](../sprites.py), and a CL2 writer. The repository has no 
 ### The body test
 
 A sample is a pixel of one cast `T` of one variant, direction and frame. The other two casts of the same
-variant, direction and frame, `T′` and `T″`, show the same body (except the monk's; see
+variant, direction and frame, `T′` and `T″`, show the same body, once laid onto it (see
+[Laying the casts on](#laying-the-casts-on); except the monk's: see
 [The monk's weapons](#the-monks-weapons)). A sample counts as **effect** if all three of these hold:
 
 - It's opaque and not index 0. Index 0 is the baked shadow, or black texture.
@@ -292,6 +293,30 @@ variant, direction and frame, `T′` and `T″`, show the same body (except the 
   0). Taking the darker of the two copes with the other cast showing its own effect at that spot.
 
 Everything else is body, shadow or background.
+
+### Laying the casts on
+
+The three casts don't always draw the body in the same place. In the armed warriors, the fire and magic
+casts are drawn up to 9 pixels away from the lightning cast mid-cast (see
+[the casts](../casts/README.md#the-drift)), and some other variants' casts sit a pixel or a few apart
+all through. Compared where they're drawn, strips of the lightning cast's own body passed the body test
+as effect. So the method runs twice:
+
+1. **A first pass** runs everything on this page on the casts as drawn.
+2. **Laying on.** For each variant, direction and frame, and each pair of its casts, try every shift
+   (dy, dx) with |dy| and |dx| up to 12. Score it by the intersection over union of the two casts'
+   silhouettes (opaque pixels other than index 0), counted only where neither cast's first-pass
+   overlay is, grown by a pixel. Take the best shift if it beats no shift by 0.01, and if the two then
+   match at 0.65 or better. Then, per variant and direction, replace each shift by the median over 5
+   frames (fewer at the first and last two), since a real drift changes smoothly from frame to frame.
+3. **A second pass** runs the body test with the other two casts laid onto the tested one, then the
+   consensus, the offsets and the pooling below, in the first pass's render groups.
+
+The monk's three casts are different motions, which no shift lays onto each other, so he keeps the
+first pass. So is `rhb`'s magic cast, mid-cast: no shift matches it at 0.65, and it stays as drawn
+there. Laid on, the warrior's fire and lightning casts move apart in 59% of his cells, and his
+lightning and magic casts in 70%, by up to 12 pixels; the rogue's and sorcerer's casts in 1% to 10%,
+mostly by a pixel or two.
 
 ### Render groups
 
@@ -379,6 +404,13 @@ lightning arcs, `rhb`'s extra flash.
 - **The monk's plain body colors** as a body test. His stand and walk animations use every white,
   gray and blue in his lightning and magic, and 39% of his fire's pixels are in their colors too.
 - **One overlay per spell for all classes.** Every class has its own effects.
+- **Laying the casts on without a match test.** Where an effect covers nearly the whole body (the
+  sorcerer's flame column, `rhb`'s magic mid-cast), what's left of the silhouettes matches somewhere
+  at random, by up to the search's 12 pixels. Those shifts changed some of the rogue's and sorcerer's
+  overlays by up to 28%; with the test, by 6% at most.
+- **Render groups formed again after laying on.** The medium armor's unarmed and shield-only magic
+  (`wmn`, `wmu`) then joined `magic-1`, though only 55–58% of its pixels equal their casts'. The
+  second pass keeps the first pass's groups.
 
 ## Limits
 
@@ -388,18 +420,14 @@ lightning arcs, `rhb`'s extra flash.
 - **Five casts have no overlay:** the warrior's lightning in `wlb`, `wmb`, `whn`, `whu` and `whb`.
 - **Three casts lose their last frame:** `wln` and `wmd` lightning (21 frames) and `rhu` magic (17)
   have one more frame than the overlay.
-- **The armed warriors' lightning overlays hold body.** In the armed warriors, the fire and magic
-  casts are drawn up to 9 pixels away from the lightning cast mid-cast (see
-  [The drift](../casts/README.md#the-drift)). So the body test compared each lightning cast's body with
-  the other two's in a different place, and strips of it passed as effect: in `warrior/lightning-1`,
-  `-2` and `-3`, they're 86–98% of the pixels in frames 3–6 and 16–17, about half in frame 8, and
-  14–19% in frame 12, where the arcs are brightest. Laying the casts onto each other before the body
-  test would keep them out.
+- **Staffs light up.** In the staff variants' lightning (`wlt`, `wmt`), the staff passes the body
+  test, lit by the arcs, and some of the arcs differ from the rest of their group's: their overlays
+  cover the least of their own casts' effect samples (77% and 50%).
 - **Specks.** A few pixels of noise sit in frames before and after an effect. A few gray specks of
   the axe head remain in the monk's axe magic (`magic-6`), frames 2–4.
 - **Thresholds are judged by eye.** The two 24s of the body test, the 0.6 linkage, the 0.5 flatness,
-  the floors and the monk's support were tuned on these sprites by looking at the overlays, against
-  bleeding and gaps. There's no ground truth.
+  the floors, the monk's support and laying on's 0.65 match were tuned on these sprites by looking at
+  the overlays, against bleeding and gaps. There's no ground truth.
 
 ## Checked against the game data
 
@@ -408,28 +436,37 @@ lightning arcs, `rhb`'s extra flash.
 - **Overlays against their casts.** For each of the 319 casts with an overlay, two shares were measured
   over every direction and frame:
   - *Equal:* the share of the overlay's pixels with the same index as the cast at the same place.
-  - *Covered:* the share of the cast's own effect samples (the body test's) that the overlay covers.
+  - *Covered:* the share of the cast's own effect samples (the body test's, on the casts laid on) that
+    the overlay covers.
 
   | Class    | Cast | Equal: median, lowest | Covered: median, lowest |
   |----------|------|----------------------:|------------------------:|
-  | warrior  | fire      | 76%, 71% | 83%, 77% |
-  | warrior  | lightning | 87%, 72% | 83%, 64% |
-  | warrior  | magic     | 92%, 71% | 91%, 49% |
+  | warrior  | fire      | 76%, 71% | 84%, 81% |
+  | warrior  | lightning | 88%, 75% | 91%, 50% |
+  | warrior  | magic     | 91%, 71% | 97%, 56% |
   | rogue    | fire      | 70%, 65% | 82%, 57% |
-  | rogue    | lightning | 80%, 69% | 89%, 38% |
+  | rogue    | lightning | 80%, 69% | 89%, 41% |
   | rogue    | magic     | 82%, 59% | 82%, 66% |
-  | sorcerer | fire      | 83%, 61% | 91%, 80% |
-  | sorcerer | lightning | 83%, 75% | 92%, 73% |
-  | sorcerer | magic     | 79%, 71% | 95%, 85% |
+  | sorcerer | fire      | 83%, 61% | 91%, 86% |
+  | sorcerer | lightning | 83%, 75% | 92%, 79% |
+  | sorcerer | magic     | 79%, 71% | 95%, 86% |
   | monk     | fire      | 95%, 89% | 84%, 71% |
   | monk     | lightning | 86%, 57% | 84%, 72% |
   | monk     | magic     | 94%, 93% | 92%, 86% |
 
   The lowest coverage figures come from casts whose body test keeps extra pixels, not from gaps in the
   overlay. One is `rls`'s lightning: that cast doesn't line up with its other two, and only 7–9% of
-  their body pixels are equal in frame 0. Another is `wlu`'s magic. The monk's coverage is lower by
-  design, since his body test also passes his weapon.
+  their body pixels are equal in frame 0. Others are `wmt`'s lightning (see Limits: its staff) and
+  `wlu`'s magic. The monk's coverage is lower by design, since his body test also passes his weapon.
   The equal share is never 100%, even within a render group: variants differ a little in dither and
   in what shows through.
+- **The second pass against the first.** Laying the casts on changed 36 of the 77 files.
+  - The armed warriors' lightning (`lightning-1` to `-3`) lost 26–30% of its pixels. In frames 3–7
+    and 16–17, where the first pass's were 85–98% strips of the body, a few pixels are left, and in
+    frame 12 the share of body fell from 12–19% to 1–4%.
+  - In `lightning-1` and `-2`, the overlays now cover 83–95% of the effect samples of five of each
+    group's six casts, against 72–88%; the staff variant's the least (see Limits).
+  - The warrior's unarmed lightning (`lightning-4` and `-5`) changed by 23% and 12% of its pixels.
+    Every other file changed by 7% at most.
 - **Looked at:** every file's frames, facing SW, were drawn and inspected for bleeding and gaps,
   along with the variants' casts for a sample of groups.

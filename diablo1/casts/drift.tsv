@@ -52,7 +52,7 @@ warrior	wls	6	SW	-1	1
 warrior	wls	6	W	-1	4
 warrior	wls	6	NW	0	6
 warrior	wls	6	N	1	6
-warrior	wls	6	NE	2	5
+warrior	wls	6	NE	1	5
 warrior	wls	6	E	2	2
 warrior	wls	6	SE	1	0
 warrior	wls	7	S	0	0
@@ -93,12 +93,12 @@ warrior	wls	11	W	-2	4
 warrior	wls	11	NW	-1	7
 warrior	wls	11	N	0	9
 warrior	wls	11	NE	1	7
-warrior	wls	11	E	2	4
+warrior	wls	11	E	2	5
 warrior	wls	11	SE	1	2
 warrior	wls	12	S	0	0
 warrior	wls	12	SW	-1	1
 warrior	wls	12	W	-2	4
-warrior	wls	12	NW	-2	7
+warrior	wls	12	NW	-1	7
 warrior	wls	12	N	0	9
 warrior	wls	12	NE	1	8
 warrior	wls	12	E	2	5
@@ -115,10 +115,10 @@ warrior	wls	14	S	0	0
 warrior	wls	14	SW	-1	1
 warrior	wls	14	W	-2	4
 warrior	wls	14	NW	-2	7
-warrior	wls	14	N	0	9
+warrior	wls	14	N	-1	9
 warrior	wls	14	NE	1	8
 warrior	wls	14	E	2	5
-warrior	wls	14	SE	2	2
+warrior	wls	14	SE	1	2
 warrior	wls	15	S	0	0
 warrior	wls	15	SW	-1	1
 warrior	wls	15	W	-2	4
