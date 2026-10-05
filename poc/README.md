@@ -829,7 +829,7 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand warrior-wa
 The animations make a graph. Against the stand's frame 0 (silhouettes in common, over the 8
 directions), the attack starts there (0.94) and the hit recovers into it (0.75 at its last frame): the
 stand's frame 0 is a hub they pass through. The casts start near it (the lightning cast 0.93, the fire
-cast 0.82, the magic cast 0.77, the three cleaned into one 0.89: see [Casts](#casts-without-their-spells))
+cast 0.82, the magic cast 0.77, the three cleaned into one 0.898: see [Casts](#casts-without-their-spells))
 but end apart (0.40 to 0.57), and the walk never comes near (0.45 to 0.48 at every frame): loops of
 their own. The town's stand and walk (0.36 to 0.41) are a graph of their own (see
 [The town's animations](#the-towns-animations)). The hit starts apart (a flinch, 0.61) and ends near
@@ -913,12 +913,10 @@ In other variants the casts lie apart otherwise, so each is laid on by itself, o
 frame lies where the stand's does: the lightning cast in the armed warriors, the magic cast in `wln` and
 `wlu`.
 
-Fitted with the stand, walk, attack and hit, the cast scores 0.931 / 40.4% (with the overlays made on
-the casts laid onto each other: see [their second pass](../diablo1/overlays/README.md#laying-the-casts-on)),
-and the others lose 0.4 to 0.9 points of IoU and 1.0 to 2.4 of exact pixels against the four fitted
-without it; the skeleton has 75 pieces. (That's the first version of the cleaned cast, the fire and
-magic casts moved together; laid on each by itself, a cast lies a pixel apart in 25 of its 160 cells,
-and 4% of its pixels differ.)
+Fitted with the stand, walk, attack and hit, the cast scores 0.931 / 40.7% (with the overlays made on
+the casts laid onto each other: see [their second pass](../diablo1/overlays/README.md#laying-the-casts-on),
+and each cast laid on by itself), and the others lose 0.5 to 0.7 points of IoU and 1.4 to 2.2 of exact
+pixels against the four fitted without it; the skeleton has 77 pieces.
 
 ```
 python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand warrior-walk warrior-attack warrior-hit warrior-cast --refine-iters 18000

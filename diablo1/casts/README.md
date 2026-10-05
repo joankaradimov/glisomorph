@@ -212,10 +212,7 @@ The others aren't here:
   8 directions, with the `wls` stand's camera, covers 0.95–1.00 of their pixels. That camera fits every
   variant's stand: its frames get 0.99–1.00, but `wmh`'s 0.89.
 - **A model fits `wls`.** `poc/motion.py`'s model of the stand, walk, attack, hit and this cast together
-  matches it at 0.93 silhouette intersection over union and 40% exact pixels (the stand, in the same
-  model: 0.95 and 47%), and each frame's own still at 0.99. It was fitted to the first `wls.cl2`, made
-  with the fire and magic casts moved together: 4% of its pixels differ from this one's, where a cast
-  lies a pixel apart in 25 of its 160 cells (the same hull coverage, 0.992, and 81% of the pixels where
-  two casts agree).
+  matches it at 0.93 silhouette intersection over union and 41% exact pixels (the stand, in the same
+  model: 0.95 and 47%), and each frame's own still at 0.99.
 - **Looked at:** every frame of `wls`; every variant's frames 10, 12 and 13, in every direction; frames
   across the cast of `wlb` and `wlu`; and the worst frames of those left out.
