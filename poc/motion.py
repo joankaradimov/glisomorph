@@ -68,11 +68,11 @@ from poc import fit
 from poc.animate import write_gif, write_sheet
 from poc.casts import effect_pixels
 from poc.edges import clean_edges, edges_over_black
-from poc.evaluate import quantize, score
+from poc.evaluate import add_warp_arguments, quantize, score, warp_from_args
 from poc.field import camera_basis, pixel_rays
 from poc.gaussians import DISTANCE, intrinsics, viewmat
 from poc.ramps import Ramps
-from poc.reproject import Warp, choose, fetch, fill, neighbour, smooth_depth, source_depth
+from poc.reproject import choose, fetch, fill, neighbour, smooth_depth, source_depth
 from poc.scene import Scene, masks_for
 from poc.shadow import baked_shadow, iou, lowest_row, outline_shadow
 from poc.views import PRESETS, frame_count, load_views
@@ -729,9 +729,20 @@ class PixelCopier:
                              for d in range(4)])
         labels = choose(cost, seen, links, warp.coherence)
         picked = labels >= 0
+        mine = labels.clamp(min=0)[None]
         out = torch.full_like(labels, -1)
-        out[picked] = index.gather(0, labels.clamp(min=0)[None])[0][picked]
-        lum = shade.gather(0, labels.clamp(min=0)[None])[0]
+        out[picked] = index.gather(0, mine)[0][picked]
+        lum = shade.gather(0, mine)[0]
+        if warp.blend:
+            # The next best source that sees the point, if it costs at most 1 more: for an in-between, the
+            # other neighbouring frame; for a new direction, the other neighbouring direction. Where it
+            # gives the pixel the same material, their shades are averaged.
+            others = torch.where(seen, cost, torch.full_like(cost, float("inf"))).scatter(0, mine, float("inf"))
+            second = others.argmin(0)[None]
+            close = picked & (others.gather(0, second)[0] <= cost.gather(0, mine)[0] + 1)
+            ramp = self.ramps.of(out)
+            same = close & (ramp >= 0) & (self.ramps.of(index.gather(0, second)[0]) == ramp)
+            lum = torch.where(same, (lum + shade.gather(0, second)[0]) / 2, lum)
         out = torch.where(picked, self.ramps.nearest(out, lum), out)
         out = fill(out, solid, warp.fill)
         return torch.where(solid & (out < 0), own, torch.where(solid, out, torch.full_like(out, -1)))
@@ -929,6 +940,10 @@ def main():
                     help="take up a fit that was stopped: if its output folder has the tracked model (tracked.pt, "
                          "saved once tracking ends), refine and draw it rather than track again")
     ap.add_argument("--no-sheet", action="store_true", help="score, but skip the 16-direction sheet and GIF")
+    add_warp_arguments(ap)  # how new cells copy the artist's pixels
+    # On the copied in-betweens, blended shades and the model's own colors where no source sees a pixel
+    # do better (see the README's Copying pixels through time)
+    ap.set_defaults(blend=True, fill=0)
     ap.add_argument("--scale", type=int, default=1,
                     help="also draw the 16 directions by twice the frames this many times larger, as a GIF "
                          "(directions-<scale>x.gif)")
@@ -1314,7 +1329,7 @@ def main():
 
     # 4. Scores and pictures, per animation.
     pal = (palette.cpu().numpy() * 255).round().astype(np.uint8)
-    warp = Warp()
+    warp = warp_from_args(args)
     summary = {"presets": names, "directions": train_dirs, "elevation_deg": math.degrees(float(elevation)),
                "gaussians": len(model.means0), "nodes": args.nodes, "lighting": args.lighting}
     if model.lit:

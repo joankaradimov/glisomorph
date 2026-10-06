@@ -42,6 +42,9 @@ class Warp:
     # Keep each pixel's material (palette ramp) from the nearest source pixel, but interpolate its shade
     # between the neighbouring source pixels of that material (needs a `Ramps`).
     interpolate: bool = True
+    # Moving pixels (motion.py's PixelCopier): where a pixel's source and the next best one that sees it
+    # (for an in-between, the other neighbouring frame) give it the same material, average their shades.
+    blend: bool = False
 
     @classmethod
     def plain(cls) -> "Warp":

@@ -34,9 +34,12 @@ OVERRIDES = {
     "smooth": {"type": int, "help": "radius of the plane fits that smooth depth (0 = off)"},
     "coherence": {"type": float, "help": "cost of switching direction between neighbours inside a surface"},
     "shading": {"type": float, "help": "cost of a direction that shades a surface differently"},
+    "tolerance": {"type": float, "help": "how far (pixels) a point may be from a direction's depth and still be seen"},
     "fill": {"type": int, "help": "how far pixels that no direction sees take a neighbour's color"},
     "interpolate": {"type": lambda v: bool(int(v)), "choices": [0, 1],
                     "help": "1 to interpolate shades between source pixels of the same material"},
+    "blend": {"type": lambda v: bool(int(v)), "choices": [0, 1],
+              "help": "1 to average the shades of a pixel's two best sources where they agree in material"},
 }
 
 

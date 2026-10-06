@@ -625,6 +625,45 @@ to one source, and shades are interpolated within the ramps. The sheet's new cel
   rendered as a color, a Gaussian's rest position goes to every pixel it covers. Unposing each
   pixel's own surface point instead reproduces the original cell at 90–94% exact.
 
+**Two sources blended.** More than one original sees most of a new cell's pixels: an in-between has
+the frames before and after it, a new direction the directions beside it. Where the source the
+copier picks and the next best one (costing at most 1 more) give a pixel the same material, their
+shades are averaged, then snapped within the ramp (`--blend`, on by default). A pixel no original
+sees takes the model's own color rather than a neighbour's index (`--fill 0`, the default here;
+reproject.py's warp still fills up to 4 pixels). The stand, walk, attack, hit and cast fitted as one,
+every other frame hidden, the hidden frames' copied pixels:
+
+| Hidden frames: IoU / exact / RGB error | One source picked | Blended, own colors where none sees |
+|---|---|---|
+| Stand | 0.944 / 59.3% / 5.90 | 0.944 / 60.9% / 5.59 |
+| Walk | 0.740 / 30.9% / 14.65 | 0.740 / 31.7% / 14.28 |
+| Attack | 0.804 / 38.9% / 14.85 | 0.804 / 40.2% / 13.95 |
+| Hit | 0.893 / 54.5% / 8.53 | 0.893 / 54.9% / 8.24 |
+| Cast | 0.884 / 40.3% / 11.38 | 0.884 / 41.7% / 10.75 |
+
+- **Exact pixels measure registration more than looks.** An original moved by a pixel matches itself
+  at only 33–35% exact. Allowed a pixel's slack, the copied pixels' exact matches rise from 45% to
+  65% on average, and their material is right within a pixel 91% of the time.
+- **The copier's other settings hardly matter here.** Coherence from 0 to 2, the tolerance at 1 or 3,
+  the depth's smoothing at 0 or 4, the shading cost at 6: each within 0.1 points. Without the shading
+  cost, the hit loses 2.
+- **The model's own color where the two sources' materials differ** lowered the RGB error further
+  (10.2 against 10.6 on average) but lost texture: exact within a pixel fell to 63% from 65%.
+- **What's left is mostly the outline and the motion.** The in-betweens' silhouettes are off by a
+  pixel along the edge, and in the attack's swing the sword is drawn where neither frame beside it
+  puts it. The fitted cells' outlines are within a pixel too (0.90 to 0.95 IoU: single pixels along
+  the edge, a little fat, 2.5 extra pixels to each missing one). A render threshold of 0.6, a prior
+  that sharpens the samples' coverage, or none on the outline's length moved them by half a point at
+  most.
+
+New directions can't be scored this way (see Evaluation in Next steps). By eye, blended, they look
+as before, the armor's shading a little softer. A saved model draws again with other settings
+(`--load`, about 4 minutes for these five animations without the sheets):
+
+```
+python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand warrior-walk warrior-attack warrior-hit warrior-cast --hide-frames odd --refine-iters 9000
+```
+
 **Shadows.** The sheet shows the originals with their baked shadows, and the new cells over shadows
 made by the rule in [Shadows](#shadows): each cell's outline, about its direction's ground row, the
 lowest row of frame 0's outline there (an original's, or in a new direction, the copied frame 0's).
@@ -1204,9 +1243,9 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset zombie-walk --scale 4
   centerline and its two tones, found in the originals, carried over as a line.
 - **A ceiling:** render a known 3D model into 8 + 8 directions and run the pipeline on it. That would
   show how many exact pixels are achievable at all.
-- **Blending:** where two directions see a surface about equally well, blend their colors and snap
-  the blend to the palette, instead of picking one. That would trade some crispness for shading
-  between the two directions'.
+- **Blending across directions:** the copier blends a pixel's two best sources' shades (see Copying
+  pixels through time), which helps the in-betweens. In new directions, where the two are the
+  directions beside it, it's only been judged by eye.
 - **Lighting:** the shading light could be fitted once for the whole game and then held fixed: it
   comes out the same for every sprite (the moving Gaussians already hold it there).
 - **Evaluation:** only the arrows have usable in-between directions. The fireball and the holy bolt
