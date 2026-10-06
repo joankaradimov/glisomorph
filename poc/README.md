@@ -773,6 +773,23 @@ against 0.811, and 69% of the thin pixels covered against 72%), and the walks th
 sword is lost at the fastest part of the swing, it's already lost in the tracked frames on either
 side, not between them.
 
+With the skeleton (below), a piece's rotation is fitted to many nodes at once, and the screws were
+tried again, a piece at a time, as was turning and moving each piece at an even rate between two
+frames. On the stand, walk, attack, hit and cast fitted as one, every other frame hidden, neither
+beat the spline: the attack's hidden frames came to 0.791 (screws) and 0.798 (even rates) silhouette
+IoU against 0.804, the hit's to 0.890 and 0.884 against 0.893. Only the cast gained, with the screws
+(0.890 against 0.884). Through four frames, the spline carries the motion's trend across the gap;
+two frames don't. What the hidden frames miss isn't between frames anyway:
+
+- **The frames around them fit worse.** Tracked with every other frame, the attack's frames after
+  the swing fit its originals at 0.887 to 0.892 IoU, against 0.917 to 0.936 tracked with all of them.
+- **The misses are where the originals change most:** the swing's fastest hidden frames, 5 and 7, come
+  to 0.73 and 0.69, where each original shares only 0.55 to 0.60 of its silhouette with the frames
+  around it; the others come to 0.79 to 0.89.
+- **Tracked with every frame, the in-between frames look right.** Through the swing, the sword is
+  drawn between where the frames around it put it. What breaks up is the blade's pixels (see Thin
+  parts in Next steps).
+
 #### Rigid parts
 
 A Gaussian follows a blend of its nearest nodes, and where those nodes turn apart, the model bends.
