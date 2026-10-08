@@ -23,9 +23,9 @@ thin, straight parts, such as a sword, move as one rigid body instead, on a node
 into the pieces they move as, a skeleton found from the motion (--skeleton), each moving by one rigid
 motion, interpolated as one between frames.
 
-1. Every frame is fitted like a still (fit.py --model gaussians); the stills are saved and reused.
-   Frame 0 calibrates the camera, and its Gaussians become the moving ones; the other stills are
-   targets.
+1. Every frame is fitted like a still (fit.py --model gaussians); the stills are saved and reused by
+   later runs that start from the same animation. Frame 0 calibrates the camera, and its Gaussians
+   become the moving ones; the other stills are targets.
 2. Each next frame starts from the previous one's node poses and moves them to fit its views. Two
    things pull from afar, where the images' gradients don't reach: blurred copies of the images are
    compared first, and each Gaussian is drawn to where optimal transport takes the surface around it,
@@ -70,7 +70,7 @@ from poc.casts import effect_pixels
 from poc.edges import clean_edges, edges_over_black
 from poc.evaluate import add_warp_arguments, quantize, score, warp_from_args
 from poc.field import camera_basis, pixel_rays
-from poc.gaussians import DISTANCE, intrinsics, viewmat
+from poc.gaussians import DISTANCE, GaussianField, intrinsics, viewmat
 from poc.ramps import Ramps
 from poc.reproject import choose, fetch, fill, neighbour, smooth_depth, source_depth
 from poc.scene import Scene, masks_for
@@ -979,31 +979,55 @@ def main():
     slots = [(a, k) for a in anims for k in a.frames]
     many = len(anims) > 1
 
-    # 1. Every fitted frame as a still; frame 0 calibrates the camera, and the others share it. With several
-    #    animations, frame 0 is calibrated on up to 4 frames of each of them (one camera; calibrated on one
-    #    frame alone, the stand and the attack came out half a degree apart), and their stills are saved
-    #    apart ("-joint-<animations>").
-    joint = "-joint-" + "+".join(names) if many else ""
+    # 1. Every fitted frame as a still. The first animation's frame 0 calibrates the camera, with several
+    #    animations on up to 4 frames of each (one camera; calibrated on one frame alone, the stand and the
+    #    attack came out half a degree apart), and the other frames' stills share it. They're saved by the
+    #    first animation (the other animations' frames "-on-<it>"), for any later run that starts from it:
+    #    the camera is kept if it was calibrated on every animation of the run (else it's calibrated again,
+    #    on those it had too), and a still if it was fitted with that camera. A saved model (--load,
+    #    --resume) keeps its own camera, and needs no stills.
+    checkpoint = out_dir / "tracked.pt"  # the model once tracked, before refining (--resume)
+    tracked = bool(args.load) or (args.resume and checkpoint.exists())
+    saved_model = torch.load(args.load or checkpoint, map_location=device) if tracked else None
+    ss_tag = "-ss%d" % args.still_supersample if args.still_supersample != 1 else ""
+    edges_tag = "-" + args.edges if args.edges != "none" else ""
 
-    def still(a, k, camera=None):
+    def still_folder(a, k):
+        """A still's folder, its tag, and its iterations (None: fit.py's)."""
         iters = args.still_iters if (k or a is not base) and args.still_iters else None
-        tag = "motion-f%d%s%s%s%s%s" % (k, test, "-ss%d" % args.still_supersample if args.still_supersample != 1 else "",
-                                        "-" + args.edges if args.edges != "none" else "", "-i%d" % iters if iters else "",
-                                        joint)
-        folder = Path(args.out) / fit.run_name(a.name, split, tag=tag, model="gaussians")
+        tag = "motion-f%d%s%s%s%s%s" % (k, test, ss_tag, edges_tag, "-i%d" % iters if iters else "",
+                                        "" if a is base else "-on-" + base.name)
+        return Path(args.out) / fit.run_name(a.name, split, tag=tag, model="gaussians"), tag, iters
+
+    def saved_still(folder):
         if (folder / "scene.pt").exists() and not args.refit_stills:
             saved = Scene.load(folder / "scene.pt", args.mpq)
             if saved.supersample == args.still_supersample:  # else it was fitted otherwise
-                return saved, folder
-        argv = ["--mpq", args.mpq, "--preset", a.name, "--split", split, "--frame", str(k), "--model",
-                "gaussians", "--supersample", str(args.still_supersample), "--tag", tag, "--out", args.out,
-                "--no-evaluate", "--edges", args.edges] + (["--iters", str(iters)] if iters else [])
-        if camera:
-            argv += ["--camera", str(camera)]
-        elif many:  # up to 4 frames of each animation
-            argv += ["--calibrate-with"] + ["%s:%d" % (b.name, j) for b in anims for j in calibration_frames(b)
-                                            if b is not a or j != k]
-        return fit.main(argv)
+                return saved
+        return None
+
+    def fit_still(a, k, camera):
+        """Frame k of animation a as a still, its camera calibrated (--calibrate-with ...) or another's
+        (--camera ...): the scene and its folder."""
+        _, tag, iters = still_folder(a, k)
+        return fit.main(["--mpq", args.mpq, "--preset", a.name, "--split", split, "--frame", str(k), "--model",
+                         "gaussians", "--supersample", str(args.still_supersample), "--tag", tag, "--out", args.out,
+                         "--no-evaluate", "--edges", args.edges] + (["--iters", str(iters)] if iters else []) + camera)
+
+    def camera_still():
+        """The first animation's frame 0, which holds the camera: saved, or fitted and calibrated."""
+        folder = still_folder(base, 0)[0]
+        saved = saved_still(folder)
+        before = list(saved.config.get("calibrate_with", [])) if saved is not None else []
+        if saved is not None and (not many or set(names) <= {base.name} | {s.rsplit(":", 1)[0] for s in before}):
+            return saved, folder
+        specs = ["%s:%d" % (b.name, j) for b in anims for j in calibration_frames(b) if b is not base or j] if many else []
+        specs += [s for s in before if s.rsplit(":", 1)[0] not in names]  # what it was calibrated on before
+        return fit_still(base, 0, ["--calibrate-with"] + specs if specs else [])
+
+    def same_camera(a, b):
+        return (a.sign == b.sign and abs(float(a.elevation) - float(b.elevation)) < 1e-6
+                and all(abs(x - y) < 1e-6 for x, y in zip(a.offset, b.offset)))
 
     def calibration_frames(b):
         """Up to 4 of animation b's frames to calibrate with: evenly spaced, or for a cast, the 4 that its
@@ -1018,11 +1042,36 @@ def main():
             return b.frames[::max(1, len(b.frames) // 4)][:4]
         return sorted(sorted(b.frames, key=lambda j: covered[j])[:4])
 
-    still_scene, still_dir = still(base, 0)
-    stills = [still_scene.field if s == 0 else still(a, k, still_dir)[0].field for s, (a, k) in enumerate(slots)]
-    elevation, offset, sign = still_scene.elevation, still_scene.offset, still_scene.sign
-    train_dirs = still_scene.train
-    palette = still_scene.palette
+    still_scene = None
+    if saved_model is not None and "camera" in saved_model:
+        camera = saved_model["camera"]
+        elevation = torch.tensor(camera["elevation"], device=device)
+        offset, sign, train_dirs = tuple(camera["offset"]), camera["sign"], list(camera["train"])
+    else:
+        old = Path(args.out) / fit.run_name(base.name, split, model="gaussians", tag="motion-f0%s%s%s%s" % (
+            test, ss_tag, edges_tag, "-joint-" + "+".join(names) if many else ""))
+        if saved_model is not None and (old / "scene.pt").exists():  # saved before models kept their camera
+            still_scene, still_dir = Scene.load(old / "scene.pt", args.mpq), old
+        else:
+            still_scene, still_dir = camera_still()
+        elevation, offset, sign = still_scene.elevation, still_scene.offset, still_scene.sign
+        train_dirs = still_scene.train
+    palette = torch.as_tensor(load_views(args.mpq, base.preset)[1], device=device)
+    stills = {}
+
+    def still_field(s):
+        """Slot s's still (its Gaussians): saved, if fitted with this camera, or fitted now."""
+        if s not in stills:
+            a, k = slots[s]
+            saved = still_scene if s == 0 else saved_still(still_folder(a, k)[0])
+            if saved is None or not same_camera(saved, still_scene):
+                saved = fit_still(a, k, ["--camera", str(still_dir)])[0]
+            stills[s] = saved.field
+        return stills[s]
+
+    if saved_model is None:
+        for s in range(len(slots)):  # every still, before tracking
+            still_field(s)
 
     yaws = sign * torch.tensor([v.yaw for v in base.views[0]], dtype=torch.float32, device=device)
     right, up, forward = camera_basis(yaws, elevation)
@@ -1095,33 +1144,40 @@ def main():
     def surface_of(colors, alphas, a):
         return surface_points(colors, alphas, a.origins, forward[dirs])
 
-    parts = None
-    if args.rigid:
-        p = still_scene.field.params
-        views0 = [base.views[0][d] for d in train_dirs]
-        parts = rigid_parts(p["means"].detach(), p["opacities"].detach(), [m == 1 for m in masks_for(
-            views0, base.preset.shadows, device)], viewmats[dirs], base.Ks[dirs],
-            min_views=math.ceil(0.6 * len(train_dirs)))
-        for k in range(int(parts.max()) + 1):
-            print("rigid part %d: %d Gaussians" % (k, int((parts == k).sum())))
-    model = MovingGaussians(still_scene.field, len(slots), nodes=args.nodes, lit=args.lighting != "none",
+    if saved_model is not None:
+        # A saved model is all there is to it: built on a field of its size, which it then replaces
+        state = saved_model["model"]
+        state.setdefault("parts", torch.full((len(state["means0"]),), -1, dtype=torch.long, device=device))
+        field = GaussianField.from_points(torch.rand(len(state["means0"]), 3, device=device, generator=torch.Generator(
+            device=device).manual_seed(0)) * 40, 1.0)
+        field.params["opacities"].data.fill_(5.0)  # opaque, so that its nodes find places
+        parts = state["parts"]
+    else:
+        field, parts = still_scene.field, None
+        if args.rigid:
+            p = field.params
+            views0 = [base.views[0][d] for d in train_dirs]
+            parts = rigid_parts(p["means"].detach(), p["opacities"].detach(), [m == 1 for m in masks_for(
+                views0, base.preset.shadows, device)], viewmats[dirs], base.Ks[dirs],
+                min_views=math.ceil(0.6 * len(train_dirs)))
+            for k in range(int(parts.max()) + 1):
+                print("rigid part %d: %d Gaussians" % (k, int((parts == k).sum())))
+    model = MovingGaussians(field, len(slots), nodes=args.nodes, lit=args.lighting != "none",
                             supersample=args.supersample, parts=parts)
     model.spans = [(a.start, len(a.frames), 0 if a.returns else None) for a in anims]
-    checkpoint = out_dir / "tracked.pt"  # the model once tracked, before refining (--resume)
-    tracked = bool(args.load) or (args.resume and checkpoint.exists())
-    if tracked:
-        saved = torch.load(args.load or checkpoint, map_location=device)["model"]
-        saved.setdefault("parts", torch.full((len(model.means0),), -1, dtype=torch.long, device=device))
-        if "node_group" in saved:
-            model.tie(saved["node_group"])
-        model.load_state_dict(saved)
+    if saved_model is not None:
+        if "node_group" in state:
+            model.tie(state["node_group"])
+        model.load_state_dict(state)
         if not args.load:
             print("resumed from", checkpoint)
     print("%d Gaussians, %d nodes %.1f pixels apart" % (len(model.means0), args.nodes, model.spacing))
 
     def save(path):
         torch.save({"model": model.state_dict(), "frames": [k for _, k in slots],
-                    "animations": [(a.name, a.frames) for a in anims]}, path)
+                    "animations": [(a.name, a.frames) for a in anims],
+                    "camera": {"elevation": float(elevation), "offset": list(offset), "sign": sign,
+                               "train": list(train_dirs)}}, path)
 
     def only_slot(j):
         """Zero the gradients of every frame's node poses but slot j's."""
@@ -1155,7 +1211,7 @@ def main():
                 ss = args.supersample  # the still sampled as the moving Gaussians are
                 fine = a.Ks[dirs].clone()
                 fine[:, :2] *= ss
-                colors, alphas, _ = stills[s].rasterize(viewmats[dirs], fine, a.w * ss, a.h * ss)
+                colors, alphas, _ = still_field(s).rasterize(viewmats[dirs], fine, a.w * ss, a.h * ss)
                 colors, alphas = average_down(colors, alphas, ss)
                 still_surfaces[s] = surface_of(colors, known(s, alphas), a)
         return still_surfaces[s]

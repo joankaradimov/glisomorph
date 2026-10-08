@@ -331,7 +331,8 @@ def main(argv=None):
               % (math.degrees(elev_param.item()), elev_deg, off[0], off[1]))
         elev = elev_param.detach()
     config.update({"iters": args.iters, "elevation_calibrated_deg": elev_deg, "calibration_coverage": coverage,
-                   "camera_from": args.camera, "refine_camera": args.refine_camera})
+                   "camera_from": args.camera, "calibrate_with": list(args.calibrate_with),
+                   "refine_camera": args.refine_camera})
     scene = Scene(field=field, views=views, masks=masks, palette=palette, yaws=yaws, elevation=elev, offset=off,
                   samples=samples, config=config)
     scene.save(out_dir / "scene.pt")

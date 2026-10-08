@@ -566,7 +566,10 @@ iterations in a row better by a tenth of a percent), and the gain goes only to t
 fitted to: at 12,000 the fitted cells are 74.0% exact, but the hidden frames' own colors 53.9% and
 copied pixels 53.1%, no better. It keeps its 3,000.
 
-The frames' stills are saved, and reused by later runs (`--refit-stills` fits them again). The
+The frames' stills are saved, and reused by later runs that start from the same animation
+(`--refit-stills` fits them again): the camera, if it was calibrated on every animation of the run
+(else it's calibrated again, on those it had too), and each still, if it was fitted with that camera.
+A saved model keeps its own camera, so `--load` and `--resume` need no stills. The
 tables before [Fast motion](#fast-motion) were measured with the first tracker, which matched
 nearest neighbours instead, and a refinement of everything (now `--refine all`): all frames
 together, the last tied to the first, the node paths kept smooth, and each Gaussian given a small
@@ -902,7 +905,8 @@ Fitted as one, naively, every animation came out worse than fitted alone. Three 
   silhouettes worse (0.892 against 0.919). Calibrated on all 17 fitted frames at once (fit.py
   `--calibrate-with`), the camera is the attack's. It's calibrated on up to 4 frames of each
   animation, which take about 20 seconds each; with the hit too, on 16 frames, it came out at 26.5°:
-  every camera within half a degree explains the silhouettes about as well.
+  every camera within half a degree explains the silhouettes about as well. It's kept for later runs
+  that start from the same animation, and calibrated again only for one that adds an animation.
 - **The hub held:** an animation whose frame 0 shares 0.9 of its silhouette with the first one's (the
   attack) keeps that frame at the rest pose, one state both pass through.
 - **A jump for the others:** an animation apart from the hub (the walk) starts with every node's jump
