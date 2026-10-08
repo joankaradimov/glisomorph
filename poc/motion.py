@@ -864,7 +864,7 @@ def image_loss(colors, alphas, targets, masks, blur: int = 1, snap=None, keyed: 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
-    ap.add_argument("--preset", required=True, nargs="+", choices=sorted(PRESETS),
+    ap.add_argument("--preset", required=True, nargs="+", choices=PRESETS,
                     help="one animation, or several of one model (the same variant: a warrior with a sword "
                          "standing, walking, attacking), fitted as one model; the first one's frame 0 is the "
                          "rest pose and calibrates the camera")
@@ -1036,7 +1036,7 @@ def main():
         if b.preset.layout == "casts":
             amount = effect_pixels(b.preset)
             covered = {j: amount[j] if j < len(amount) else 0 for j in b.frames}
-        elif any(v.ignore is not None for views in b.views.values() for v in views):
+        elif any(v.ignore is not None and not v.unseen for views in b.views.values() for v in views):
             covered = {j: sum(int(v.ignore.sum()) for v in b.views[j] if v.ignore is not None) for j in b.frames}
         else:
             return b.frames[::max(1, len(b.frames) // 4)][:4]
@@ -1089,9 +1089,11 @@ def main():
 
     def overlap(a, b, k=0):
         """How much of their silhouettes animation a's frame k and b's frame 0 share (IoU), placed by their
-        ground points, over the fitted directions."""
+        ground points, over the fitted directions where both are known."""
         ious = []
         for d in train_dirs:
+            if a.views[k][d].unseen or b.views[0][d].unseen:
+                continue
             placed = []
             for x, f in ((a, k), (b, 0)):
                 v = x.views[f][d]
@@ -1101,7 +1103,7 @@ def main():
                 canvas[y0:y0 + m.shape[0], x0:x0 + m.shape[1]] = m
                 placed.append(canvas)
             ious.append(float((placed[0] & placed[1]).sum() / (placed[0] | placed[1]).sum().clamp(min=1)))
-        return sum(ious) / len(ious)
+        return sum(ious) / max(len(ious), 1)
 
     # The animations' graph: an animation whose frame 0 is the first one's frame 0 (the attack starts from
     # the stand, 0.94 of their silhouettes in common) keeps that frame at the rest pose, one state that
@@ -1416,10 +1418,12 @@ def main():
             return quantize(colors[0, ..., :3], alphas[0, ..., 0], palette, candidates)
 
         # The originals the copier may take pixels from: every fitted frame of the animation in every
-        # fitted direction, with the model's depth there for the visibility test.
+        # fitted direction where it's known, with the model's depth there for the visibility test.
         sources = []
         for i, k in enumerate(a.frames):
             for d in train_dirs:
+                if a.views[k][d].unseen:  # an empty source would still be one of the nearest few
+                    continue
                 r, u, f, vm, _ = camera(float(yaws[d]))
                 _, alpha, depth = model.rest_points(a.start + i, vm, a.K, a.w, a.h)
                 sources.append({"view": d, "slot": a.start + i, "yaw": float(yaws[d]), "right": r, "up": u,
@@ -1441,7 +1445,7 @@ def main():
 
         def ground_row(n):
             if n not in grounds:
-                if n % 2 == 0 and n // 2 != args.hide_direction:
+                if n % 2 == 0 and n // 2 != args.hide_direction and not a.views[0][n // 2].unseen:
                     grounds[n] = lowest_row(masks_for([a.views[0][n // 2]], a.preset.shadows, device)[0] == 1)
                 else:
                     grounds[n] = lowest_row(copied(0, sign * n * 22.5) >= 0)
@@ -1474,6 +1478,8 @@ def main():
 
         for k in range(a.count):
             for d in range(len(yaws)):
+                if a.views[k][d].unseen:  # drawn wrong: nothing to score against
+                    continue
                 own = render(k, float(yaws[d]))
                 s = scored(own, k, d)
                 if d == args.hide_direction:

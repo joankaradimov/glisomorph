@@ -97,7 +97,7 @@ def write_gif(frames: list[list[np.ndarray]], palette: np.ndarray, path: Path, s
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
-    ap.add_argument("--preset", required=True, choices=sorted(PRESETS))
+    ap.add_argument("--preset", required=True, choices=PRESETS)
     ap.add_argument("--frames", type=int, default=None, help="only the first N frames (default: all)")
     ap.add_argument("--lighting", default="phong", choices=["none", "lambert", "phong"])
     ap.add_argument("--iters", type=int, default=2000)

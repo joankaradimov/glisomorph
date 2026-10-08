@@ -241,6 +241,8 @@ def evaluate(scene: Scene, out_dir: Path, warp: Warp) -> dict:
         if relit_i is not None:
             relit[i] = relit_i
         shadows[i] = renderer.shadow(r["target"]["solid"])
+        if v.unseen:  # drawn wrong: nothing to score against
+            continue
         original = torch.as_tensor(v.indices, device=device).long()
         if shadows[i] is not None:
             match = float(iou(shadows[i], baked_shadow(original)))

@@ -1017,6 +1017,49 @@ per graph: the dungeon's animations, and the town's.
 python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-town-stand warrior-town-walk --refine-iters 8400
 ```
 
+#### The other variants
+
+The warrior comes in 27 variants: three armors (light, medium, heavy: `l`, `m`, `h`) by nine weapons
+(none, a shield, a sword, a sword and a shield, a bow, an axe, a mace, a mace and a shield, a staff:
+`n`, `u`, `s`, `d`, `b`, `a`, `m`, `h`, `t`), each with sprites of its own
+(`plrgfx/warrior/<v>/<v><animation>.cl2`). Every one of the warrior's presets takes a variant after an
+`@`: `warrior-stand@wla` is the warrior in light armor with an axe, standing (a bow's attack is 96
+pixels wide, not 128). Each variant is two models, as `wls` is: its dungeon animations, with its
+cleaned cast where [diablo1/casts](../diablo1/casts/README.md) has one, and its town stand and walk.
+
+```
+python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand@wla warrior-walk@wla warrior-attack@wla warrior-hit@wla warrior-cast@wla --refine-iters 19200
+```
+
+A model's animations share one camera, and not every variant's sprites were drawn alike. Two kinds of
+drawing are put right as the sprites are loaded (views.py), measured by how well each animation's 8
+views make one shape under the `wls` camera (the share of their pixels that their visual hull covers):
+
+- **Drawn about another pivot** (`ONTO_STAND`): the walks of the variants without a weapon (`wln`,
+  `wlu`, `wmn`, `wmu`, `whn`, `whu`) are drawn 3 pixels to the left of their stands, in every
+  direction: as drawn, a walk's views are no one shape with the stand's camera (a hull covers 0.72 to
+  0.79 of them), and moved, they are (1.00). The axe attacks (`wla`, `wma`) are drawn up to 5 pixels
+  aside, the further they face from S the more: moved, their frame 0 lies on the stand's (0.94 of their
+  silhouettes in common, against 0.63 and 0.72 as drawn), as an attack starts from the stand, and their
+  views are one shape again (0.95 to 1.00). The sheets show them where the stand is. (The town's
+  animations, a model of their own, are drawn a pixel aside in some variants, which their own camera
+  takes up.)
+- **A direction drawn as another** (`MISDRAWN`): `wmh`'s stand facing SW is its W drawing again, in all
+  10 frames (their silhouettes share 0.993 to 0.999, and 96% of their pixels the same index, where
+  every other variant's SW and W share about half their silhouettes; no other direction of any
+  variant's animations repeats another). With it, the stand's views are no one shape (0.886); without
+  it, they are (0.997). The view comes with nothing of it known (`ignore` everywhere): it pulls on
+  nothing, the copier takes no pixels from it, the scores and the animations' graph leave it out, and
+  its cells in the sheets are copied from the other directions, as the new directions' are.
+
+Moved onto the stand, `wla`'s attack fits to 0.886 IoU, against 0.746 as drawn, and its other
+animations gain 1.6 to 3.2 points with it. But its axe isn't found as a rigid part (see
+[Rigid parts](#rigid-parts)): in the stand it's held low, across the body in some views, so its handle
+is thin in too few of them, and its head makes it no straight line. Its head is moved by many pieces
+of the skeleton, one node each, and between the attack's frames 8 and 9, where the axe falls from
+overhead to the ground in one frame, each takes a path of its own: the head blurs, and comes apart in
+two.
+
 #### Supersampled
 
 Like the stills (see [Supersampled fitting](#gaussians)), the moving Gaussians make each pixel the
@@ -1233,10 +1276,11 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset zombie-walk --scale 4
 
 - **Animations:** the warrior with a sword's stand, walk, attack, hit and casts make one model, and
   its town stand and walk another; the attack's sword swing needed the tracking of
-  [Fast motion](#fast-motion). Deaths (only the unarmed variants have one) and the other variants and
-  characters are still to be seen; every animation needs its own preset, with its frame width. The
-  casts of 16 of the warrior's variants are cleaned (see [diablo1/casts](../diablo1/casts/README.md));
-  the others' want better lightning overlays.
+  [Fast motion](#fast-motion). The warrior's other variants take its presets (see
+  [The other variants](#the-other-variants)). Deaths (only the unarmed variants have one) and the
+  other characters are still to be seen; every animation needs its own preset, with its frame width.
+  The casts of 16 of the warrior's variants are cleaned (see
+  [diablo1/casts](../diablo1/casts/README.md)); the others' want better lightning overlays.
 - **Surfaces frame 0 hides:** the rest shape has only frame 0's Gaussians, refitted. Surfaces that
   only other frames show (the inside of an arm, the far side of a blade) could get Gaussians of
   their own. Densifying in the rest pose from every frame's views (gsplat's strategy, clones and

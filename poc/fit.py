@@ -89,7 +89,7 @@ def main(argv=None):
     """Fit and evaluate, as the command line (or argv) says. Returns the fitted scene and its folder."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mpq", required=True, help="path to DIABDAT.MPQ")
-    ap.add_argument("--preset", required=True, choices=sorted(PRESETS))
+    ap.add_argument("--preset", required=True, choices=PRESETS)
     ap.add_argument("--split", default="alternate",
                     help="alternate, cardinal, all, or holdout:K (train on every direction but K)")
     ap.add_argument("--harmonics", type=int, default=0,
