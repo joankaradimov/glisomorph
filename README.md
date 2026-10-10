@@ -58,8 +58,9 @@ through a StarCraft adapter that isn't in the repo.
 
 ![The hydralisk: three walk cycles, then a spine attack](examples/starcraft/hydralisk-walk-attack-4x.gif)
 
-**Zealot**: its psi blades break up. The game draws them as flat swooshes that change shape every
-frame, which the 3D model can't follow.
+**Zealot**: the game draws its psi blades as flat swooshes that change shape every frame, which the 3D
+model can't follow. So they're drawn apart from the body, at 1× and scaled up as pixel art: the game's
+own pixels in the directions it draws, and elsewhere the blades of each frame fitted on its own.
 
 ![The zealot: three walk cycles, then a blade attack](examples/starcraft/zealot-walk-attack-4x.gif)
 
