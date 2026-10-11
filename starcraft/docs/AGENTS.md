@@ -13,6 +13,7 @@ for every game (game data, licenses, checking claims) and the MPQ references.
 | Path                   | Contents                                                        |
 |------------------------|-----------------------------------------------------------------|
 | `docs/AGENTS.md`       | this file: ground rules, what matters for glisomorph, and references |
+| `docs/cameras.md`      | the camera each 9-direction sprite was rendered with, as fitted and checked |
 | `docs/filespecs/*.md`  | one spec per format: layout, decoding and what was checked against the real data |
 | `*.py`                 | parsers (none yet)                                              |
 
@@ -73,6 +74,11 @@ for every game (game data, licenses, checking claims) and the MPQ references.
   and walking advances a frame every tick (see [iscript.md](filespecs/iscript.md#timing)). In-betweens
   don't fit in the game's own timing: they need a renderer that draws between ticks, as D2DX does for
   Diablo II. The longer holds are on slower speeds and idle loops.
+- **The camera differs by sprite.** Fitted 3D views of the 9-direction sprites put most Terran and
+  Protoss infantry and workers at 28–38° above the ground, their vehicles and larger figures at about
+  44.5°, most Zerg at 44.5–60°, and five sprites (the goliath, the Archon, the Zerg queen, guardian and
+  overlord) behind a perspective camera (see [cameras.md](cameras.md)). A 3D fit needs each sprite's own
+  camera.
 - **Movement is often in the script.** 44 units, the infantry and the legged units among them, move
   by `move n` in their walk script, so positions advance with the frames; an in-between frame needs
   an in-between position too. Flyers, workers and the vulture glide at a speed instead.
