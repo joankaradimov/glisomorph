@@ -1,7 +1,7 @@
 """Exporters: write the frames glisomorph makes to files. See common/docs/AGENTS.md.
 
 The Sprite and Animation they all take, and the Exporter interface, are in sprite.py. The previews are
-here; game formats live with their game (starcraft/export/grp.py).
+here; game formats live with their game (starcraft/export/grp.py, diablo1/export/cl2.py).
 """
 
 from common.export.animation import AnimationExporter

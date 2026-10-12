@@ -13,7 +13,10 @@ for every game (game data, licenses, checking claims) and the MPQ references.
 |------------------------|-----------------------------------------------------------------|
 | `docs/AGENTS.md`       | this file: ground rules, what matters for glisomorph, and references |
 | `docs/filespecs/*.md`  | one spec per format: layout, decoding and what was checked against the real data |
-| `*.py`                 | parsers (none yet)                                              |
+| `palette.py`           | the PAL reader                                                  |
+| `sprites.py`           | the CEL and CL2 readers: frames as palette indices               |
+| `export/cl2.py`        | `Cl2Exporter`: a sprite's frames written as a CL2 (see [common/docs/AGENTS.md](../../common/docs/AGENTS.md)) |
+| `overlays/`, `casts/`  | spell effects drawn over the casts, and the casts cleaned of them (each with a README) |
 
 ## Game data
 
@@ -41,7 +44,7 @@ for every game (game data, licenses, checking claims) and the MPQ references.
 | Format | Spec | What it is | Status |
 |--------|------|------------|--------|
 | MPQ | [archives.md](filespecs/archives.md); the format is in [blizzard_common](../../blizzard_common/docs/filespecs/mpq.md) | archives that hold all the data | specified, checked |
-| CL2 | [cl2.md](filespecs/cl2.md) | animated directional sprites (monsters, players, missiles) | specified, checked |
+| CL2 | [cl2.md](filespecs/cl2.md) | animated directional sprites (monsters, players, missiles) | specified, checked; read and written (`sprites.py`, `export/cl2.py`) |
 | CEL | [cel.md](filespecs/cel.md) | other sprites, UI, and dungeon tiles | sprites specified and checked; tiles outlined |
 | CLX | [clx.md](filespecs/clx.md) | DevilutionX's runtime and asset sprite format | specified |
 | PAL | [pal.md](filespecs/pal.md) | 256-color palettes | specified, checked |

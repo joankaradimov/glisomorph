@@ -36,8 +36,8 @@ sprites) and `starcraft` (GRP sprites). Results and open problems are in [poc/RE
 
 The frames it makes are written out by exporters that share one interface ([common/docs/AGENTS.md](common/docs/AGENTS.md)).
 The previews are in `common/export`: a comparison with the game's frames, a file per animation, and a demo
-that turns through every direction, each as GIF, APNG or WebP. The game's own formats are with their game,
-such as StarCraft's GRP in `starcraft/export`.
+that turns through every direction, each as GIF, APNG or WebP. The game's own formats are with their game:
+StarCraft's GRP in `starcraft/export`, Diablo's CL2 in `diablo1/export`.
 
 ## Examples
 

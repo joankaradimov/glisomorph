@@ -39,7 +39,7 @@ for exporter in (GrpExporter(), DemoExporter(zoom=3)):
 | `AnimationExporter`  | `common/export/animation.py`   | an animated file per animation, every direction side by side |
 | `DemoExporter`       | `common/export/demo.py`        | one animated file: every animation in each direction in turn |
 | `GrpExporter`        | `starcraft/export/grp.py`      | a StarCraft GRP |
-| (planned)            | `diablo1/export/cl2.py`        | a Diablo CL2 |
+| `Cl2Exporter`        | `diablo1/export/cl2.py`        | a Diablo CL2 (or one per direction, as missiles) |
 | (planned)            | `fallout_common/export/frm.py` | a Fallout FRM |
 
 ## The sprite
@@ -60,7 +60,8 @@ A `Sprite` (in `export/sprite.py`) is what every exporter takes:
   the frames; previews play the animations.
 - **`palette`:** (256, 3), the colors the indices show in, player colors already swapped in.
 - **`pivot`:** where the unit stands on the canvas. It defaults to the canvas center, rounded down,
-  which is StarCraft's convention. Previews line frames up by it, and so do the original and ours in a
+  which is StarCraft's convention. Diablo's is x = width / 2, 16 pixels above the bottom row, so a
+  Diablo sprite sets it. Previews line frames up by it, and so do the original and ours in a
   comparison.
 - **`scale`:** pixels per game pixel, such as 4 for a 4× render.
 - **`new_directions` and `new_frames`:** what glisomorph made rather than the game. Previews number new
@@ -148,6 +149,22 @@ A game format exporter writes the cells the way the game stores them:
   animations aren't written: the iscript holds them.
 - **Pivot:** at the canvas center.
 - **Encoding:** see [Writing](../../starcraft/docs/filespecs/grp.md#writing) in the GRP spec.
+
+`Cl2Exporter(check=True, directions=8, ground=16, split=False)`, in `diablo1/export/cl2.py`:
+
+- **One animation per file:** a CL2 holds one animation of one unit, so it takes a sprite per file, its
+  frames in the order the game plays them. The animations aren't written, nor the frames' width: the
+  game's tables hold them ([sprite-metadata.md](../../diablo1/docs/filespecs/sprite-metadata.md)).
+- **Directions:** players and monsters are sheets of 8 groups, a frame's 8 cells in the order S, SW, W,
+  NW, N, NE, E, SE. A frame with one cell goes into every group. Missiles are frame lists:
+  `directions=1` writes one, and `split=True` one per direction, `<name>1.cl2` to `<name>N.cl2`, as the
+  Fireball's 16 are.
+- **Pivot:** the unit at x = width / 2, `ground` pixels above the bottom row: 16, the tile center, for
+  players and monsters. A missile is shifted by its table instead, so `ground=None` doesn't check it.
+- **Canvas:** every frame keeps the whole canvas, as the game's own do. Its width has to be the one the
+  game's table gives that file.
+- **Encoding:** the game's own, so that the game's frames re-encode to their own bytes; see
+  [Writing](../../diablo1/docs/filespecs/cl2.md#writing) in the CL2 spec.
 
 ## Adding an exporter
 
