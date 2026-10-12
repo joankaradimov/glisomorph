@@ -42,7 +42,7 @@ from PIL import Image, ImageDraw
 from poc import fit
 from poc.evaluate import Renderer, quantize, score
 from poc.field import VoxelField, allowed_masks, camera_basis, carve, pixel_rays
-from poc.gaussians import DISTANCE, GaussianField, intrinsics, viewmat
+from poc.gaussians import GaussianField, camera_distance, intrinsics, viewmat
 from poc.reproject import Warp
 from poc.scene import Scene, masks_for
 from poc.views import PRESETS, View, load_views
@@ -65,7 +65,7 @@ def render_at(field, shape, pivot, offset, basis, scale: int):
     h, w = shape
     K = intrinsics(pivot, offset, right.device, scale)
     colors, alpha, _ = field.rasterize(viewmat(right, up, forward)[None], K[None], w * scale, h * scale)
-    return colors[0, ..., :3], alpha[0, ..., 0], colors[0, ..., 3] - DISTANCE
+    return colors[0, ..., :3], alpha[0, ..., 0], colors[0, ..., 3] - camera_distance()
 
 
 def fit_views(views, masks, palette, yaws, elevation, offset, iters: int, supersample: int, device):

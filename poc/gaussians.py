@@ -10,6 +10,10 @@ f * x + c, without a perspective divide. With f = 1 and c at the pivot, that is 
 turntable camera: one pixel per world unit, the world origin at the pivot. The camera sits
 `DISTANCE` back along its view, which only has to clear the model (gsplat culls Gaussians behind
 the camera).
+
+With a perspective camera (field.set_perspective), gsplat's pinhole camera maps them to f * x / z + c
+instead. The camera sits the perspective distance D back, and f = D, so the plane through the rotation
+axis is drawn at one pixel per world unit.
 """
 
 import math
@@ -20,27 +24,42 @@ import torch.nn.functional as F
 from gsplat import rasterization
 from gsplat.strategy import DefaultStrategy
 
-from poc.field import pixel_rays, pool
+from poc.field import perspective, pixel_rays, pool
 
 DISTANCE = 1000.0
+
+
+def camera_distance() -> float:
+    """How far back along its view the camera sits: the perspective distance, or for an orthographic
+    camera DISTANCE (any distance that clears the model). A rendered depth less this is the depth along the
+    view from the plane through the world origin."""
+    d = perspective()
+    return DISTANCE if d is None else d
+
+
+def camera_model() -> str:
+    """gsplat's camera model for the turntable camera."""
+    return "ortho" if perspective() is None else "pinhole"
 
 
 def viewmat(right, up, forward):
     """World-to-camera transform (4, 4), in gsplat's convention: x right, y down, z forward."""
     m = torch.eye(4, device=right.device)
     m[0, :3], m[1, :3], m[2, :3] = right, -up, forward
-    m[2, 3] = DISTANCE
+    m[2, 3] = camera_distance()
     return m
 
 
 def intrinsics(pivot, offset, device, supersample: int = 1):
     """(3, 3): one pixel per world unit (times `supersample`), the world origin at the pivot plus the
-    calibrated offset."""
+    calibrated offset. (A perspective camera's focal length is its distance in pixels, so that the plane
+    through the origin is drawn at that scale.)"""
     s = supersample
     offset = torch.as_tensor(offset, device=device, dtype=torch.float32)
     center = (torch.tensor(pivot, device=device, dtype=torch.float32) + offset) * s
-    zero, one = torch.zeros((), device=device), torch.full((), float(s), device=device)
-    return torch.stack([torch.stack([one, zero, center[0]]), torch.stack([zero, one, center[1]]),
+    zero = torch.zeros((), device=device)
+    focal = torch.full((), float(s) * (1.0 if perspective() is None else perspective()), device=device)
+    return torch.stack([torch.stack([focal, zero, center[0]]), torch.stack([zero, focal, center[1]]),
                         torch.stack([zero, zero, torch.ones((), device=device)])])
 
 
@@ -76,7 +95,7 @@ class GaussianField(torch.nn.Module):
         p = self.params
         return rasterization(p["means"], F.normalize(p["quats"], dim=-1), torch.exp(p["scales"]),
                              torch.sigmoid(p["opacities"]), torch.sigmoid(p["colors"]), viewmats, Ks, width, height,
-                             camera_model="ortho", render_mode="RGB+ED", packed=False)
+                             camera_model=camera_model(), render_mode="RGB+ED", packed=False)
 
     def render(self, height, width, pivot, offset, right, up, forward, samples=None, jitter=False, yaw_rad=None,
                supersample: int = 1):
@@ -87,7 +106,7 @@ class GaussianField(torch.nn.Module):
                                           intrinsics(pivot, offset, self.params["means"].device, s)[None],
                                           width * s, height * s)
         colors, alpha = colors[0], alpha[0, ..., 0]
-        depth = colors[..., 3] - DISTANCE
+        depth = colors[..., 3] - camera_distance()
         self.last_depth = pool(depth * alpha, s) / pool(alpha, s).clamp(min=1e-6)
         self.last_surface = self.last_depth
         self.last_origins = pixel_rays(height, width, pivot, offset, right, up, forward)[0]

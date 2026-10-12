@@ -69,8 +69,8 @@ from poc.animate import write_gif, write_sheet
 from poc.casts import effect_pixels
 from poc.edges import clean_edges, edges_over_black
 from poc.evaluate import add_warp_arguments, quantize, score, warp_from_args
-from poc.field import camera_basis, pixel_rays
-from poc.gaussians import DISTANCE, GaussianField, intrinsics, viewmat
+from poc.field import camera_basis, pixel_rays, unproject
+from poc.gaussians import GaussianField, camera_distance, camera_model, intrinsics, viewmat
 from poc.ramps import Ramps
 from poc.reproject import choose, fetch, fill, neighbour, smooth_depth, source_depth
 from poc.scene import Scene, masks_for
@@ -482,7 +482,7 @@ class MovingGaussians(torch.nn.Module):
             Ks[:, :2] *= s  # s samples per world unit, the origin where it was
         means, quats = self.pose(phase)
         self.last_means = means  # for the transport's pull, without posing again
-        common = dict(camera_model="ortho", render_mode="RGB+ED", packed=False)
+        common = dict(camera_model=camera_model(), render_mode="RGB+ED", packed=False)
         if not self.lit:
             out, alpha, info = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
                                              torch.sigmoid(self.colors), viewmats, Ks, width * s, height * s, **common)
@@ -513,11 +513,11 @@ class MovingGaussians(torch.nn.Module):
         K[:2] *= s
         means, quats = self.pose(phase)
         out, alpha, _ = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities), self.means0,
-                                      viewmat_[None], K[None], width * s, height * s, camera_model="ortho",
+                                      viewmat_[None], K[None], width * s, height * s, camera_model=camera_model(),
                                       render_mode="RGB+ED", packed=False)
         out, alpha = average_down(out, alpha, s)
         a = alpha[0, ..., 0]
-        return out[0, ..., :3] / a.clamp(min=1e-6)[..., None], a, out[0, ..., 3] - DISTANCE
+        return out[0, ..., :3] / a.clamp(min=1e-6)[..., None], a, out[0, ..., 3] - camera_distance()
 
     def nodes_of(self, flat, where, part=None):
         """The nodes (P, bind) that points (P, 3) follow, with their weights (P, bind, 1): the nearest
@@ -680,8 +680,8 @@ class PixelCopier:
         # nearest Gaussian's per-frame correction is taken off here, and the source frame's added back.
         s0 = self.sources[0]
         scale = h // s0["indices"].shape[0]  # cells may be drawn larger than the originals
-        posed = pixel_rays(h // scale, w // scale, s0["pivot"], s0["offset"], right, up, forward,
-                           supersample=scale)[0] + depth[..., None] * forward
+        posed = unproject(pixel_rays(h // scale, w // scale, s0["pivot"], s0["offset"], right, up, forward,
+                                     supersample=scale)[0], depth, forward)
         rest = model.unpose_points(posed, slot_phase)
         near_gaussian = torch.zeros(solid.shape, dtype=torch.long, device=rest.device)
         part = None
@@ -760,7 +760,7 @@ def surface_points(colors, alphas, origins, forward, color_scale: float = 60.0):
     forward (C, 3) the views' directions. Every pixel counts once, so a thin blade, made of many faint
     Gaussians, weighs as much as its pixels."""
     solid = alphas[..., 0] > 0.5
-    points = origins + (colors[..., 3] - DISTANCE)[..., None] * forward[:, None, None]
+    points = unproject(origins, colors[..., 3] - camera_distance(), forward[:, None, None])
     color = (colors[..., :3] / alphas.clamp(min=1e-6)).clamp(0, 1)
     return torch.cat([points, color_scale * color], -1)[solid]
 

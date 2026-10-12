@@ -2,12 +2,51 @@
 
 World units are sprite pixels. y is up; the rotation axis is the y axis. A view with yaw phi and
 camera elevation theta looks at the origin from azimuth phi, theta above the horizon.
+
+The turntable camera is orthographic: one pixel per world unit everywhere. With a distance set
+(set_perspective), it's a pinhole instead, that far from the rotation axis and drawing one pixel per world
+unit there, nearer things larger. Some games rendered sprites so: StarCraft's goliath, from about 85 pixels
+(starcraft/docs/cameras.md has the others).
+It's one camera per process: fit.py sets it from its camera, Scene.load from the scene's. The voxel
+renderer stays orthographic; projection (carve, silhouettes, reproject.fetch) and the Gaussian renderers
+follow the setting.
 """
 
 import math
 
 import torch
 import torch.nn.functional as F
+
+PERSPECTIVE = None  # the camera's distance from the rotation axis, in pixels; None: orthographic
+
+
+def set_perspective(distance) -> None:
+    """Make the turntable camera a pinhole `distance` pixels from the rotation axis (None: orthographic)."""
+    global PERSPECTIVE
+    PERSPECTIVE = None if distance is None else float(distance)
+
+
+def perspective():
+    """The camera's distance from the rotation axis, or None for an orthographic camera."""
+    return PERSPECTIVE
+
+
+def project(points: torch.Tensor, right, up, forward, pivot, offset):
+    """Where points (..., 3) are drawn: pixel coordinates across and down, continuous. A pinhole draws a
+    point D / (D + depth) as large as the plane through the origin does, depth along `forward`."""
+    across, upward = points @ right, points @ up
+    if PERSPECTIVE is not None:
+        scale = PERSPECTIVE / (PERSPECTIVE + points @ forward)
+        across, upward = across * scale, upward * scale
+    return across + pivot[0] + offset[0], pivot[1] + offset[1] - upward
+
+
+def unproject(origins: torch.Tensor, depth: torch.Tensor, forward: torch.Tensor) -> torch.Tensor:
+    """The points pixels show at a depth (...) along `forward` from the plane through the origin, given
+    where their rays cross that plane (pixel_rays' origins, (..., 3)); `forward` broadcasts against them."""
+    if PERSPECTIVE is None:
+        return origins + depth[..., None] * forward
+    return origins * ((PERSPECTIVE + depth) / PERSPECTIVE)[..., None] + depth[..., None] * forward
 
 
 def camera_basis(yaw_deg: torch.Tensor, elevation: torch.Tensor):
@@ -23,7 +62,9 @@ def camera_basis(yaw_deg: torch.Tensor, elevation: torch.Tensor):
 
 
 def pixel_rays(height: int, width: int, pivot, offset, right, up, forward, supersample: int = 1):
-    """Origins on the plane through the world origin, and the shared direction (3,).
+    """Origins on the plane through the world origin, and the shared direction (3,). (With a perspective
+    camera the rays aren't parallel: the origins are where they cross that plane, and unproject finds
+    the points they reach.)
 
     With supersample s, each pixel gets s x s rays at the centers of its sub-pixels, and origins is
     (H*s, W*s, 3); otherwise it's (H, W, 3) with one ray through each pixel center.
@@ -104,6 +145,8 @@ class VoxelField(torch.nn.Module):
                supersample: int = 1):
         """Sample points along every ray: points (h, w, S, 3), depths t (h, w, S), step length (h, w, 1),
         where (h, w) is the view's size times `supersample`."""
+        if PERSPECTIVE is not None:
+            raise NotImplementedError("voxel fields march parallel rays: an orthographic camera only")
         origins, direction = pixel_rays(height, width, pivot, offset, right, up, forward, supersample)
         h, w = origins.shape[:2]
         near, far = ray_box(origins, direction, self.box_min, self.box_max)
@@ -265,8 +308,8 @@ def carve(field: VoxelField, allowed, views, right, up, offset):
     inside = torch.ones(centers.shape[:3], dtype=torch.bool, device=centers.device)
     for mask, view, r, u in zip(allowed, views, right, up):
         h, w = mask.shape
-        col = torch.floor((centers @ r) + view.pivot[0] + offset[0]).long()
-        row = torch.floor((view.pivot[1] + offset[1]) - (centers @ u)).long()
+        x, y = project(centers, r, u, torch.linalg.cross(u, r), view.pivot, offset)  # forward is up x right
+        col, row = torch.floor(x).long(), torch.floor(y).long()
         valid = (col >= 0) & (col < w) & (row >= 0) & (row < h)
         value = torch.zeros_like(col, dtype=torch.bool)
         value[valid] = mask[row[valid], col[valid]]
@@ -280,8 +323,8 @@ def silhouettes(inside, field: VoxelField, views, right, up, offset):
     out = []
     for view, r, u in zip(views, right, up):
         h, w = view.shape
-        x = torch.floor(centers @ r + view.pivot[0] + offset[0]).long()
-        y = torch.floor(view.pivot[1] + offset[1] - centers @ u).long()
+        x, y = project(centers, r, u, torch.linalg.cross(u, r), view.pivot, offset)
+        x, y = torch.floor(x).long(), torch.floor(y).long()
         valid = (x >= 0) & (x < w) & (y >= 0) & (y < h)
         m = torch.zeros((h, w), dtype=torch.bool, device=centers.device)
         m[y[valid], x[valid]] = True

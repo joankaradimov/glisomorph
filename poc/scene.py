@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from poc.field import LitVoxelField, VoxelField, camera_basis
+from poc.field import LitVoxelField, VoxelField, camera_basis, set_perspective
 from poc.shadow import baked_shadow
 from poc.views import PRESETS, Preset, View, load_views
 
@@ -109,9 +109,12 @@ class Scene:
 
     @classmethod
     def load(cls, path, mpq_path: str, device=None) -> "Scene":
+        """A saved scene. Its camera becomes the process's: orthographic, or the perspective camera it was
+        fitted with (field.set_perspective), so that renders of it match."""
         device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         data = torch.load(path, map_location=device)
         config = data["config"]
+        set_perspective(config.get("perspective"))
         preset = dataclasses.replace(PRESETS[config["preset"]], frame=config["frame"])
         views, palette = load_views(mpq_path, preset)
         if config.get("model") == "gaussians":

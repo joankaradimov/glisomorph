@@ -24,6 +24,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from poc.field import project, unproject
+
 
 @dataclass
 class Warp:
@@ -133,8 +135,7 @@ def fetch(points: torch.Tensor, source: dict, tolerance: float, ramps=None):
     interpolated (bilinearly) between the neighbouring pixels of the same ramp and surface; without
     `ramps` it's None."""
     h, w = source["indices"].shape
-    x = points @ source["right"] + source["pivot"][0] + source["offset"][0]       # in pixels, across
-    y = source["pivot"][1] + source["offset"][1] - points @ source["up"]         # in pixels, down
+    x, y = project(points, source["right"], source["up"], source["forward"], source["pivot"], source["offset"])
     col, row = torch.floor(x).long(), torch.floor(y).long()
     inside = (col >= 0) & (col < w) & (row >= 0) & (row < h)
     col, row = col.clamp(0, w - 1), row.clamp(0, h - 1)
@@ -225,7 +226,7 @@ def reproject(target: dict, sources: list[dict], warp: Warp, ramps=None):
     depth = target["depth"]
     if warp.smooth:
         depth, slope_c, slope_r = smooth_depth(depth, solid, warp.smooth)
-    points = target["origins"] + depth[..., None] * target["forward"]
+    points = unproject(target["origins"], depth, target["forward"])
     interpolate = ramps is not None and warp.interpolate
     fetched = [fetch(points, s, warp.tolerance, ramps if interpolate else None) for s in sources]
     index = torch.stack([f[0] for f in fetched])                                  # (S, H, W)

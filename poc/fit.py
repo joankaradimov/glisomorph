@@ -25,7 +25,7 @@ import torch
 
 from poc.edges import clean_edges, edges_over_black
 from poc.evaluate import add_warp_arguments, evaluate, warp_from_args
-from poc.field import VoxelField, allowed_masks, camera_basis, carve, silhouettes
+from poc.field import VoxelField, allowed_masks, camera_basis, carve, perspective, set_perspective, silhouettes
 from poc.scene import Scene, make_field, masks_for
 from poc.views import PRESETS, load_views
 
@@ -129,6 +129,9 @@ def main(argv=None):
     ap.add_argument("--calibrate-with", nargs="*", default=[], metavar="PRESET:FRAME",
                     help="calibrate on these frames' silhouettes too (other frames and animations of the same "
                          "model): one camera for all, less noisy than one frame's")
+    ap.add_argument("--perspective", type=float, default=None, metavar="PIXELS",
+                    help="a perspective camera this far from the rotation axis (default: orthographic); with "
+                         "--camera, the camera's own is taken")
     ap.add_argument("--voxel", type=float, default=1.0, help="voxel size in pixels (0.6 suits thin sprites)")
     ap.add_argument("--iters", type=int, default=2000)
     ap.add_argument("--lr", type=float, default=0.05)
@@ -191,9 +194,12 @@ def main(argv=None):
     if args.camera:
         saved = torch.load(Path(args.camera) / "scene.pt", map_location="cpu")
         sign, elev_deg, off = saved["config"]["yaw_sign"], math.degrees(saved["elevation"]), tuple(saved["offset"])
+        set_perspective(saved["config"].get("perspective"))
         coverage = None
-        print("camera from %s: yaw sign %+d, elevation %.1f deg, pivot offset %s" % (args.camera, sign, elev_deg, off))
+        print("camera from %s: yaw sign %+d, elevation %.1f deg, pivot offset %s%s" % (
+            args.camera, sign, elev_deg, off, "" if perspective() is None else ", perspective at %g px" % perspective()))
     else:
+        set_perspective(args.perspective)
         coarse = VoxelField(box_min, box_max, 1.0, device)
         frames = [(train_views, train_masks)] + others
         offsets = [(dx, dy) for dx in (-2, -1, 0, 1, 2) for dy in range(-6, 7, 2)]
@@ -223,7 +229,7 @@ def main(argv=None):
               "lighting": args.lighting if lit else "none", "lights": args.lights, "harmonics": args.harmonics,
               "coupled_normals": args.coupled_normals, "voxel": args.voxel, "box_min": box_min, "box_max": box_max,
               "supersample": args.supersample, "snap": args.snap, "keyed": args.keyed,
-              "edges": args.edges, "yaw_sign": sign}
+              "edges": args.edges, "yaw_sign": sign, "perspective": perspective()}
     yaw_rad = torch.deg2rad(yaws)
     if gaussians:
         from poc.gaussians import GaussianField  # needs gsplat
