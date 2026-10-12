@@ -310,6 +310,13 @@ report flaws that a byte comparison can't find. They haven't been checked here:
 - odd camera angles in the Gargoyle's, Rhino's and Zombie's deaths;
 - only 3 truly different directions in the goat archer's death.
 
+One flaw a byte comparison can't find was checked here. In `plrgfx/warrior/wmh/wmhas.cl2`, the stand of
+the Warrior in medium armor with a mace and shield, SW is W drawn again, in all 10 frames. Their
+silhouettes share 0.993 to 0.999 (intersection over union), and 96 to 98% of their pixels have the same
+index. That's close, but not byte for byte. Every other Warrior's SW and W share about half their
+silhouettes. Comparing every two directions of every Warrior animation, one frame each, found no other
+such pair. glisomorph leaves that view out (`MISDRAWN` in `poc/views.py`).
+
 ## Checked against the game data
 
 Every player, monster and missile file named by the rules above was decoded with the widths above:
