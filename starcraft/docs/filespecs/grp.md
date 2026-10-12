@@ -104,6 +104,26 @@ top  = position.y + y − height / 2
 with `width` and `height` the canvas's, divided rounding down. Overlays such as muzzle flashes and
 fire are placed per frame from [LO* files](dat.md#lo-overlay-offsets).
 
+## Reading and writing
+
+`starcraft/grp.py` reads the run-length GRPs into frames on the whole canvas: palette indices, -1 where
+transparent. `starcraft/export/grp.py` writes them; see [common/docs/AGENTS.md](../../../common/docs/AGENTS.md)
+for the sprite it takes.
+
+### Writing
+
+- **Boxes:** each frame is stored as the smallest box holding what it draws. A frame that draws nothing
+  gets a 1×1 box with its one pixel transparent. The header's bytes limit a box to 255 pixels from the
+  canvas's left and top edges, and 255 across and down.
+- **Runs**, row by row, left to right:
+  - transparent pixels in runs of up to 127;
+  - three or more of one index as a repeat run, of up to 63;
+  - anything else copied as is, up to 63 at a time, stopping before the next gap or run of three.
+- **Shared data:** identical frames share their data, as in the game's own GRPs.
+- **Not byte-identical:** the game's encoder chose differently in places. A rebuilt GRP decodes to the
+  same pixels, but isn't the same bytes.
+- **Check:** after writing, the file is read back and compared with the frames, pixel for pixel.
+
 ## Checked against the game data
 
 Checked on the MPQs of a 2017 classic install (`StarDat.mpq`, `BrooDat.mpq`, `patch_rt.mpq`):
@@ -120,6 +140,13 @@ Checked on the MPQs of a 2017 classic install (`StarDat.mpq`, `BrooDat.mpq`, `pa
 - That direction 0 faces north and the directions run clockwise, from the attack and carry
   overlays: where the defiler, drone, guardian, archon, SCV, siege tank turret and wraith fire from
   or carry things is above the center in frame 0, to its right in frame 8 and below it in frame 16.
+- `grp.py` and `export/grp.py`, on the same 833:
+  - Each one reads, and re-encodes to the same pixels.
+  - 14 come out byte for byte the same. The rest differ where the game's encoder chose other runs: 776
+    of ours are smaller and 4 larger.
+- The writer, on 64 GRPs made into 17 directions: the 9-direction Terran, Protoss and Zerg sprites,
+  shadows and effects. Each read back pixel for pixel. These were checked with the reader here, not by
+  loading them in the game.
 
 ## Sources
 

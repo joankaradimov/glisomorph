@@ -25,10 +25,11 @@ a sprite and returns the files it wrote. So any exporter can write any sprite, a
 handed a list of them:
 
 ```python
-from common.export import Animation, AnimationExporter, DemoExporter, Sprite
+from common.export import Animation, ComparisonExporter, DemoExporter, Sprite
+from starcraft.export import GrpExporter
 
 sprite = Sprite(cells, palette, [Animation("walk", [0, 1, 2, 3], [67] * 4)], new_directions={1, 3, 5})
-for exporter in (AnimationExporter(), DemoExporter(zoom=3)):
+for exporter in (GrpExporter(), DemoExporter(zoom=3)):
     exporter.export(sprite, ...)
 ```
 
@@ -37,7 +38,7 @@ for exporter in (AnimationExporter(), DemoExporter(zoom=3)):
 | `ComparisonExporter` | `common/export/comparison.py`  | one animated file: the game's frames above ours, every direction |
 | `AnimationExporter`  | `common/export/animation.py`   | an animated file per animation, every direction side by side |
 | `DemoExporter`       | `common/export/demo.py`        | one animated file: every animation in each direction in turn |
-| (planned)            | `starcraft/export/grp.py`      | a StarCraft GRP |
+| `GrpExporter`        | `starcraft/export/grp.py`      | a StarCraft GRP |
 | (planned)            | `diablo1/export/cl2.py`        | a Diablo CL2 |
 | (planned)            | `fallout_common/export/frm.py` | a Fallout FRM |
 
@@ -139,6 +140,14 @@ A game format exporter writes the cells the way the game stores them:
 - **What it refuses:** anything the format can't hold, with a message: RGBA cells, a direction count
   the game doesn't use, a pivot off where the game puts it, frames too large.
 - **Checking:** when there's a reader, it reads the file back and compares it with the cells.
+
+`GrpExporter(check=True)`, in `starcraft/export/grp.py`:
+
+- **Frames:** written in order, each frame's directions together. A turning frame's 17 cells (directions
+  0 to 16 of 32) are one animation step of 17 GRP frames, and a single cell is one GRP frame. The
+  animations aren't written: the iscript holds them.
+- **Pivot:** at the canvas center.
+- **Encoding:** see [Writing](../../starcraft/docs/filespecs/grp.md#writing) in the GRP spec.
 
 ## Adding an exporter
 

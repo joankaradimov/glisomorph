@@ -15,7 +15,8 @@ for every game (game data, licenses, checking claims) and the MPQ references.
 | `docs/AGENTS.md`       | this file: ground rules, what matters for glisomorph, and references |
 | `docs/cameras.md`      | the camera each 9-direction sprite was rendered with, as fitted and checked |
 | `docs/filespecs/*.md`  | one spec per format: layout, decoding and what was checked against the real data |
-| `*.py`                 | parsers (none yet)                                              |
+| `grp.py`               | the GRP reader: frames as palette indices on the canvas          |
+| `export/grp.py`        | `GrpExporter`: a sprite's frames written as a GRP (see [common/docs/AGENTS.md](../../common/docs/AGENTS.md)) |
 
 ## Game data
 
@@ -56,7 +57,7 @@ for every game (game data, licenses, checking claims) and the MPQ references.
 | Format | Spec | What it is | Status |
 |--------|------|------------|--------|
 | MPQ | [archives.md](filespecs/archives.md); the format is in [blizzard_common](../../blizzard_common/docs/filespecs/mpq.md) | the archives | specified, checked |
-| GRP | [grp.md](filespecs/grp.md) | sprite frames | specified, checked on every sprite |
+| GRP | [grp.md](filespecs/grp.md) | sprite frames | specified, checked on every sprite; read and written (`grp.py`, `export/grp.py`) |
 | iscript.bin | [iscript.md](filespecs/iscript.md) | animation scripts: frames, timing, overlays, shadows | specified, opcode sizes checked on the whole file |
 | `.dat`, LO*, `.tbl` | [dat.md](filespecs/dat.md) | units → flingy → sprites → images; overlay offsets; strings | specified, layouts checked |
 | WPE, PCX remaps, draw functions | [palettes.md](filespecs/palettes.md) | palettes, player colors, shadows, glows | specified; partly checked |

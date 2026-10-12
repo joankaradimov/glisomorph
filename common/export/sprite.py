@@ -4,6 +4,7 @@ A Sprite is a set of frames, each drawn in every direction, and the animations t
 
     sprite = Sprite(cells, palette, animations=[Animation("walk", [0, 1, 2, 3], [67] * 4)])
     ComparisonExporter(zoom=1).export(sprite, "out/marine.gif")
+    GrpExporter().export(sprite, "out/marine.grp")
 
 cells[f][d] is frame f in direction d. A cell is an (H, W) array of palette indices, -1 where transparent,
 or, for previews only, an (H, W, 4) uint8 RGBA array (for what isn't drawn through the palette: glows,
