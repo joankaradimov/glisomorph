@@ -898,8 +898,9 @@ their own. The town's stand and walk (0.36 to 0.41) are a graph of their own (se
 the hub, so after its last frame it goes on to the hub, not back to its first: an animation whose last
 frame shares 0.7 of its silhouette with the first one's frame 0, and more than with its own frame 0
 (the hit: 0.75, against 0.70), is drawn into it (the in-between after its last frame, `warrior-hit`
-among the presets). The town walk ends as near its own start as the town stand's (0.77, against 0.76),
-and loops.
+among the presets), and that in-between's pixels are copied from the hub's first frame too, the frame
+after its last (not from its own first, as if it looped). The town walk ends as near its own start as
+the town stand's (0.77, against 0.76), and loops.
 
 Fitted as one, naively, every animation came out worse than fitted alone. Three things closed the gap:
 

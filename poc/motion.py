@@ -647,9 +647,12 @@ class PixelCopier:
     rest-pose point (MovingGaussians.rest_points) is moved to each nearby original frame, projected
     into its nearby directions, and takes the palette index there from one that sees it, as
     reproject.py does across directions alone: nearer frames and directions cost less, regions keep
-    to one source, and shades are interpolated within the palette's ramps."""
+    to one source, and shades are interpolated within the palette's ramps. A source is drawn at its
+    slot of the model, and its time is its place in the animation: frames from the start, around a
+    loop of `slots` frames, or straight on (slots None) for an animation that runs on into another's
+    frame, whose source comes after its last."""
 
-    def __init__(self, model, sources, warp, ramps, slots: int):
+    def __init__(self, model, sources, warp, ramps, slots: int | None):
         self.model, self.sources, self.warp, self.ramps, self.slots = model, sources, warp, ramps, slots
 
     def __call__(self, slot_phase, yaw, camera, own):
@@ -671,9 +674,12 @@ class PixelCopier:
             d = abs(a - b) % period
             return min(d, period - d)
 
+        def frames_apart(time):
+            return gap(time, slot_phase, self.slots) if self.slots else abs(time - slot_phase)
+
         angles = [gap(s["yaw"], yaw, 360.0) for s in self.sources]
         nearest_angle = max(min(angles), 1.0)
-        costs = [a / nearest_angle + gap(s["slot"], slot_phase, self.slots) for s, a in zip(self.sources, angles)]
+        costs = [a / nearest_angle + frames_apart(s["time"]) for s, a in zip(self.sources, angles)]
         chosen = sorted(range(len(self.sources)), key=lambda i: costs[i])[:6]
         # Each pixel's surface point, from the depth, moved back to the rest pose. (Rendering rest
         # positions as colors would give a wide Gaussian's center to every pixel it covers.) The
@@ -1421,20 +1427,26 @@ def main():
             return quantize(colors[0, ..., :3], alphas[0, ..., 0], palette, candidates)
 
         # The originals the copier may take pixels from: every fitted frame of the animation in every
-        # fitted direction where it's known, with the model's depth there for the visibility test.
-        sources = []
-        for i, k in enumerate(a.frames):
-            for d in train_dirs:
-                if a.views[k][d].unseen:  # an empty source would still be one of the nearest few
-                    continue
-                r, u, f, vm, _ = camera(float(yaws[d]))
-                _, alpha, depth = model.rest_points(a.start + i, vm, a.K, a.w, a.h)
-                sources.append({"view": d, "slot": a.start + i, "yaw": float(yaws[d]), "right": r, "up": u,
-                                "forward": f, "pivot": a.pivot, "offset": offset,
-                                "indices": torch.as_tensor(model_indices(a.views[k][d], a, redraw=False),
-                                                           device=device).long(),
-                                "depth": source_depth(depth, alpha >= 0.5, warp)})
-        copier = PixelCopier(model, sources, warp, Ramps(palette), len(a.frames))
+        # fitted direction where it's known, with the model's depth there for the visibility test. An
+        # animation that runs on into the hub (a.returns) has the hub's first frame after its last: its
+        # last in-between is posed halfway there, not back to its own first frame.
+        def source(b, i, d, time):
+            """Animation b's i-th fitted frame in direction d, at a time of the animation drawn."""
+            r, u, f, vm, _ = camera(float(yaws[d]))
+            _, alpha, depth = model.rest_points(b.start + i, vm, b.K, b.w, b.h)
+            return {"view": d, "slot": b.start + i, "time": time, "anim": b, "frame": b.frames[i],
+                    "yaw": float(yaws[d]), "right": r, "up": u, "forward": f, "pivot": b.pivot, "offset": offset,
+                    "indices": torch.as_tensor(model_indices(b.views[b.frames[i]][d], b, redraw=False),
+                                               device=device).long(),
+                    "depth": source_depth(depth, alpha >= 0.5, warp)}
+
+        # (an empty source would still be one of the nearest few)
+        sources = [source(a, i, d, a.start + i) for i, k in enumerate(a.frames) for d in train_dirs
+                   if not a.views[k][d].unseen]
+        if a.returns:
+            sources += [source(base, 0, d, a.start + len(a.frames)) for d in train_dirs
+                        if not base.views[base.frames[0]][d].unseen]
+        copier = PixelCopier(model, sources, warp, Ramps(palette), None if a.returns else len(a.frames))
 
         def copied(frame_phase, d_yaw, own=None):
             if own is None:
@@ -1550,8 +1562,8 @@ def main():
             K_big = intrinsics(a.pivot, offset, device, S)
             model.supersample = max(1, fine // S)
             big_copier = PixelCopier(model, [dict(s, indices=torch.as_tensor(model_indices(
-                a.views[a.frames[s["slot"] - a.start]][s["view"]], a), device=device).long()) for s in sources],
-                warp, Ramps(palette), len(a.frames))
+                s["anim"].views[s["frame"]][s["view"]], s["anim"]), device=device).long()) for s in sources],
+                warp, Ramps(palette), copier.slots)
 
             def big_cell(step, n):
                 d_yaw = sign * n * 22.5
