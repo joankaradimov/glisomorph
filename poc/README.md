@@ -484,8 +484,10 @@ is one bit, but the Gaussians are fitted to the squared distance from each pixel
 to full opacity. `--snap T` fits colors as they'll be snapped instead: by cross-entropy over the
 palette's colors, softened by the temperature T, so that any color nearest the right palette color
 will do. `--keyed` does the same for transparency: any opacity above a half is solid. Both are
-options of fit.py (Gaussians) and of motion.py's refinement, off by default. On the warrior's stance
-(SW hidden) and the zombie's walk (moving Gaussians, 4 x 4, odd frames hidden):
+options of fit.py (Gaussians), off by default, and of motion.py: `--snap` in its refinement, off by
+default, and `--keyed` in its stills and refinement, on by default now (see
+[Keyed outlines](#keyed-outlines)). On the warrior's stance (SW hidden) and the zombie's walk (moving
+Gaussians, 4 x 4, odd frames hidden, fitted before motion.py keyed them):
 
 | IoU / exact / RGB error | Fitted cells, own colors | Hidden cells, own colors | Hidden cells, copied |
 |---|---|---|---|
@@ -504,7 +506,8 @@ options of fit.py (Gaussians) and of motion.py's refinement, off by default. On 
   surface one color, a compromise between the views' shading), not how it's matched to the palette.
   The moving Gaussians' own colors, lit, gain a point.
 - **Outlines lose a point or so,** with `--keyed` on the stance and with `--snap` on the zombie, and
-  the copied pixels with them.
+  the copied pixels with them. (The moving Gaussians' outlines gain with `--keyed`, their hidden
+  frames' too: see [Keyed outlines](#keyed-outlines).)
 
 ### Moving Gaussians
 
@@ -1059,6 +1062,53 @@ is thin in too few of them, and its head makes it no straight line. Its head is 
 of the skeleton, one node each, and between the attack's frames 8 and 9, where the axe falls from
 overhead to the ground in one frame, each takes a path of its own: the head blurs, and comes apart in
 two.
+
+#### Keyed outlines
+
+The heavy armor's swords fitted worst of the variants: `whs` and `whd` walked at 0.913 and 0.915 IoU,
+where most walk at 0.94. Not for their black plate (index 0 is taken for shadow only in the shadow),
+but for soft edges. Fitted as coverage, every solid pixel pulled toward full opacity, the Gaussians
+spread a little past the outline, and pixels there at 51 to 63% opacity count as solid. The frames'
+stills already lost a point of IoU to such pixels (0.2 in the other variants), half of it on the
+blade, and the moving Gaussians kept them. `--keyed` fits opacity as the sprites' 1-bit transparency
+instead, any above a half solid (see Fitting the palette, in [Gaussians](#gaussians)): a still of
+`whs`'s walk then fits at 1.000 IoU, against 0.988. It's now motion.py's default, in the stills and
+in the refinement (`--no-keyed` for neither). `whs`'s fitted cells, IoU / exact:
+
+| `whs` | `--no-keyed` | Keyed refinement only | Keyed |
+|---|---|---|---|
+| Stand | 0.951 / 47.4% | 0.969 / 45.8% | 0.975 / 45.4% |
+| Walk | 0.913 / 37.9% | 0.931 / 36.3% | 0.941 / 37.6% |
+| Attack | 0.906 / 39.2% | 0.917 / 38.2% | 0.927 / 39.3% |
+| Hit | 0.919 / 40.0% | 0.935 / 38.8% | 0.932 / 39.2% |
+| Cast | 0.921 / 39.0% | 0.933 / 37.9% | 0.934 / 38.5% |
+
+- **Every variant's outline gains,** not only these. Refined keyed from their tracked models, `whd`'s
+  walk goes from 0.915 to 0.932, `wms`'s from 0.943 to 0.957 and `whm`'s from 0.939 to 0.951, and
+  their other animations gain 0.5 to 1.9 points.
+- **Keyed stills gain more than a keyed refinement alone.** The refinement holds the opacities where
+  frame 0's still left them (see [Fast motion](#fast-motion)), so it can only sharpen the outline by
+  shrinking the Gaussians along it. That leaves the pixels just inside partly covered, and their
+  colors, fitted as rendered over black, snap brighter. Keyed stills start the model sharp.
+- **The sheets' new cells gain,** as they copy the artist's pixels inside the model's outline. With
+  every other frame of `whs` hidden, fitted both ways, the hidden frames' copied pixels:
+
+| `whs`, hidden frames | IoU | Exact | RGB error | Shadows' IoU |
+|---|---|---|---|---|
+| Stand | 0.945 → 0.965 | 56.6% → 56.6% | 7.8 → 7.8 | 0.894 → 0.919 |
+| Walk | 0.751 → 0.756 | 25.5% → 25.1% | 24.4 → 24.6 | 0.639 → 0.645 |
+| Attack | 0.762 → 0.773 | 30.2% → 32.3% | 23.2 → 22.4 | 0.705 → 0.722 |
+| Hit | 0.867 → 0.882 | 45.7% → 46.1% | 16.3 → 15.1 | 0.827 → 0.849 |
+| Cast | 0.875 → 0.881 | 35.7% → 36.7% | 16.8 → 16.3 | 0.821 → 0.835 |
+
+- **The model's own colors lose a little,** up to 3 points of exact pixels (the stand), as the
+  stills' do (a still of the walk: 81.6% exact against 83.3%). Keying only the outline's pixels, or
+  only the transparent ones, or refitting the colors afterwards, didn't win it back. In the sheets
+  they only fill what no original sees.
+- **What's left of the heavy swords' gap** is in the legs and the blade. Keyed, `whs`'s walk loses
+  1.6 points of IoU to extra pixels beside the shadow, where `whm`, in the same armor, loses 0.9: in
+  the middle of the stride, its legs fill the gap between the feet. And it loses 2.1 points on the
+  blade, where `wms` loses 1.0.
 
 #### Supersampled
 

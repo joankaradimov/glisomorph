@@ -923,9 +923,10 @@ def main():
     ap.add_argument("--snap", type=float, default=0.0,
                     help="in the refinement, fit colors as they'll be snapped to the palette: cross-entropy over "
                          "its colors at this temperature (0: the squared distance to the pixel's palette color)")
-    ap.add_argument("--keyed", action="store_true",
-                    help="in the refinement, fit opacity as the sprites' 1-bit transparency (any above a half is "
-                         "solid)")
+    ap.add_argument("--keyed", action=argparse.BooleanOptionalAction, default=True,
+                    help="fit opacity as the sprites' 1-bit transparency (any above a half is solid), in the frames' "
+                         "stills and in the refinement: the default, see the README's Keyed outlines. --no-keyed "
+                         "pulls every solid pixel to full opacity, which leaves a rim a pixel wide past the outline")
     ap.add_argument("--rigid", action=argparse.BooleanOptionalAction, default=True,
                     help="find long, thin, straight parts in frame 0 (rigid_parts: a sword) and move each as one "
                          "rigid body, rather than bent by the several nodes its Gaussians would follow (the "
@@ -991,12 +992,13 @@ def main():
     saved_model = torch.load(args.load or checkpoint, map_location=device) if tracked else None
     ss_tag = "-ss%d" % args.still_supersample if args.still_supersample != 1 else ""
     edges_tag = "-" + args.edges if args.edges != "none" else ""
+    keyed_tag = "-keyed" if args.keyed else ""
 
     def still_folder(a, k):
         """A still's folder, its tag, and its iterations (None: fit.py's)."""
         iters = args.still_iters if (k or a is not base) and args.still_iters else None
-        tag = "motion-f%d%s%s%s%s%s" % (k, test, ss_tag, edges_tag, "-i%d" % iters if iters else "",
-                                        "" if a is base else "-on-" + base.name)
+        tag = "motion-f%d%s%s%s%s%s%s" % (k, test, ss_tag, edges_tag, keyed_tag, "-i%d" % iters if iters else "",
+                                          "" if a is base else "-on-" + base.name)
         return Path(args.out) / fit.run_name(a.name, split, tag=tag, model="gaussians"), tag, iters
 
     def saved_still(folder):
@@ -1012,7 +1014,8 @@ def main():
         _, tag, iters = still_folder(a, k)
         return fit.main(["--mpq", args.mpq, "--preset", a.name, "--split", split, "--frame", str(k), "--model",
                          "gaussians", "--supersample", str(args.still_supersample), "--tag", tag, "--out", args.out,
-                         "--no-evaluate", "--edges", args.edges] + (["--iters", str(iters)] if iters else []) + camera)
+                         "--no-evaluate", "--edges", args.edges] + (["--iters", str(iters)] if iters else []) + camera
+                        + (["--keyed"] if args.keyed else []))
 
     def camera_still():
         """The first animation's frame 0, which holds the camera: saved, or fitted and calibrated."""
