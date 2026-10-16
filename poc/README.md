@@ -534,7 +534,9 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --hide-fram
    The images are blurred by 4, 2 and then 1 pixels, in three stages of up to 266 iterations, and
    a stage ends once its image loss hasn't improved for 50 iterations (`--patience`).
 3. The rest shape and the colors are refitted to all frames at once, through the tracked motion
-   (see [The shape from every frame](#the-shape-from-every-frame)).
+   (see [The shape from every frame](#the-shape-from-every-frame)), while the Gaussians that never
+   show are cut and new ones grown where the views pull (see
+   [Cutting and growing](#cutting-and-growing)).
 4. A phase between frames interpolates the node poses periodically.
 
 Ending the stages early takes a quarter off the tracking of the warrior's walk and a fifth off the
@@ -1139,6 +1141,108 @@ sample per pixel, the tracking loss tripled.
 - **16 x 16 gains nothing more,** unlike the stills. Tracking and refining the zombie took 4.3
   minutes at one sample per pixel, 6.1 at 4 x 4 and 33 at 16 x 16, alone on the GPU. (Three runs
   sharing it take about three times as long each, so running them together saves nothing.)
+
+#### Cutting and growing
+
+The moving model starts with all of frame 0's still's Gaussians: 15,000 to 26,000 for a variant's
+five dungeon animations. About half of them hardly show: at 5% of the refinement, 48% of `whs`'s never
+cover a twentieth of a pixel in any frame in any of the 16 directions. And unlike the stills, whose
+fitting splits and clones Gaussians where the views pull hardest (gsplat's strategy), the moving
+model never grew. Now the refinement does both, in rounds (`--cycle`, 8 of them, evenly from 5% to
+65% of it; `--cycle 0` for none):
+
+- **Each round cuts** every Gaussian that never shows the round's threshold in a cell: the most it
+  covers of any frame in any of the 16 directions, in pixels (the gradient of the summed render
+  with respect to its color). The threshold eases from 0.2 pixels (`--cycle-cut-from`) to 0.05
+  (`--prune-below`) as the log of the rounds goes, so the first round does most of the cutting
+  (two thirds of `whs`'s Gaussians). Rigid parts' Gaussians stay.
+- **Then it grows** those whose place on screen the views pulled at hardest since the round before
+  (the mean gradient of their 2D means, as 3DGS densifies): one over a pixel across is split in
+  two, mirrored within its spread and 1.6 times smaller, and a smaller one is copied. Both keep its
+  nodes, part and colors and share its opacity, so that together they cover what it did alone. The
+  rounds grow half as many Gaussians as the refinement started with (`--densify 0.5`).
+- **What a round grows is spared the next round's cut,** which its shared opacity would fail at
+  once. The last round only cuts, and a last cut, a round later, spares none.
+
+The settings were tried on `whs`, `wlm` and `wmd`, every other frame hidden, each refined for 12
+minutes (about as many iterations as their fits take) from the same tracked model
+(`--refine-seconds 720`; `--track 15` scores the cells every 15 seconds of it, into track.json).
+The means over the three, as changes from no cutting or growing:
+
+| Mean of `whs`, `wlm`, `wmd` | Gaussians | Fitted cells: IoU / exact | Hidden frames, copied: IoU |
+|---|---|---|---|
+| No cutting or growing | 21,381 | 0.9517 / 41.73% | 0.8674 |
+| The rounds above | 72% | +0.0020 / −0.08 | +0.0009 |
+| The same, again | 72% | +0.0022 / −0.06 | +0.0011 |
+| First threshold 0.1 pixels | 80% | +0.0017 / +0.28 | +0.0004 |
+| First threshold 0.3 pixels | 68% | +0.0017 / −0.41 | +0.0010 |
+| Growing a quarter | 52% | +0.0011 / −0.90 | +0.0007 |
+| Growing as many again | 106% | +0.0023 / +0.78 | +0.0012 |
+| 4 rounds | 75% | +0.0012 / +0.24 | +0.0000 |
+| 12 rounds | 72% | +0.0021 / −0.26 | +0.0010 |
+| Last threshold 0.025 pixels | 77% | +0.0020 / −0.04 | +0.0009 |
+| Last threshold 0.1 pixels | 63% | +0.0015 / −0.56 | +0.0010 |
+
+- **The sheets come out the same, from 72% of the Gaussians.** The hidden frames' copied pixels
+  are the artist's, and only their outline is the model's: it gains a little. Their exact pixels,
+  RGB error, fine detail and brightness (see [Colors in new directions](#colors-in-new-directions))
+  stayed within 0.15 points, 0.04, 0.3 points and 0.03 of no cutting, on average, in every setting.
+- **The model's own colors follow the count:** growing as many again fits them closest, growing a
+  quarter loosens them. Growing alone, without the cuts, gained 1.6 points of the fitted cells'
+  exact pixels (`whs`), and the sheets stayed the same.
+- **4 rounds lose the outline's gain; 12 add nothing to 8.** A last threshold of 0.025 pixels keeps
+  more Gaussians for nothing. One of 0.1 keeps 13% fewer and the sheets the same, at half a point
+  of the model's own exact pixels: their shade, not their texture.
+- **At 4x,** in the model's own colors, the rounds leave fewer specks floating off the outline and
+  the blade than no cutting, and fewest with a last threshold of 0.1: Gaussians too faint to show
+  at 1x grow into specks at 4x.
+- **In a hidden direction** (`whs`, SW), the copied pixels score as without the rounds (24.6%
+  exact, RGB error 22.6), the outline a little better (0.895 IoU against 0.892 and 0.893 in two
+  runs), from 16,221 Gaussians against 22,581.
+- **Cutting doesn't speed the refinement.** An iteration takes about 35 ms with 4,700 Gaussians or
+  27,500: what's cut is what costs least to draw. Nor does what's cut first matter at the same
+  count: cutting a share in rounds (evenly, early, log-eased), by how much each Gaussian shows or by
+  how much the frames' losses react to it (as PUP 3D-GS scores them), all came out alike, and below
+  no cutting: from under a point of the fitted cells' exact pixels (15% at a time) to nearly ten
+  (half at once). A threshold cuts only what doesn't show.
+- **It doesn't fix the legs between strides.** In the walk's hidden frames, whole legs sit where
+  the interpolated motion puts them, not where the artist drew them. Gaussians that web between
+  two legs, carried off the outline by the blend of their nodes while each side's nodes alone would
+  keep them on, are rare (583 of `whs`'s, in at most 6 of its 240 cells, mostly on the arms), and
+  splitting each between its two sides changed nothing.
+
+#### Colors in new directions
+
+The sheets copy the artist's pixels into the in-betweens and the new directions, relit (see Copying
+pixels through time, above). In the in-betweens that beats the model's own colors: with every other
+frame of `whs` hidden, 39.4% exact against 33.0%. Across directions it doesn't: with `whs`'s SW
+hidden, the copied pixels come to 24.6% exact and the model's own colors to 33.7%, with the same
+outline. Copied from the directions 45° to either side, the pixels keep those directions' shading:
+they're on the wrong ramp more often, and brighter, their highlights carried over.
+
+`--new-colors` picks the new directions' colors (the in-betweens are copied whatever it is): copied
+pixels (the default), the model's own, or mixed: each pixel the model's own ramp, at the shade of
+the model's own colors blurred, plus the copied pixels' detail (their luminance less its blur). In
+the hidden direction, over the five animations:
+
+| `whs`, SW hidden | Exact | RGB error | Blurred RGB error | Right ramp | Fine detail kept | Brightness |
+|---|---|---|---|---|---|---|
+| Copied pixels | 24.6% | 22.6 | 12.2 | 77.6% | 90% | +4.0 |
+| Mixed | 27.5% | 19.6 | 9.1 | 83.5% | 86% | +2.5 |
+| The model's own | 33.7% | 15.7 | 8.5 | 83.5% | 74% | +2.1 |
+
+(Fine detail: the mean, inside the outline, of how far each pixel's luminance is from its blurred
+neighbourhood's; kept, its share of the real frames'. Brightness: the mean luminance over the real
+frames', where both have a pixel, 0 to 255.)
+
+- **The per-pixel scores favor smooth colors.** A texture a pixel out of place scores worse than
+  none, so the model's own colors, smoother, win on all of them, while the copied pixels keep most
+  of the artist's texture.
+- **By eye, on the sheets, copied pixels look most like the artist's:** crisp, though they break up
+  the attack's thin blade and leave specks. The model's own colors are clean but soft, and mixed
+  lies between, with some red specks. So the sheets copy.
+- **The hidden direction overstates the copied pixels' errors:** it lies 45° from the drawn
+  directions it copies from, where the sheets' new directions lie 22.5° from one.
 
 ## Higher resolution
 

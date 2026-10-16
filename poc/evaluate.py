@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from diablo1.palette import ramp_of
-from poc.ramps import Ramps
+from poc.ramps import LUMA, Ramps
 from poc.reproject import Warp, fill, neighbour, reproject, source_depth
 from poc.scene import Scene
 from poc.shadow import baked_shadow, iou, lowest_row, outline_shadow
@@ -89,8 +89,23 @@ def stray_pixels(indices, palette, threshold: float = 20.0) -> float:
     return float((stray & interior).sum() / interior.sum().clamp(min=1))
 
 
+def detail(indices, palette) -> float:
+    """Fine detail, as pixel art has it: the mean, within the silhouette, of how far each pixel's luminance
+    (0-255) is from its neighbourhood's (blurred as for blurred_rgb_error). Smooth colors score low and the
+    artist's texture high, whether or not it lines up pixel for pixel; the per-pixel errors can't tell a
+    texture slightly out of place from noise, and favor smooth colors."""
+    solid = indices >= 0
+    if not solid.any():
+        return 0.0
+    near = blurred(indices, palette)
+    luma = torch.tensor(LUMA, device=palette.device, dtype=near.dtype)
+    return float(((palette[indices.clamp(min=0)].to(near.dtype) - near) @ luma)[solid].abs().mean() * 255)
+
+
 def score(pred, gt, palette):
-    """Metrics comparing predicted and true palette indices (-1 = transparent)."""
+    """Metrics comparing predicted and true palette indices (-1 = transparent). Besides the per-pixel ones,
+    each cell's fine detail and the truth's (detail kept is their ratio, over many cells), and how much
+    brighter the prediction is where both have pixels (luminance, 0-255)."""
     p = pred >= 0
     g = gt >= 0
     both = p & g
@@ -101,6 +116,8 @@ def score(pred, gt, palette):
     rgb_err = (palette[pred[both]] - palette[gt[both]]).abs().mean() * 255 if both.any() else torch.tensor(0.0)
     blur_err = ((blurred(pred, palette) - blurred(gt, palette))[both].abs().mean() * 255
                 if both.any() else torch.tensor(0.0))
+    luma = torch.tensor(LUMA, device=palette.device, dtype=palette.dtype)
+    brighter = ((palette[pred[both]] - palette[gt[both]]) @ luma).mean() * 255 if both.any() else torch.tensor(0.0)
     return {
         "silhouette_iou": float(both.sum() / union.sum().clamp(min=1)),
         "exact_index": float(same.sum() / both.sum().clamp(min=1)),
@@ -110,6 +127,9 @@ def score(pred, gt, palette):
         "pixels_matching": float(same.sum() / union.sum().clamp(min=1)),
         "stray_pixels": stray_pixels(pred, palette),
         "stray_pixels_truth": stray_pixels(gt, palette),
+        "detail": detail(pred, palette),
+        "detail_truth": detail(gt, palette),
+        "brightness": float(brighter),
     }
 
 

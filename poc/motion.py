@@ -435,6 +435,46 @@ class MovingGaussians(torch.nn.Module):
         self.node_quats = torch.nn.Parameter(quats)
         self.node_moves = torch.nn.Parameter(moves)
 
+    def keep(self, mask):
+        """Keep only the Gaussians where mask (G,) is set: each per-Gaussian parameter and buffer cut
+        alike, and each one's nearest Gaussians (gaussian_links) found again among those kept. An
+        optimizer over the old parameters has to be made again."""
+        with torch.no_grad():
+            for name in ("means0", "quats0", "scales", "opacities", "colors") + (("specular",) if self.lit else ()):
+                setattr(self, name, torch.nn.Parameter(getattr(self, name)[mask].clone()))
+            self.residuals = torch.nn.Parameter(self.residuals[:, mask].clone())
+            self.parts, self.bind_idx, self.bind_w = self.parts[mask], self.bind_idx[mask], self.bind_w[mask]
+            near = [torch.cdist(chunk, self.means0).topk(5, largest=False).indices[:, 1:]
+                    for chunk in torch.split(self.means0, 4096)]
+            self.gaussian_links = torch.cat(near)
+
+    def grow(self, parents, split):
+        """Add a Gaussian beside each of parents (P,), as 3DGS densifies: where split (P,) is set, the parent
+        and the new one are drawn from the parent's own spread, at each other's mirror, and made 1.6 times
+        smaller; elsewhere the parent is copied. Both keep its node bindings, part, corrections and colors,
+        and share its opacity, so that together they cover what it did alone. As after keep, an optimizer
+        has to be made again."""
+        with torch.no_grad():
+            quats = F.normalize(self.quats0[parents], dim=-1)
+            offsets = quat_rotate(quats, torch.randn_like(self.means0[parents]) * torch.exp(self.scales[parents]))
+            offsets = offsets * split[:, None]
+            smaller = self.scales[parents] - math.log(1.6) * split[:, None]
+            shared = torch.logit(1 - torch.sqrt(1 - torch.sigmoid(self.opacities[parents])), eps=1e-6)
+            both = {"means0": (self.means0[parents] + offsets, self.means0[parents] - offsets),
+                    "scales": (smaller, smaller), "opacities": (shared, shared)}
+            for name in ("means0", "quats0", "scales", "opacities", "colors") + (("specular",) if self.lit else ()):
+                values = getattr(self, name).detach().clone()
+                first, second = both.get(name, (values[parents], values[parents]))
+                values[parents] = first
+                setattr(self, name, torch.nn.Parameter(torch.cat([values, second])))
+            self.residuals = torch.nn.Parameter(torch.cat([self.residuals, self.residuals[:, parents]], 1))
+            self.parts = torch.cat([self.parts, self.parts[parents]])
+            self.bind_idx = torch.cat([self.bind_idx, self.bind_idx[parents]])
+            self.bind_w = torch.cat([self.bind_w, self.bind_w[parents]])
+            near = [torch.cdist(chunk, self.means0).topk(5, largest=False).indices[:, 1:]
+                    for chunk in torch.split(self.means0, 4096)]
+            self.gaussian_links = torch.cat(near)
+
     def residual(self, phase: float):
         if float(phase).is_integer():
             return self.residuals[int(phase) % self.residuals.shape[0]]
@@ -885,6 +925,28 @@ def main():
                     help="a stage of tracking ends once its image loss hasn't improved for this many iterations "
                          "(0 = every stage runs its full share)")
     ap.add_argument("--refine-iters", type=int, default=3000, help="iterations of the joint refinement")
+    ap.add_argument("--refine-seconds", type=float, default=0.0,
+                    help="refine for this many seconds instead of --refine-iters iterations (what --track takes "
+                         "not counted); --cycle's fractions are then of this time")
+    ap.add_argument("--track", type=float, default=0.0,
+                    help="every this many seconds of the refinement, score the fitted cells as the model draws them "
+                         "then (not counted as refinement): printed, and kept in track.json, the cells in track.npz")
+    ap.add_argument("--cycle", type=int, default=8,
+                    help="rounds of cutting and growing the Gaussians, evenly from --cycle-from to --cycle-until of the "
+                         "refinement (0, or --refine colors: none). Each cuts every Gaussian that never shows the round's threshold in a "
+                         "cell (from --cycle-cut-from down to --prune-below, eased logarithmically), then, but for the "
+                         "last, grows those the views pull at hardest (--densify in all); those a round grows are "
+                         "spared the next round's cut, and a last cut, a round later, spares none")
+    ap.add_argument("--cycle-cut-from", type=float, default=0.2, help="the first --cycle round's threshold, in pixels")
+    ap.add_argument("--prune-below", type=float, default=0.05,
+                    help="the last --cycle rounds' threshold, in pixels: the most a Gaussian covers of any frame in any "
+                         "of the 16 directions")
+    ap.add_argument("--densify", type=float, default=0.5,
+                    help="how many Gaussians --cycle grows in all, as a share of those the refinement starts with: each "
+                         "round splits (or, under a pixel across, copies) those whose place the views pulled at "
+                         "hardest since the round before")
+    ap.add_argument("--cycle-from", type=float, default=0.05, help="the first --cycle round, as a fraction of the refinement")
+    ap.add_argument("--cycle-until", type=float, default=0.65, help="the last --cycle round, as a fraction of the refinement")
     ap.add_argument("--arap", type=float, default=0.1, help="weight of the nodes' rigidity")
     ap.add_argument("--corrections", type=float, default=0.01,
                     help="with --refine all, the weight of the cost of per-frame corrections (0 = no corrections)")
@@ -954,6 +1016,10 @@ def main():
     ap.add_argument("--scale", type=int, default=1,
                     help="also draw the 16 directions by twice the frames this many times larger, as a GIF "
                          "(directions-<scale>x.gif)")
+    ap.add_argument("--new-colors", default="copied", choices=["copied", "own", "mixed"],
+                    help="the colors of directions the originals don't have (and of a held-out one): copied pixels; "
+                         "the model's own; or mixed, the model's own material shaded by its own colors, blurred, plus "
+                         "the copied pixels' detail (frames between drawn ones are copied whatever this is)")
     ap.add_argument("--scale-colors", default="own", choices=["own", "copied"],
                     help="the larger cells' colors: the model's own, or copied pixels (from the originals with "
                          "their edges redrawn, as --edges)")
@@ -1349,27 +1415,163 @@ def main():
     #    Gaussian) fits the known cells closer, but at the cost of consistency between frames, which
     #    copying pixels relies on; and a thin blade that's a pixel off in some frames fades out in all.
     all_targets = [targets_of(s) for s in range(len(slots))]
-    groups = [{"params": [model.colors], "lr": 0.01}]
-    if model.lit:
-        groups.append({"params": model.highlight_parameters(), "lr": 0.01})
-    if args.refine != "colors":
-        groups += [{"params": [model.means0], "lr": 0.005}, {"params": [model.quats0], "lr": 0.001},
-                   {"params": [model.scales], "lr": 0.002}]
-    if args.refine == "all":
-        groups += [{"params": [model.node_moves], "lr": 0.02}, {"params": [model.node_quats], "lr": 0.002},
-                   {"params": [model.opacities], "lr": 0.01}]
-        if args.corrections:
-            groups.append({"params": [model.residuals], "lr": 0.01})
-    opt = torch.optim.Adam(groups)
+
+    def refiner():
+        groups = [{"params": [model.colors], "lr": 0.01}]
+        if model.lit:
+            groups.append({"params": model.highlight_parameters(), "lr": 0.01})
+        if args.refine != "colors":
+            groups += [{"params": [model.means0], "lr": 0.005}, {"params": [model.quats0], "lr": 0.001},
+                       {"params": [model.scales], "lr": 0.002}]
+        if args.refine == "all":
+            groups += [{"params": [model.node_moves], "lr": 0.02}, {"params": [model.node_quats], "lr": 0.002},
+                       {"params": [model.opacities], "lr": 0.01}]
+            if args.corrections:
+                groups.append({"params": [model.residuals], "lr": 0.01})
+        return torch.optim.Adam(groups)
+
+    def peaks():
+        """How much each Gaussian shows, in pixels: its weight in the pixels it covers (opacity times
+        transmittance), as the gradient of the summed render with respect to its color in each view, in every
+        slot in all 16 directions (the drawn ones and the new ones between); the most it shows in any one
+        cell (G,)."""
+        ss = model.supersample
+        yaws16 = sign * torch.arange(16, device=device, dtype=torch.float32) * 22.5
+        r16, u16, f16 = camera_basis(yaws16, elevation)
+        vms16 = torch.stack([viewmat(r16[d], u16[d], f16[d]) for d in range(16)])
+        peak = torch.zeros(len(model.means0), device=device)
+        for s in range(len(slots)):
+            a = slots[s][0]
+            K = a.K.clone()
+            K[:2] *= ss
+            with torch.no_grad():
+                means, quats = model.pose(s)
+                scales, opacities = torch.exp(model.scales), torch.sigmoid(model.opacities)
+            colors = torch.ones((16, len(means), 1), device=device, requires_grad=True)
+            image, _, _ = rasterization(means, quats, scales, opacities, colors, vms16, K[None].repeat(16, 1, 1),
+                                        a.w * ss, a.h * ss, camera_model=camera_model(), packed=False)
+            image.sum().backward()
+            peak = torch.maximum(peak, (colors.grad[..., 0] / ss ** 2).max(0).values)
+        return peak
+
+    opt = refiner()
     candidates = torch.tensor([0] + list(range(128, 255)), device=device)  # the indices sprites use
     snap = (palette[candidates], args.snap) if args.snap else None
     model.keep_samples = bool(args.tv or args.outline_tv)
     neighbours = None
-    t0 = time.time()
-    for it in range(0 if args.load else args.refine_iters):
+
+    # --cycle: rounds of a cut, then a split. The cut's threshold eases from --cycle-cut-from down to
+    # --prune-below as the log of the rounds goes (fast at first), the last round's cut alone. Each split grows
+    # as many Gaussians, split from (or copies of) those whose place on screen the loss pulled at hardest in the
+    # views they showed in, on average since the round before (as 3DGS densifies; the 2D means' gradients, in
+    # supersampled pixels). Each Gaussian's round of birth (born, 0 for the first ones): a split halves its two
+    # Gaussians' opacity, so they'd fall to a cut at once, and the round after spares them. A last cut, a round
+    # later, spares none: the last ones grown face it too. Each round is due at its fraction of the refinement:
+    # of its iterations, or of its time. Not with --refine colors: what it grew would never move into place.
+    step = (args.cycle_until - args.cycle_from) / max(args.cycle - 1, 1)
+    cycling = [] if args.load or not args.cycle or args.refine == "colors" else [
+        (args.cycle_from + step * r,
+         args.prune_below + (args.cycle_cut_from - args.prune_below) * (1 - math.log(1 + r) / math.log(max(args.cycle, 2))),
+         r < args.cycle - 1, True) for r in range(args.cycle)] + [(args.cycle_until + step, args.prune_below, False, False)]
+    per_round = round(args.densify * len(model.means0) / max(args.cycle - 1, 1))
+    born, newest = torch.zeros(len(model.means0), dtype=torch.long, device=device), 0
+    pull_sum = torch.zeros(len(model.means0), device=device)
+    pull_count = torch.zeros(len(model.means0), device=device)
+    track_rows, track_cells, track_masks = [], {}, {}
+
+    def track(it, seconds):
+        """The fitted cells as the model draws them now, and the hidden ones (its own, not copied): under
+        --hide-frames the frames between, under --hide-direction the direction. Scored as report scores them
+        (per animation, the mean over its cells of the silhouette IoU, exact index and RGB error), and kept."""
+        row = {"seconds": seconds, "iterations": it, "gaussians": len(model.means0), "animations": {}}
+        fitted = lambda a: [(a.start + i, k) for i, k in enumerate(a.frames)]  # noqa: E731
+        kinds = [("animations", "", fitted, list(train_dirs))]
+        if args.hide_frames:
+            row["hidden"] = {}
+            kinds.append(("hidden", "-hidden", lambda a: [(a.start + k * len(a.frames) / a.count, k)
+                                                          for k in range(a.count) if k % 2], list(train_dirs)))
+        if args.hide_direction is not None:
+            row["direction"] = {}
+            kinds.append(("direction", "-direction", fitted, [args.hide_direction]))
+        with torch.no_grad():
+            for a in anims:
+                for key, suffix, cells_of, views_at in kinds:
+                    at = cells_of(a)
+                    chosen = torch.tensor(views_at, device=device)
+                    cells, scores = np.full((len(at), len(views_at), a.h, a.w), -1, np.int16), []
+                    for i, (phase, k) in enumerate(at):
+                        colors, alphas, _ = model.rasterize(phase, viewmats[chosen], a.Ks[chosen], a.w, a.h)
+                        if (a.name, k, key) not in track_masks:
+                            track_masks[a.name, k, key] = masks_for([a.views[k][d] for d in views_at],
+                                                                    a.preset.shadows, device)
+                        masks = track_masks[a.name, k, key]
+                        for c, d in enumerate(views_at):
+                            if a.views[k][d].unseen:
+                                continue
+                            own = quantize(colors[c, ..., :3], alphas[c, ..., 0], palette, candidates)
+                            cells[i, c] = own.cpu().numpy()
+                            idx = torch.as_tensor(a.views[k][d].indices, device=device).long()
+                            truth = torch.where(masks[c] == 1, idx, torch.full_like(idx, -1))
+                            cell = torch.where(masks[c] == -1, torch.full_like(own, -1), own)
+                            both = (cell >= 0) & (truth >= 0)
+                            scores.append((float(both.sum() / ((cell >= 0) | (truth >= 0)).sum().clamp(min=1)),
+                                           float((both & (cell == truth)).sum() / both.sum().clamp(min=1)),
+                                           float((palette[cell[both]] - palette[truth[both]]).abs().mean() * 255)
+                                           if both.any() else 0.0))
+                    row[key][a.name] = dict(zip(("silhouette_iou", "exact_index", "rgb_error"),
+                                                np.mean(scores, 0).tolist()))
+                    track_cells.setdefault(a.name + suffix, []).append(cells)
+        line = "track %5.0fs  %6d iterations  %5d Gaussians" % (seconds, it, row["gaussians"])
+        for key, _, _, _ in kinds:
+            mean = np.mean([list(s.values()) for s in row[key].values()], 0)
+            line += "  %sIoU %.4f  exact %.2f%%  RGB %.3f" % ("" if key == "animations" else key + " ", mean[0],
+                                                            100 * mean[1], mean[2])
+        print(line)
+        track_rows.append(row)
+
+    t0, untimed = time.time(), 0.0  # untimed: what tracking took
+    it, next_track = 0, 0.0
+    while not args.load:
+        seconds = time.time() - t0 - untimed
+        done = seconds >= args.refine_seconds if args.refine_seconds else it >= args.refine_iters
+        if args.track and (seconds >= next_track or done):
+            torch.cuda.synchronize()  # the refinement's own work done before the clock stops
+            start = time.time()
+            seconds = start - t0 - untimed
+            track(it, seconds)
+            untimed += time.time() - start
+            next_track = (math.floor(seconds / args.track) + 1) * args.track
+        if done:
+            break
+        while cycling and (seconds >= args.refine_seconds * cycling[0][0] if args.refine_seconds
+                           else it >= int(args.refine_iters * cycling[0][0])):
+            _, threshold, splits, spare = cycling.pop(0)
+            spared = (born == newest) if newest and spare else torch.zeros_like(born, dtype=torch.bool)
+            peak = peaks().masked_fill((model.parts >= 0) | spared, float("inf"))  # rigid parts kept
+            kept = peak >= threshold
+            model.keep(kept)
+            born = born[kept]
+            print("pruned %d Gaussians that never showed %.3g pixels in a cell (%d spared): %d left (%.0fs)" % (
+                int((~kept).sum()), threshold, int(spared.sum()), len(model.means0), time.time() - t0 - untimed))
+            if splits:
+                pull = pull_sum[kept] / pull_count[kept].clamp(min=1)
+                parents = torch.argsort(pull, descending=True)[:per_round]
+                split = torch.exp(model.scales[parents]).max(-1).values > 1.0  # over a pixel across: split, else copy
+                model.grow(parents, split)
+                newest += 1
+                born[parents] = newest
+                born = torch.cat([born, torch.full((len(parents),), newest, dtype=born.dtype, device=device)])
+                print("grew %d Gaussians where the views pulled hardest (%d split, %d copied; down to %.3g): %d now "
+                      "(%.0fs)" % (len(parents), int(split.sum()), int((~split).sum()), float(pull[parents[-1]]),
+                                   len(model.means0), time.time() - t0 - untimed))
+            pull_sum = torch.zeros(len(model.means0), device=device)
+            pull_count = torch.zeros(len(model.means0), device=device)
+            opt, neighbours = refiner(), neighbours_of(model.means0.detach(), 8)
         j = it % len(slots)
         targets, masks = all_targets[j]
-        colors, alphas, _ = render_slot(j)
+        colors, alphas, info = render_slot(j)
+        if cycling:
+            info["means2d"].retain_grad()
         loss = image_loss(colors, alphas, targets, masks, snap=snap, keyed=args.keyed)
         if args.tv:
             loss = loss + args.tv * sample_variation(*model.last_samples)
@@ -1387,9 +1589,22 @@ def main():
                 loss = loss + args.corrections * model.correction_cost(j)
         opt.zero_grad()
         loss.backward()
+        if cycling:
+            seen = info["radii"] > 0
+            seen = seen.all(-1) if seen.dim() == 3 else seen  # gsplat 1.5 gives a radius per axis
+            pull_sum += (info["means2d"].grad.norm(dim=-1) * seen).sum(0)
+            pull_count += seen.sum(0)
         opt.step()
-        if it % 500 == 0 or it == args.refine_iters - 1:
-            print("refine %5d  loss %.5f  (%.0fs)" % (it, loss.item(), time.time() - t0))
+        if it % 500 == 0 or (not args.refine_seconds and it == args.refine_iters - 1):
+            print("refine %5d  loss %.5f  (%.0fs)" % (it, loss.item(), time.time() - t0 - untimed))
+        it += 1
+    if args.refine_seconds and not args.load:
+        print("refined %d iterations in %.0fs%s" % (it, time.time() - t0 - untimed,
+                                                     " (and %.0fs tracking)" % untimed if args.track else ""))
+    if track_rows:
+        (out_dir / "track.json").write_text(json.dumps(track_rows, indent=1))
+        np.savez_compressed(out_dir / "track.npz", seconds=np.array([r["seconds"] for r in track_rows]),
+                            **{name: np.stack(cells) for name, cells in track_cells.items()})
     model.keep_samples, model.last_samples = False, None
     if not args.load:
         save(out_dir / "motion.pt")  # refined: drawn again with --load if what follows is stopped
@@ -1404,6 +1619,23 @@ def main():
                             "power": F.softplus(model.light_raw).tolist(),
                             "ambient": F.softplus(model.ambient_raw).item()}
         print("light (camera space):", json.dumps(summary["light"]))
+    shades = Ramps(palette)
+    g = torch.exp(-torch.arange(-3, 4, device=device, dtype=torch.float32) ** 2 / 2)
+    kernel = (g[:, None] * g[None, :])[None, None]
+
+    def soft(values, solid):
+        """values (H, W) blurred within solid (H, W), by a Gaussian a pixel wide."""
+        v = F.conv2d((values.float() * solid)[None, None], kernel, padding=3)[0, 0]
+        return v / F.conv2d(solid[None, None], kernel, padding=3)[0, 0].clamp(min=1e-6)
+
+    def mixed(own, cell):
+        """--new-colors mixed: each pixel the model's own material (its ramp), at the shade of the model's own
+        colors, blurred, plus the copied pixels' detail (their luminance less its blur). The copied pixels'
+        own shading and materials go wrong where the view turns away from their sources; their texture doesn't."""
+        solid = (cell >= 0).float()
+        lo, lc = shades.luminance[own.clamp(min=0)], shades.luminance[cell.clamp(min=0)]
+        tone = soft(lo, solid) + lc - soft(lc, solid)
+        return torch.where((cell >= 0) & (own >= 0), shades.nearest(own, tone), cell)
 
     def report(a):
         """Scores, the hidden cells, the sheet and GIFs of animation a; its summary."""
@@ -1453,6 +1685,16 @@ def main():
                 own = render(frame_phase, d_yaw)
             return copier(phase(frame_phase), d_yaw, camera(d_yaw), own)
 
+        def new_direction(frame_phase, d_yaw, own=None):
+            """A direction the originals don't have (a new one, or one held out), colored as --new-colors says:
+            copied pixels, the model's own colors, or the two mixed."""
+            if own is None:
+                own = render(frame_phase, d_yaw)
+            if args.new_colors == "own":
+                return own
+            cell = copied(frame_phase, d_yaw, own)
+            return cell if args.new_colors == "copied" else mixed(own, cell)
+
         # Shadows, made as the originals' were (shadow.py): a cell's own outline, squashed and sheared
         # about its direction's ground row, the lowest row of the direction's outline in frame 0 (an
         # original's where there is one, else the copied cell's). n counts the 16 directions from S.
@@ -1499,7 +1741,7 @@ def main():
                 s = scored(own, k, d)
                 if d == args.hide_direction:
                     results["hidden_direction"].append(s)
-                    cell = copied(k, float(yaws[d]), own)
+                    cell = new_direction(k, float(yaws[d]), own)
                     results["hidden_direction_copied"].append(scored(cell, k, d))
                     hidden_cells["f%d_d%d" % (k, d)] = cell.cpu().numpy().astype(np.int16)
                     if a.preset.shadows:
@@ -1546,7 +1788,8 @@ def main():
                     body = torch.where(m == 1, idx, torch.where(m == -1, cell, torch.full_like(idx, -1)))
                     column.append(with_shadow(body, n).cpu().numpy())
                 else:
-                    cell = copied(step / 2, sign * n * 22.5)
+                    new = n % 2 or n // 2 == args.hide_direction
+                    cell = (new_direction if new else copied)(step / 2, sign * n * 22.5)
                     column.append(with_shadow(cell, n).cpu().numpy())
             sheet.append(column)
         if sheet:
