@@ -1153,9 +1153,10 @@ model never grew. Now the refinement does both, in rounds (`--cycle`, 8 of them,
 
 - **Each round cuts** every Gaussian that never shows the round's threshold in a cell: the most it
   covers of any frame in any of the 16 directions, in pixels (the gradient of the summed render
-  with respect to its color). The threshold eases from 0.2 pixels (`--cycle-cut-from`) to 0.05
-  (`--prune-below`) as the log of the rounds goes, so the first round does most of the cutting
-  (two thirds of `whs`'s Gaussians). Rigid parts' Gaussians stay.
+  with respect to its color), by its own size (see [Stray pixels at 4x](#stray-pixels-at-4x)). The
+  threshold eases from 0.2 pixels (`--cycle-cut-from`) to 0.05 (`--prune-below`) as the log of the
+  rounds goes, so the first round does most of the cutting (two thirds of `whs`'s Gaussians).
+  Rigid parts' Gaussians are cut too.
 - **Then it grows** those whose place on screen the views pulled at hardest since the round before
   (the mean gradient of their 2D means, as 3DGS densifies): one over a pixel across is split in
   two, mirrored within its spread and 1.6 times smaller, and a smaller one is copied. Both keep its
@@ -1166,8 +1167,9 @@ model never grew. Now the refinement does both, in rounds (`--cycle`, 8 of them,
 
 The settings were tried on `whs`, `wlm` and `wmd`, every other frame hidden, each refined for 12
 minutes (about as many iterations as their fits take) from the same tracked model
-(`--refine-seconds 720`; `--track 15` scores the cells every 15 seconds of it, into track.json).
-The means over the three, as changes from no cutting or growing:
+(`--refine-seconds 720`; `--track 15` scores the cells every 15 seconds of it, into track.json),
+with the cuts measuring each Gaussian with the renderer's blur and leaving rigid parts (see Stray
+pixels at 4x for the change). The means over the three, as changes from no cutting or growing:
 
 | Mean of `whs`, `wlm`, `wmd` | Gaussians | Fitted cells: IoU / exact | Hidden frames, copied: IoU |
 |---|---|---|---|
@@ -1193,9 +1195,9 @@ The means over the three, as changes from no cutting or growing:
 - **4 rounds lose the outline's gain; 12 add nothing to 8.** A last threshold of 0.025 pixels keeps
   more Gaussians for nothing. One of 0.1 keeps 13% fewer and the sheets the same, at half a point
   of the model's own exact pixels: their shade, not their texture.
-- **At 4x,** in the model's own colors, the rounds leave fewer specks floating off the outline and
-  the blade than no cutting, and fewest with a last threshold of 0.1: Gaussians too faint to show
-  at 1x grow into specks at 4x.
+- **At 4x,** in the model's own colors, the rounds leave fewer stray pixels around the outline and
+  the blade than no cutting, and fewer with a last threshold of 0.1: see
+  [Stray pixels at 4x](#stray-pixels-at-4x).
 - **In a hidden direction** (`whs`, SW), the copied pixels score as without the rounds (24.6%
   exact, RGB error 22.6), the outline a little better (0.895 IoU against 0.892 and 0.893 in two
   runs), from 16,221 Gaussians against 22,581.
@@ -1204,12 +1206,58 @@ The means over the three, as changes from no cutting or growing:
   count: cutting a share in rounds (evenly, early, log-eased), by how much each Gaussian shows or by
   how much the frames' losses react to it (as PUP 3D-GS scores them), all came out alike, and below
   no cutting: from under a point of the fitted cells' exact pixels (15% at a time) to nearly ten
-  (half at once). A threshold cuts only what doesn't show.
+  (half at once). A threshold cuts only what doesn't show. Cutting on to the end, three times a
+  round, or taking every other cut by the losses' sensitivity (as many as the threshold would),
+  cut 3% more and changed nothing else.
 - **It doesn't fix the legs between strides.** In the walk's hidden frames, whole legs sit where
   the interpolated motion puts them, not where the artist drew them. Gaussians that web between
   two legs, carried off the outline by the blend of their nodes while each side's nodes alone would
   keep them on, are rare (583 of `whs`'s, in at most 6 of its 240 cells, mostly on the arms), and
   splitting each between its two sides changed nothing.
+
+#### Stray pixels at 4x
+
+Drawn 4 times larger in its own colors (`--scale 4`), the model had clouds of stray pixels around
+it: small blobs off the figure, under 4 pixels at 1x, in nearly every cell. `--specks` counts them,
+over every direction at twice the frames, and finds which Gaussians draw them (of a saved model,
+with `--load`).
+
+Most were Gaussians shrunk to points. The renderer widens every Gaussian by a blur of 0.3 square
+pixels of the grid it draws on, so a point is drawn as a dot about a sample across, at its
+opacity. In the fit, 4 x 4 samples average into a pixel, and the dot is a few percent of one,
+which the fit hardly sees. Nothing stops a Gaussian shrinking (the refinement only reins in big
+ones), and once it's far under the blur, its size no longer changes how it looks, so nothing grows
+it back. Drawn 4x larger, one sample a pixel, the same dot is a whole pixel: a speck. In `wmd`'s
+model, the Gaussians under 0.05 pixels across were 6% of them and drew half the stray pixels;
+70% of them were on the blade, whose Gaussians weren't cut, and by the blur, a point showed about
+as much as the last threshold.
+
+So the cuts measure each Gaussian by its own size (gsplat's antialiased mode, which fades a
+Gaussian by how much of what it draws is blur, so that a point shows nothing), and cut rigid parts
+too. The stray pixels over the five animations, and the changes in the scores (refined by
+iterations, as many as the runs above took):
+
+| Stray pixels at 4x | `whs` | `wlm` | `wmd` |
+|---|---|---|---|
+| No cutting or growing | 385,666 | 155,709 | 247,952 |
+| Cut with the blur, rigid parts kept (two runs of `wmd`) | 192,636 | 42,755 | 87,593 / 86,644 |
+| Cut by own size, rigid parts too | 30,004 | 7,538 | 21,264 |
+
+| Mean of `whs`, `wlm`, `wmd` | Gaussians | Fitted cells: IoU / exact | Hidden frames, copied: IoU / exact / fine detail kept |
+|---|---|---|---|
+| Cut with the blur | 15,392 | 0.9537 / 41.65% | 0.8683 / 44.14% / 93.1% |
+| Cut by own size | 76% | −0.0001 / −0.70 | +0.0009 / −0.03 / −0.4 |
+
+- **Four fifths of the stray pixels go,** in every animation: 82% to 97% of them but in the attack,
+  whose swing keeps a quarter to two fifths of its own.
+- **The blade comes out a clean line,** with no spray off its tip: its dotted look at 4x was the
+  points.
+- **The hidden frames' outline gains as much again** as the rounds did (+0.0009 IoU), from three
+  quarters of the Gaussians.
+- **The model's own colors lose 0.7 points** of exact pixels, and the copied in-betweens 0.4
+  points of fine detail kept.
+- **What's left is the outline's own:** in `wmd`'s, Gaussians at its edge, 0.6 pixels across and
+  half transparent, which at 4x break the edge into islands.
 
 #### Colors in new directions
 
@@ -1232,8 +1280,9 @@ the hidden direction, over the five animations:
 | The model's own | 33.7% | 15.7 | 8.5 | 83.5% | 74% | +2.1 |
 
 (Fine detail: the mean, inside the outline, of how far each pixel's luminance is from its blurred
-neighbourhood's; kept, its share of the real frames'. Brightness: the mean luminance over the real
-frames', where both have a pixel, 0 to 255.)
+neighbourhood's; kept, its share of the real frames'. It can't tell texture from speckle: where a
+fast swing has its pixels copied from frames far apart, as `wlm`'s attack does, it passes 100%.
+Brightness: the mean luminance over the real frames', where both have a pixel, 0 to 255.)
 
 - **The per-pixel scores favor smooth colors.** A texture a pixel out of place scores worse than
   none, so the model's own colors, smoother, win on all of them, while the copied pixels keep most

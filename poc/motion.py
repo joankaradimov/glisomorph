@@ -933,10 +933,11 @@ def main():
                          "then (not counted as refinement): printed, and kept in track.json, the cells in track.npz")
     ap.add_argument("--cycle", type=int, default=8,
                     help="rounds of cutting and growing the Gaussians, evenly from --cycle-from to --cycle-until of the "
-                         "refinement (0, or --refine colors: none). Each cuts every Gaussian that never shows the round's threshold in a "
-                         "cell (from --cycle-cut-from down to --prune-below, eased logarithmically), then, but for the "
-                         "last, grows those the views pull at hardest (--densify in all); those a round grows are "
-                         "spared the next round's cut, and a last cut, a round later, spares none")
+                         "refinement (0, or --refine colors: none). Each cuts every Gaussian that never shows the "
+                         "round's threshold in a cell by its own size (from --cycle-cut-from down to --prune-below, "
+                         "eased logarithmically; rigid parts' too), then, but for the last, grows those the views pull "
+                         "at hardest (--densify in all); those a round grows are spared the next round's cut, and a "
+                         "last cut, a round later, spares none")
     ap.add_argument("--cycle-cut-from", type=float, default=0.2, help="the first --cycle round's threshold, in pixels")
     ap.add_argument("--prune-below", type=float, default=0.05,
                     help="the last --cycle rounds' threshold, in pixels: the most a Gaussian covers of any frame in any "
@@ -947,6 +948,9 @@ def main():
                          "hardest since the round before")
     ap.add_argument("--cycle-from", type=float, default=0.05, help="the first --cycle round, as a fraction of the refinement")
     ap.add_argument("--cycle-until", type=float, default=0.65, help="the last --cycle round, as a fraction of the refinement")
+    ap.add_argument("--specks", action="store_true",
+                    help="diagnostic, with --load: which Gaussians draw the stray pixels around the model at 4x, "
+                         "and how they fare by the cut's measures (specks.npz); then stop")
     ap.add_argument("--arap", type=float, default=0.1, help="weight of the nodes' rigidity")
     ap.add_argument("--corrections", type=float, default=0.01,
                     help="with --refine all, the weight of the cost of per-frame corrections (0 = no corrections)")
@@ -1434,7 +1438,10 @@ def main():
         """How much each Gaussian shows, in pixels: its weight in the pixels it covers (opacity times
         transmittance), as the gradient of the summed render with respect to its color in each view, in every
         slot in all 16 directions (the drawn ones and the new ones between); the most it shows in any one
-        cell (G,)."""
+        cell (G,). By its own size: the renderer widens every Gaussian by a blur of 0.3 square pixels (of the
+        supersampled grid), and gsplat's antialiased mode fades one by how much of what it draws is that blur.
+        A Gaussian shrunk to a point is all blur: the supersampling averages it away to a few percent of a
+        pixel, which the fit hardly sees, but drawn larger it's a speck. So it shows nothing here."""
         ss = model.supersample
         yaws16 = sign * torch.arange(16, device=device, dtype=torch.float32) * 22.5
         r16, u16, f16 = camera_basis(yaws16, elevation)
@@ -1449,7 +1456,8 @@ def main():
                 scales, opacities = torch.exp(model.scales), torch.sigmoid(model.opacities)
             colors = torch.ones((16, len(means), 1), device=device, requires_grad=True)
             image, _, _ = rasterization(means, quats, scales, opacities, colors, vms16, K[None].repeat(16, 1, 1),
-                                        a.w * ss, a.h * ss, camera_model=camera_model(), packed=False)
+                                        a.w * ss, a.h * ss, camera_model=camera_model(), packed=False,
+                                        rasterize_mode="antialiased")
             image.sum().backward()
             peak = torch.maximum(peak, (colors.grad[..., 0] / ss ** 2).max(0).values)
         return peak
@@ -1547,7 +1555,7 @@ def main():
                            else it >= int(args.refine_iters * cycling[0][0])):
             _, threshold, splits, spare = cycling.pop(0)
             spared = (born == newest) if newest and spare else torch.zeros_like(born, dtype=torch.bool)
-            peak = peaks().masked_fill((model.parts >= 0) | spared, float("inf"))  # rigid parts kept
+            peak = peaks().masked_fill(spared, float("inf"))  # rigid parts' too: a blade's shrink to points
             kept = peak >= threshold
             model.keep(kept)
             born = born[kept]
@@ -1833,6 +1841,118 @@ def main():
                       duration=[20, 30] * a.count, columns=4)
         return out
 
+    def specks():
+        """The stray pixels around the model at 4x, and the Gaussians that draw them. A cell's specks: its
+        solid pixels (opacity at least a half, one sample per pixel, as --scale draws) in blobs, 8-connected,
+        under 64 pixels (4 at 1x). Per Gaussian, in 1x pixels' worth: what it draws on specks and on any
+        solid pixel there, over every direction at twice the frames; and at 1x, supersampled, with the
+        renderer's blur (as the cuts measured it before they took each Gaussian's own size), its most in a
+        cell of the fitted frames in the drawn directions, in the new ones, and in the frames between (in
+        all 16), and what it draws inside and outside the originals' outline in the fitted cells."""
+        S, G, ss = 4, len(model.means0), model.supersample
+        yaws16 = sign * torch.arange(16, device=device, dtype=torch.float32) * 22.5
+        r16, u16, f16 = camera_basis(yaws16, elevation)
+        vms16 = torch.stack([viewmat(r16[n], u16[n], f16[n]) for n in range(16)])
+        with torch.no_grad():
+            scales, opacities = torch.exp(model.scales), torch.sigmoid(model.opacities)
+        acc = {key: torch.zeros(G, device=device) for key in (
+            "speck", "solid", "speck_cells", "peak_drawn", "peak_new", "peak_between", "inside", "outside")}
+
+        def weights(ph, vms, K, w, h, masks_of):
+            """Each Gaussian's weight per view (V, G), and over the pixels of masks_of(alpha (V, H, W)) (V, G)."""
+            with torch.no_grad():
+                means, quats = model.pose(ph)
+            ones = torch.ones((len(vms), G, 2), device=device, requires_grad=True)
+            image, alpha, _ = rasterization(means, quats, scales, opacities, ones, vms, K[None].repeat(len(vms), 1, 1),
+                                            w, h, camera_model=camera_model(), packed=False)
+            masks = masks_of(alpha[..., 0].detach())
+            (image[..., 0].sum() + (image[..., 1] * masks).sum()).backward()
+            return ones.grad[..., 0], ones.grad[..., 1], masks
+
+        def blobs(solid):
+            """Each solid pixel's blob size (H, W), 8-connected; 0 elsewhere."""
+            H, W = solid.shape
+            labels = torch.arange(1, H * W + 1, device=device, dtype=torch.float32).view(H, W) * solid
+            while True:
+                grown = F.max_pool2d(labels[None, None], 3, 1, 1)[0, 0] * solid
+                if torch.equal(grown, labels):
+                    break
+                labels = grown
+            ids = labels.long().flatten()
+            return torch.bincount(ids, minlength=H * W + 1)[ids].view(H, W) * (solid > 0)
+
+        lines = []
+        for a in anims:
+            per_frame = len(a.frames) / a.count
+            K_big = intrinsics(a.pivot, offset, device, S)
+            K_fine = a.K.clone()
+            K_fine[:2] *= ss
+            pixels, cells = 0, 0
+            for step in range(2 * a.count):
+                ph = a.start + step / 2 * per_frame
+                fitted = float(ph).is_integer()
+                # at 1x, supersampled, as the cut measures: the fitted frames' drawn directions against the
+                # originals' outline (in the fitted directions), and the rest
+                clear = torch.zeros((16, a.h * ss, a.w * ss), device=device)
+                if fitted:
+                    m = all_targets[int(ph)][1]  # (fitted directions, H, W): 1 solid, 0 clear, -1 unknown
+                    for i, d in enumerate(train_dirs):
+                        clear[2 * d] = (m[i] == 0).float().repeat_interleave(ss, 0).repeat_interleave(ss, 1)
+                cell_w, out_w, _ = weights(ph, vms16, K_fine, a.w * ss, a.h * ss, lambda alpha: clear)
+                cell_w, out_w = cell_w / ss ** 2, out_w / ss ** 2
+                if fitted:
+                    acc["peak_drawn"] = torch.maximum(acc["peak_drawn"], cell_w[0::2].max(0).values)
+                    acc["peak_new"] = torch.maximum(acc["peak_new"], cell_w[1::2].max(0).values)
+                    drawn = [2 * d for d in train_dirs]
+                    acc["outside"] += out_w[drawn].sum(0)
+                    acc["inside"] += cell_w[drawn].sum(0) - out_w[drawn].sum(0)
+                else:
+                    acc["peak_between"] = torch.maximum(acc["peak_between"], cell_w.max(0).values)
+                # at 4x, one sample per pixel, as --scale draws: the specks, and who draws them
+                for n in range(16):
+                    def specks_of(alpha):
+                        solid = (alpha >= 0.5).float()
+                        return ((blobs(solid[0]) < 64) & (solid[0] > 0)).float()[None]
+                    on_all, on_speck, speck = weights(ph, vms16[n][None], K_big, a.w * S, a.h * S, specks_of)
+                    acc["solid"] += on_all[0] / S ** 2
+                    acc["speck"] += on_speck[0] / S ** 2
+                    acc["speck_cells"] += (on_speck[0] > 0).float()
+                    if speck.any():
+                        pixels, cells = pixels + int(speck.sum()), cells + 1
+            lines.append("%s: %d stray pixels at 4x, in %d of %d cells" % (a.name, pixels, cells, 2 * a.count * 16))
+        out = {key: v.cpu().numpy() for key, v in acc.items()}
+        out.update(rigid=(model.parts >= 0).cpu().numpy(), opacity=opacities.cpu().numpy(),
+                   size=scales.max(-1).values.cpu().numpy())
+        np.savez_compressed(out_dir / "specks.npz", **out)
+        for line in lines:
+            print(line)
+        sp = out["speck"]
+        order = np.argsort(-sp)
+        share = np.cumsum(sp[order]) / max(sp.sum(), 1e-12)
+        peak = np.maximum(out["peak_drawn"], out["peak_new"])
+        for cover in (0.5, 0.9):
+            top = order[:int(np.searchsorted(share, cover)) + 1]
+            rest = np.setdiff1d(np.arange(G), top)
+            print("the %d Gaussians that draw %d%% of the specks (of %d):" % (len(top), 100 * cover, G))
+            for name, values, fmt in (
+                    ("rigid", out["rigid"].astype(float), "%.2f"), ("opacity", out["opacity"], "%.3f"),
+                    ("size, px", out["size"], "%.3f"), ("most in a cell, with the blur", peak, "%.3f"),
+                    ("most in a drawn direction", out["peak_drawn"], "%.3f"),
+                    ("most in a new direction", out["peak_new"], "%.3f"),
+                    ("most between frames", out["peak_between"], "%.3f"),
+                    ("share outside the outline", out["outside"] / np.maximum(out["outside"] + out["inside"], 1e-9), "%.3f"),
+                    ("share of its 4x drawing on specks", sp / np.maximum(out["solid"], 1e-9), "%.3f"),
+                    ("4x cells it draws specks in", out["speck_cells"], "%.1f")):
+                print("  %-34s median %s, mean %s  |  the rest: median %s, mean %s" % (
+                    name, fmt % np.median(values[top]), fmt % np.mean(values[top]),
+                    fmt % np.median(values[rest]), fmt % np.mean(values[rest])))
+            for thr in (0.05, 0.1, 0.2):
+                print("  under %.2f px, with the blur: in any cell %d, in drawn directions only %d" % (
+                    thr, int((peak[top] < thr).sum()), int((out["peak_drawn"][top] < thr).sum())))
+
+    if args.specks:
+        specks()
+        return
     with torch.no_grad():
         reports = [report(a) for a in anims]
     summary["seconds"] = time.time() - t_start
