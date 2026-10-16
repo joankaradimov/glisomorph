@@ -7,6 +7,8 @@ transparent pixels. The width isn't stored in the files; sprite-metadata.md says
 import struct
 from dataclasses import dataclass
 
+SUB_HEADER_SIZE = 0x0A
+CEL_BLOCK_HEIGHT = 32
 
 @dataclass
 class Frame:
@@ -49,7 +51,80 @@ def _to_frame(stream: list[int | None], width: int) -> Frame:
     return Frame(width, height, [p for row in reversed(rows) for p in row])  # stored bottom row first
 
 
+def cl2_compute_width_from_header(frame: bytes) -> int:
+    """Reading the frame header {CEL FRAME HEADER}"""
+    if (len(frame) < SUB_HEADER_SIZE):
+        return 0 # invalid header
+    celFrameHeaderSize = _u16(frame, 0 * 2)
+    if (celFrameHeaderSize & 1):
+        return 0 # invalid header
+    if (celFrameHeaderSize < SUB_HEADER_SIZE):
+        return 0 # invalid header
+    if (celFrameHeaderSize > len(frame)):
+        return 0 # invalid header
+    """Decode the 32 pixel-lines blocks to calculate the image width"""
+    celFrameWidth = 0
+    lastFrameOffset = celFrameHeaderSize
+    celFrameHeaderSize /= 2
+    i = 1
+    while (i < celFrameHeaderSize):
+        nextFrameOffset = _u16(frame, i * 2)
+        if (nextFrameOffset == 0):
+            """check if the remaining entries are zero"""
+            i += 1
+            while (i < celFrameHeaderSize):
+                if (_u16(frame, i * 2) != 0):
+                    return 0 # invalid header
+                i += 1
+
+            if (celFrameWidth != 0):
+                return celFrameWidth
+
+            """last attempt using the size of the frame"""
+            nextFrameOffset = len(frame)
+
+        pixelCount = 0
+        """ensure the offsets are consecutive"""
+        if (lastFrameOffset >= nextFrameOffset):
+            return 0 # invalid data
+        pos = lastFrameOffset
+        while (pos < nextFrameOffset):
+            if (pos >= len(frame)):
+                return 0 # invalid data
+
+            c = frame[pos]
+            pos += 1
+            if (c < 0x80):
+                """Transparent pixels"""
+                pixelCount += c
+            elif (c < 0xBF):
+                """RLE encoded palette index"""
+                pixelCount += (0xBF - c)
+                pos += 1
+            else:
+                """Palette indices"""
+                pixelCount += 256 - c
+                pos += 256 - c
+
+        width = pixelCount / CEL_BLOCK_HEIGHT
+        """The calculated width has to be identical for each 32 pixel-line block"""
+        if (celFrameWidth == 0):
+            if (width == 0):
+                return 0 # invalid data
+        else:
+            if (celFrameWidth != width):
+                return 0 # mismatching width values
+
+        celFrameWidth = width
+        lastFrameOffset = nextFrameOffset
+        i += 1
+
+    return celFrameWidth
+
+
 def decode_cl2_frame(frame: bytes, width: int) -> Frame:
+    if (width == 0):
+        width = cl2_compute_width_from_header(frame)
     pos = _u16(frame, 0)  # skip the frame header
     stream: list[int | None] = []
     while pos < len(frame):
@@ -66,7 +141,78 @@ def decode_cl2_frame(frame: bytes, width: int) -> Frame:
     return _to_frame(stream, width)
 
 
+def cel_compute_width_from_header(frame: bytes) -> int:
+    """Reading the frame header {CEL FRAME HEADER}"""
+    if (len(frame) < SUB_HEADER_SIZE):
+        return 0 # invalid header
+    celFrameHeaderSize = _u16(frame, 0 * 2)
+    if (celFrameHeaderSize & 1):
+        return 0 # invalid header
+    if (celFrameHeaderSize < SUB_HEADER_SIZE):
+        return 0 # invalid header
+    if (celFrameHeaderSize > len(frame)):
+        return 0 # invalid header
+    """Decode the 32 pixel-lines blocks to calculate the image width"""
+    celFrameWidth = 0
+    lastFrameOffset = celFrameHeaderSize
+    celFrameHeaderSize /= 2
+    i = 1
+    while (i < celFrameHeaderSize):
+        nextFrameOffset = _u16(frame, i * 2)
+        if (nextFrameOffset == 0):
+            """check if the remaining entries are zero"""
+            i += 1
+            while (i < celFrameHeaderSize):
+                if (_u16(frame, i * 2) != 0):
+                    return 0 # invalid header
+                i += 1
+
+            if (celFrameWidth != 0):
+                return celFrameWidth
+            """last attempt using the size of the frame"""
+            nextFrameOffset = len(frame)
+
+        pixelCount = 0
+        """ensure the offsets are consecutive"""
+        if (lastFrameOffset >= nextFrameOffset):
+            return 0 # invalid data
+        """calculate width based on the data-block"""
+        pos = lastFrameOffset
+        while (pos < nextFrameOffset):
+            if (pos >= len(frame)):
+                return 0 # invalid data
+
+            c = frame[pos]
+            pos += 1
+            if (c > 0x7F):
+                """Transparent pixels group"""
+                pixelCount += 256 - c
+            else:
+                """Palette indices group"""
+                pixelCount += c
+                pos += c
+
+        if (pixelCount % CEL_BLOCK_HEIGHT):
+            return 0 # invalid block
+        width = pixelCount / CEL_BLOCK_HEIGHT
+        """The calculated width has to be identical for each 32 pixel-line block"""
+        if (celFrameWidth == 0):
+            if (width == 0):
+                return 0 # invalid data
+        else:
+            if (celFrameWidth != width):
+                return 0 # mismatching width values
+
+        celFrameWidth = width
+        lastFrameOffset = nextFrameOffset
+        i += 1
+
+    return celFrameWidth
+
+
 def decode_cel_frame(frame: bytes, width: int) -> Frame:
+    if (width == 0):
+        width = cel_compute_width_from_header(frame)
     pos = 10 if len(frame) >= 2 and _u16(frame, 0) == 10 else 0  # optional frame header
     stream: list[int | None] = []
     while pos < len(frame):
