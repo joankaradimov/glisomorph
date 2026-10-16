@@ -173,5 +173,5 @@ class GaussianField(torch.nn.Module):
                 if name == "means":
                     opt.param_groups[0]["lr"] *= decay
             if step % 500 == 0 or step == iters - 1:
-                print("iter %5d  loss %.5f  %d Gaussians  (%.0fs)" % (step, loss.item(), len(params["means"]),
-                                                                       time.time() - t0))
+                print("iter %5d/%5d  loss %.5f  %d Gaussians  (%.0fs)" % (step + 1, iters, loss.item(),
+                                                                          len(params["means"]), time.time() - t0))
