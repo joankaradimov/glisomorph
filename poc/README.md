@@ -1259,6 +1259,32 @@ iterations, as many as the runs above took):
 - **What's left is the outline's own:** in `wmd`'s, Gaussians at its edge, 0.6 pixels across and
   half transparent, which at 4x break the edge into islands.
 
+**The outline.** Inside it, the cuts left holes: in `wmd`'s model, 49,511 pixels in clear blobs under
+4 pixels at 1x, against 21,264 stray ones. 69% of its Gaussians are under half opaque (their
+opacities are held as tracked, and a split shares one between two), and a fifth of its solid
+samples are a quarter to three quarters covered. The fit sees each pixel's coverage, the average of
+its 4 x 4 samples; drawn 4x larger, each sample is solid or clear by itself, and a half covered band
+breaks into islands and holes. `--specks` counts those too. On `wmd`, as above:
+
+| `wmd` at 4x | Fitted cells: IoU / exact | Hidden frames, copied: IoU | Stray pixels | Hole pixels | Half covered |
+|---|---|---|---|---|---|
+| The outline's total variation at 0.02 | 0.9647 / 44.04% | 0.8798 | 21,264 | 49,511 | 20.4% |
+| The same at 0.1 | 0.9616 / 43.54% | 0.8800 | 8,590 | 27,841 | 21.7% |
+| The same at 0.3 | 0.9546 / 39.56% | 0.8781 | 4,582 | 14,672 | 29.1% |
+| Samples fitted to the outlines enlarged smoothly (0.2) | 0.9656 / 43.32% | 0.8803 | 13,475 | 40,943 | 24.1% |
+| Samples pushed to solid or clear (0.1) | 0.9457 / 41.78% | 0.8725 | 18,573 | 29,876 | 4.2% |
+| Opacities fitted, pushed to solid or clear (0.05) | 0.9614 / 43.29% | 0.8779 | 43,479 | 60,821 | 14.6% |
+
+- **The outline's total variation, heavier, takes out what breaks it** (`--outline-tv`, see A clean
+  look at 4x, now 0.1 by default): three fifths of the stray pixels and two fifths of the holes go,
+  the copied in-betweens as they were, at 0.003 of the fitted cells' IoU and half a point of the
+  model's own exact pixels. At 0.3 more go, but the model's own colors smear.
+- **Fitting the samples to the outlines enlarged smoothly** (bilinearly, solid where over a half,
+  which averages back to the originals' pixels exactly) helps the outline at 1x a little, but does
+  less at 4x; with the variation, it costs the model's own colors more for little.
+- **Pushing samples or opacities to solid or clear** sharpens the edge but erodes it at 1x, and
+  small solid Gaussians come back as specks.
+
 #### Colors in new directions
 
 The sheets copy the artist's pixels into the in-betweens and the new directions, relit (see Copying
@@ -1426,7 +1452,8 @@ Together, with `--tv 0.005`, they cost the attack's hidden frames little at 1x (
 exact against 37.2%, own colors 32.1% against 33.5%; the fitted cells' own colors 39.1% against
 44.0%). The blade's outline needs something else: drawn as a line, or made of flat Gaussians.
 
-**They're the defaults:** `--tv 0.005 --color-smooth 0.2 --outline-tv 0.02` (0 turns each off).
+**They're the defaults:** `--tv 0.005 --color-smooth 0.2 --outline-tv 0.02` (0 turns each off;
+`--outline-tv` is 0.1 since [Stray pixels at 4x](#stray-pixels-at-4x)).
 Without them, the shared model of the warrior's stand, walk, attack and hit (see Several animations,
 one model) came out as scaly at 4x as any plain fit: 30% speckle, against 8% with them, refined
 from the same tracking. They cost its fitted cells 5 to 8 points of exact own colors at 1x (the

@@ -950,7 +950,8 @@ def main():
     ap.add_argument("--cycle-until", type=float, default=0.65, help="the last --cycle round, as a fraction of the refinement")
     ap.add_argument("--specks", action="store_true",
                     help="diagnostic, with --load: which Gaussians draw the stray pixels around the model at 4x, "
-                         "and how they fare by the cut's measures (specks.npz); then stop")
+                         "and how they fare by the cut's measures (specks.npz), with the holes, half covered samples "
+                         "and outline length at 4x; then stop")
     ap.add_argument("--arap", type=float, default=0.1, help="weight of the nodes' rigidity")
     ap.add_argument("--corrections", type=float, default=0.01,
                     help="with --refine all, the weight of the cost of per-frame corrections (0 = no corrections)")
@@ -986,7 +987,7 @@ def main():
                          "over taken out (edges.py): redrawn over black, given an inside neighbour's color, or kept "
                          "('none'). Rendered larger, the model's edges then show no bluish rim. The copier keeps "
                          "the originals' edges: the sheet's new cells sit beside original ones")
-    ap.add_argument("--outline-tv", type=float, default=0.02,
+    ap.add_argument("--outline-tv", type=float, default=0.1,
                     help="in the refinement, weight of the samples' coverage's total variation "
                          "(coverage_variation): smooth outlines, without needles (0: none)")
     ap.add_argument("--color-smooth", type=float, default=0.2,
@@ -1844,11 +1845,13 @@ def main():
     def specks():
         """The stray pixels around the model at 4x, and the Gaussians that draw them. A cell's specks: its
         solid pixels (opacity at least a half, one sample per pixel, as --scale draws) in blobs, 8-connected,
-        under 64 pixels (4 at 1x). Per Gaussian, in 1x pixels' worth: what it draws on specks and on any
-        solid pixel there, over every direction at twice the frames; and at 1x, supersampled, with the
-        renderer's blur (as the cuts measured it before they took each Gaussian's own size), its most in a
-        cell of the fitted frames in the drawn directions, in the new ones, and in the frames between (in
-        all 16), and what it draws inside and outside the originals' outline in the fitted cells."""
+        under 64 pixels (4 at 1x); its holes, clear blobs as small; its half covered samples (a quarter to
+        three quarters); and its outline, solid pixels beside a clear one. Per Gaussian, in 1x pixels'
+        worth: what it draws on specks and on any solid pixel there, over every direction at twice the
+        frames; and at 1x, supersampled, with the renderer's blur (as the cuts measured it before they took
+        each Gaussian's own size), its most in a cell of the fitted frames in the drawn directions, in the
+        new ones, and in the frames between (in all 16), and what it draws inside and outside the
+        originals' outline in the fitted cells."""
         S, G, ss = 4, len(model.means0), model.supersample
         yaws16 = sign * torch.arange(16, device=device, dtype=torch.float32) * 22.5
         r16, u16, f16 = camera_basis(yaws16, elevation)
@@ -1888,6 +1891,7 @@ def main():
             K_fine = a.K.clone()
             K_fine[:2] *= ss
             pixels, cells = 0, 0
+            edges = {"holes": 0, "fuzz": 0, "solid": 0, "outline": 0}  # the outline at 4x, as drawn
             for step in range(2 * a.count):
                 ph = a.start + step / 2 * per_frame
                 fitted = float(ph).is_integer()
@@ -1912,6 +1916,11 @@ def main():
                 for n in range(16):
                     def specks_of(alpha):
                         solid = (alpha >= 0.5).float()
+                        clear = 1 - solid[0]
+                        edges["holes"] += int(((blobs(clear) < 64) & (clear > 0)).sum())
+                        edges["fuzz"] += int(((alpha > 0.25) & (alpha < 0.75)).sum())
+                        edges["solid"] += int(solid.sum())
+                        edges["outline"] += int((solid[0] * F.max_pool2d(clear[None, None], 3, 1, 1)[0, 0]).sum())
                         return ((blobs(solid[0]) < 64) & (solid[0] > 0)).float()[None]
                     on_all, on_speck, speck = weights(ph, vms16[n][None], K_big, a.w * S, a.h * S, specks_of)
                     acc["solid"] += on_all[0] / S ** 2
@@ -1919,7 +1928,10 @@ def main():
                     acc["speck_cells"] += (on_speck[0] > 0).float()
                     if speck.any():
                         pixels, cells = pixels + int(speck.sum()), cells + 1
-            lines.append("%s: %d stray pixels at 4x, in %d of %d cells" % (a.name, pixels, cells, 2 * a.count * 16))
+            lines.append("%s: %d stray pixels at 4x, in %d of %d cells; %d in holes; half covered %.1f%% and outline "
+                         "%.1f%% of the solid pixels" % (a.name, pixels, cells, 2 * a.count * 16, edges["holes"],
+                                                          100 * edges["fuzz"] / max(edges["solid"], 1),
+                                                          100 * edges["outline"] / max(edges["solid"], 1)))
         out = {key: v.cpu().numpy() for key, v in acc.items()}
         out.update(rigid=(model.parts >= 0).cpu().numpy(), opacity=opacities.cpu().numpy(),
                    size=scales.max(-1).values.cpu().numpy())
