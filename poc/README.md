@@ -1278,7 +1278,9 @@ breaks into islands and holes. `--specks` counts those too. On `wmd`, as above:
 - **The outline's total variation, heavier, takes out what breaks it** (`--outline-tv`, see A clean
   look at 4x, now 0.1 by default): three fifths of the stray pixels and two fifths of the holes go,
   the copied in-betweens as they were, at 0.003 of the fitted cells' IoU and half a point of the
-  model's own exact pixels. At 0.3 more go, but the model's own colors smear.
+  model's own exact pixels. On `whs` and `wlm` alike: 63% and 68% of the stray pixels and 47% and
+  44% of the holes go, at 0.005 of the fitted cells' IoU, and the copied in-betweens lose 0.0003
+  and 0.0010. At 0.3 more go, but the model's own colors smear.
 - **Fitting the samples to the outlines enlarged smoothly** (bilinearly, solid where over a half,
   which averages back to the originals' pixels exactly) helps the outline at 1x a little, but does
   less at 4x; with the variation, it costs the model's own colors more for little.
