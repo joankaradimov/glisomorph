@@ -360,6 +360,9 @@ class MovingGaussians(torch.nn.Module):
         # centers, and each node takes its piece's.
         self.register_buffer("node_group", None)
         self.register_buffer("group_centers", None)
+        # How much each Gaussian shows in each slot, from 0 (hidden) to 1 (slots, G), for fading between
+        # frames (opacity); None fades nothing. Measured on the finished model, and not saved with it.
+        self.shown = None
         # Small per-frame corrections of each Gaussian's position, on top of the nodes' motion, so that
         # each frame can match its views as closely as a still; and each Gaussian's nearest neighbours,
         # whose corrections should be alike.
@@ -391,6 +394,26 @@ class MovingGaussians(torch.nn.Module):
             return catmull_rom(values[start:start + n], phase - start, quaternions=quaternions)
         return catmull_rom_open(torch.cat([values[start:start + n], values[then:then + 1]]), phase - start,
                                 quaternions=quaternions)
+
+    def neighbours(self, phase: float):
+        """The slots either side of a phase between slots, within its animation (spans): after an animation's
+        last comes its first, or the slot it returns to."""
+        phase = phase % self.node_quats.shape[0]
+        start, n, then = next((s, n, t) for s, n, t in self.spans if s <= math.floor(phase) < s + n)
+        k = math.floor(phase) - start
+        if k + 1 < n:
+            return start + k, start + k + 1
+        return start + k, start if then is None else then
+
+    def opacity(self, phase: float):
+        """The Gaussians' opacities (G,) at a phase. Between slots, with shown set, each is dimmed by the less it
+        shows at the slots either side: one hidden at either (inside the body, where tracking parked it while
+        others drew its part) would show only mid-way, on its way in or out."""
+        opacity = torch.sigmoid(self.opacities)
+        if self.shown is None or float(phase).is_integer():
+            return opacity
+        a, b = self.neighbours(phase)
+        return opacity * torch.minimum(self.shown[a], self.shown[b])
 
     def node_pose(self, phase: float):
         """The nodes' unit quaternions (M, 4) and translations (M, 3) at a phase in model frames."""
@@ -528,7 +551,7 @@ class MovingGaussians(torch.nn.Module):
         self.last_means = means  # for the transport's pull, without posing again
         common = dict(camera_model=camera_model(), render_mode="RGB+ED", packed=False)
         if not self.lit:
-            out, alpha, info = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
+            out, alpha, info = rasterization(means, quats, torch.exp(self.scales), self.opacity(phase),
                                              torch.sigmoid(self.colors), viewmats, Ks, width * s, height * s, **common)
             if self.keep_samples:
                 self.last_samples = (out[..., :3], alpha)
@@ -536,7 +559,7 @@ class MovingGaussians(torch.nn.Module):
         albedo = torch.sigmoid(self.colors)
         strength = torch.sigmoid(self.specular)[:, None]
         features = torch.stack([torch.cat([albedo, self.normals(quats, vm[2, :3]), strength], -1) for vm in viewmats])
-        out, alpha, info = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities),
+        out, alpha, info = rasterization(means, quats, torch.exp(self.scales), self.opacity(phase),
                                          features, viewmats, Ks, width * s, height * s, **common)
         normal = F.normalize(out[..., 3:6], dim=-1)
         shaded = []
@@ -556,7 +579,7 @@ class MovingGaussians(torch.nn.Module):
         K = K.clone()
         K[:2] *= s
         means, quats = self.pose(phase)
-        out, alpha, _ = rasterization(means, quats, torch.exp(self.scales), torch.sigmoid(self.opacities), self.means0,
+        out, alpha, _ = rasterization(means, quats, torch.exp(self.scales), self.opacity(phase), self.means0,
                                       viewmat_[None], K[None], width * s, height * s, camera_model=camera_model(),
                                       render_mode="RGB+ED", packed=False)
         out, alpha = average_down(out, alpha, s)
@@ -1032,6 +1055,10 @@ def main():
     ap.add_argument("--scale-colors", default="own", choices=["own", "copied"],
                     help="the larger cells' colors: the model's own, or copied pixels (from the originals with "
                          "their edges redrawn, as --edges)")
+    ap.add_argument("--fade-hidden", type=float, default=0.05,
+                    help="between frames, dim each Gaussian by how little it shows at the frames either side, the "
+                         "less of the two, under this many pixels in all 16 directions (as the cuts measure): one "
+                         "hidden at either, inside the body, would show only on its way in or out (0: none)")
     ap.add_argument("--tag", default="", help="suffix for the output folder")
     ap.add_argument("--out", default="out")
     args = ap.parse_args()
@@ -1440,19 +1467,19 @@ def main():
                 groups.append({"params": [model.residuals], "lr": 0.01})
         return torch.optim.Adam(groups)
 
-    def peaks():
-        """How much each Gaussian shows, in pixels: its weight in the pixels it covers (opacity times
-        transmittance), as the gradient of the summed render with respect to its color in each view, in every
-        slot in all 16 directions (the drawn ones and the new ones between); the most it shows in any one
-        cell (G,). By its own size: the renderer widens every Gaussian by a blur of 0.3 square pixels (of the
-        supersampled grid), and gsplat's antialiased mode fades one by how much of what it draws is that blur.
-        A Gaussian shrunk to a point is all blur: the supersampling averages it away to a few percent of a
-        pixel, which the fit hardly sees, but drawn larger it's a speck. So it shows nothing here."""
+    def shows():
+        """How much each Gaussian shows in each slot, in pixels (slots, G): its weight in the pixels it covers
+        (opacity times transmittance), as the gradient of the summed render with respect to its color in each
+        view, the most in any of all 16 directions (the drawn ones and the new ones between). By its own size:
+        the renderer widens every Gaussian by a blur of 0.3 square pixels (of the supersampled grid), and
+        gsplat's antialiased mode fades one by how much of what it draws is that blur. A Gaussian shrunk to a
+        point is all blur: the supersampling averages it away to a few percent of a pixel, which the fit hardly
+        sees, but drawn larger it's a speck. So it shows nothing here."""
         ss = model.supersample
         yaws16 = sign * torch.arange(16, device=device, dtype=torch.float32) * 22.5
         r16, u16, f16 = camera_basis(yaws16, elevation)
         vms16 = torch.stack([viewmat(r16[d], u16[d], f16[d]) for d in range(16)])
-        peak = torch.zeros(len(model.means0), device=device)
+        shown = torch.zeros((len(slots), len(model.means0)), device=device)
         for s in range(len(slots)):
             a = slots[s][0]
             K = a.K.clone()
@@ -1465,8 +1492,8 @@ def main():
                                         a.w * ss, a.h * ss, camera_model=camera_model(), packed=False,
                                         rasterize_mode="antialiased")
             image.sum().backward()
-            peak = torch.maximum(peak, (colors.grad[..., 0] / ss ** 2).max(0).values)
-        return peak
+            shown[s] = (colors.grad[..., 0] / ss ** 2).max(0).values
+        return shown
 
     opt = refiner()
     candidates = torch.tensor([0] + list(range(128, 255)), device=device)  # the indices sprites use
@@ -1561,7 +1588,7 @@ def main():
                            else it >= int(args.refine_iters * cycling[0][0])):
             _, threshold, splits, spare = cycling.pop(0)
             spared = (born == newest) if newest and spare else torch.zeros_like(born, dtype=torch.bool)
-            peak = peaks().masked_fill(spared, float("inf"))  # rigid parts' too: a blade's shrink to points
+            peak = shows().max(0).values.masked_fill(spared, float("inf"))  # rigid parts' too: a blade's shrink to points
             kept = peak >= threshold
             model.keep(kept)
             born = born[kept]
@@ -1622,6 +1649,13 @@ def main():
     model.keep_samples, model.last_samples = False, None
     if not args.load:
         save(out_dir / "motion.pt")  # refined: drawn again with --load if what follows is stopped
+    if args.fade_hidden:
+        # Tracking can leave some Gaussians drawing a part in one frame and others in the next, each parked
+        # inside the body when it isn't drawing. The frames show none of it, but between them those on their way
+        # in or out would draw the part twice (an axe's second head), so they fade there (MovingGaussians.opacity).
+        model.shown = (shows() / args.fade_hidden).clamp(max=1.0)
+        print("fading between frames: %.0f of %d Gaussians hidden in a slot, on average (%d in every one)" % (
+            float((model.shown < 1).sum(1).float().mean()), len(model.means0), int((model.shown < 1).all(0).sum())))
 
     # 4. Scores and pictures, per animation.
     pal = (palette.cpu().numpy() * 255).round().astype(np.uint8)
@@ -1862,7 +1896,7 @@ def main():
         r16, u16, f16 = camera_basis(yaws16, elevation)
         vms16 = torch.stack([viewmat(r16[n], u16[n], f16[n]) for n in range(16)])
         with torch.no_grad():
-            scales, opacities = torch.exp(model.scales), torch.sigmoid(model.opacities)
+            scales = torch.exp(model.scales)
         acc = {key: torch.zeros(G, device=device) for key in (
             "speck", "solid", "speck_cells", "peak_drawn", "peak_new", "peak_between", "inside", "outside")}
 
@@ -1870,6 +1904,7 @@ def main():
             """Each Gaussian's weight per view (V, G), and over the pixels of masks_of(alpha (V, H, W)) (V, G)."""
             with torch.no_grad():
                 means, quats = model.pose(ph)
+                opacities = model.opacity(ph)
             ones = torch.ones((len(vms), G, 2), device=device, requires_grad=True)
             image, alpha, _ = rasterization(means, quats, scales, opacities, ones, vms, K[None].repeat(len(vms), 1, 1),
                                             w, h, camera_model=camera_model(), packed=False)

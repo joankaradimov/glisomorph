@@ -537,7 +537,8 @@ python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-walk --hide-fram
    (see [The shape from every frame](#the-shape-from-every-frame)), while the Gaussians that never
    show are cut and new ones grown where the views pull (see
    [Cutting and growing](#cutting-and-growing)).
-4. A phase between frames interpolates the node poses periodically.
+4. A phase between frames interpolates the node poses periodically, and fades the Gaussians either
+   frame hides (see [Hidden Gaussians between frames](#hidden-gaussians-between-frames)).
 
 Ending the stages early takes a quarter off the tracking of the warrior's walk and a fifth off the
 zombie's, and scores the same within the noise. The attack's swing keeps improving to the end of
@@ -1064,7 +1065,8 @@ animations gain 1.6 to 3.2 points with it. But its axe isn't found as a rigid pa
 is thin in too few of them, and its head makes it no straight line. Its head is moved by many pieces
 of the skeleton, one node each, and between the attack's frames 8 and 9, where the axe falls from
 overhead to the ground in one frame, each takes a path of its own: the head blurs, and comes apart in
-two.
+two. Between frames 6 and 7 it was drawn twice, until the in-betweens faded what the frames hide (see
+[Hidden Gaussians between frames](#hidden-gaussians-between-frames)).
 
 #### Keyed outlines
 
@@ -1320,6 +1322,37 @@ Brightness: the mean luminance over the real frames', where both have a pixel, 0
   lies between, with some red specks. So the sheets copy.
 - **The hidden direction overstates the copied pixels' errors:** it lies 45° from the drawn
   directions it copies from, where the sheets' new directions lie 22.5° from one.
+
+#### Hidden Gaussians between frames
+
+Tracking doesn't keep every Gaussian on one part. In `wla`'s attack, some of the axe head's
+Gaussians draw it in frame 6 and others in frame 7, and each, when it isn't drawing, sits inside the
+body, where nothing shows it. Both frames come out right, but between them both sets are on their
+way, and at 6.5 the axe has two heads.
+
+So between two frames, each Gaussian is dimmed by how little it shows at them (`--fade-hidden`, 0.05
+pixels by default; 0 for none): what it covers at each frame, the most in any of the 16 directions
+(the cuts' measure), as a share of 0.05 pixels, the lesser of the two frames', up to 1. One hidden at
+either frame fades out between them, and the frames themselves don't change. It's measured once the
+model is refined, so `--load` draws a saved model with it too. In `wla`'s model, 1,455 of its 10,003
+Gaussians are hidden in a frame, on average; in `whs`'s, 1,764 of 12,344.
+
+- **The second head is gone** from `wla`'s sheet, in all 16 directions: 161 pixels at 6.5, and 114
+  and 86 at 8.5 and 9.5. Elsewhere a pixel or two changes in a cell, and `whs`'s sheets and 4x
+  drawings look as they did, its swing too.
+- **Against the frames either side,** the in-betweens draw 1 to 4% fewer pixels where neither frame
+  has one (`wla`'s attack: 19,574 to 19,127, over its 16 directions), and leave out 2 to 6% more
+  where both have one (5,436 to 5,534), in every animation of both variants.
+- **At 4x it only trims the head's rim.** Most of the head is drawn by Gaussians that show 0.01 to
+  0.05 pixels at frame 7: partly seen, they keep much of their opacity. Cut outright under 0.05
+  pixels, they'd take four fifths of the head at 4x, but over `wla`'s in-betweens at 4x the cut
+  takes 13,766 pixels where both frames are solid (holes), against the fade's 2,718, and 60,035
+  where one is, against 15,790. Measured as a share of each Gaussian's own size instead, the cut did
+  no better: no measure of how much they show tells the head's apart.
+- **8.5 stays broken up.** There the axe falls from overhead to the ground, and its Gaussians show at
+  both frames, so none fades: they change places along the axe between frames 8 and 9, and frame 9
+  is broken up at 4x already. That's tracking. Interpolating each piece's motion as one screw (dual
+  quaternions), not its turn and move apart, left more stray pixels.
 
 ## Higher resolution
 
