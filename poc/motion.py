@@ -214,6 +214,11 @@ def rigid_parts(means, opacities, masks, viewmats, Ks, min_views: int, min_lengt
     return parts
 
 
+def node_spacing(centers):
+    """How far apart nodes (M, 3) are: the median distance from one to its nearest."""
+    return float(torch.cdist(centers, centers).topk(2, largest=False).values[:, 1].median())
+
+
 def rigid_residual(rest, posed):
     """How far points (P, 3) are from moving as one rigid body through frames (posed (F, P, 3)): how
     far the point that strays most is from the rigid motion that fits them best (Kabsch), in the frame
@@ -329,8 +334,7 @@ class MovingGaussians(torch.nn.Module):
                      for k in range(n_parts)]
             free_nodes = centers
             centers = torch.cat([centers] + [g[None] for g in grips])
-            gaps = torch.cdist(centers, centers).topk(2, largest=False).values[:, 1]
-            spacing = float(gaps.median())
+            spacing = node_spacing(centers)
             # Each Gaussian follows its nearest nodes, weighted by closeness.
             d, idx = torch.cdist(self.means0, free_nodes).topk(bind, largest=False)
             w = torch.exp(-d ** 2 / (2 * spacing ** 2)) + 1e-6
@@ -1251,6 +1255,7 @@ def main():
         if "node_group" in state:
             model.tie(state["node_group"])
         model.load_state_dict(state)
+        model.spacing = node_spacing(model.centers)  # not saved: as the nodes were made, not the stand-in field's
         if not args.load:
             print("resumed from", checkpoint)
     print("%d Gaussians, %d nodes %.1f pixels apart" % (len(model.means0), args.nodes, model.spacing))
