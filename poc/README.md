@@ -1033,6 +1033,7 @@ The warrior comes in 27 variants: three armors (light, medium, heavy: `l`, `m`, 
 `@`: `warrior-stand@wla` is the warrior in light armor with an axe, standing (a bow's attack is 96
 pixels wide, not 128). Each variant is two models, as `wls` is: its dungeon animations, with its
 cleaned cast where [diablo1/casts](../diablo1/casts/README.md) has one, and its town stand and walk.
+All 27 are fitted (see [All 27 variants](#all-27-variants)).
 
 ```
 python -m poc.motion --mpq PATH/TO/DIABDAT.MPQ --preset warrior-stand@wla warrior-walk@wla warrior-attack@wla warrior-hit@wla warrior-cast@wla --refine-iters 19200
@@ -1353,6 +1354,61 @@ Gaussians are hidden in a frame, on average; in `whs`'s, 1,764 of 12,344.
   both frames, so none fades: they change places along the axe between frames 8 and 9, and frame 9
   is broken up at 4x already. That's tracking. Interpolating each piece's motion as one screw (dual
   quaternions), not its turn and move apart, left more stray pixels.
+
+#### All 27 variants
+
+Every variant's two models (see [The other variants](#the-other-variants)) were fitted again with
+motion.py's defaults: keyed outlines, the cuts by each Gaussian's own size in rounds with the growth,
+the outline's variation at 0.1, and the fade between frames, refined 300 iterations per fitted frame
+and drawn at 4x too (`--scale 4`). That was about 25 hours on the GPU, a median of 40 minutes for a
+dungeon model and 16 for a town one. The fitted cells, as each model's mean over its animations, and
+the change since the models fitted in October, before [Keyed outlines](#keyed-outlines) and all that
+followed (— where there's no October model):
+
+| Variant | Dungeon: IoU / exact | Since October | Town: IoU / exact | Since October |
+|---|---|---|---|---|
+| `wln` (cast) | 0.949 / 40.0% | +0.013 / −3.2 | 0.977 / 50.6% | +0.009 / 0.0 |
+| `wlu` | 0.961 / 33.8% | +0.016 / −0.4 | 0.978 / 47.5% | +0.011 / +0.1 |
+| `wls` (cast) | 0.948 / 40.0% | — | 0.974 / 46.6% | — |
+| `wld` (cast) | 0.957 / 35.8% | +0.012 / −1.2 | 0.977 / 41.7% | +0.011 / −0.5 |
+| `wlb` | 0.946 / 36.7% | +0.014 / −3.4 | 0.964 / 44.8% | +0.011 / −1.2 |
+| `wla` (cast) | 0.941 / 38.1% | +0.009 / −2.8 | 0.971 / 44.7% | +0.011 / −1.8 |
+| `wlm` (cast) | 0.949 / 42.8% | +0.009 / −3.5 | 0.975 / 48.4% | +0.010 / −0.5 |
+| `wlh` (cast) | 0.957 / 37.8% | +0.010 / −1.2 | 0.978 / 47.0% | +0.010 / −0.7 |
+| `wlt` | 0.961 / 42.5% | +0.014 / −2.9 | 0.978 / 48.3% | +0.015 / −3.2 |
+| `wmn` | 0.964 / 46.1% | +0.016 / −1.8 | 0.980 / 56.2% | +0.008 / −0.6 |
+| `wmu` | 0.965 / 44.3% | +0.017 / −2.7 | 0.975 / 55.1% | +0.008 / −0.3 |
+| `wms` (cast) | 0.955 / 45.0% | +0.011 / −2.4 | 0.978 / 55.4% | +0.009 / 0.0 |
+| `wmd` (cast) | 0.959 / 44.3% | +0.011 / −1.8 | 0.981 / 55.1% | +0.010 / −0.8 |
+| `wmb` | 0.948 / 39.5% | +0.013 / −3.1 | 0.967 / 50.3% | +0.014 / −0.7 |
+| `wma` (cast) | 0.949 / 41.7% | — | 0.977 / 53.0% | +0.011 / −0.5 |
+| `wmm` (cast) | 0.956 / 46.4% | +0.008 / −2.8 | 0.979 / 55.4% | +0.009 / −0.9 |
+| `wmh` (cast) | 0.961 / 46.1% | +0.012 / −0.9 | 0.980 / 54.5% | +0.009 / −0.6 |
+| `wmt` | 0.961 / 46.1% | +0.014 / −0.7 | 0.978 / 57.2% | +0.015 / −2.2 |
+| `whn` | 0.956 / 40.8% | +0.016 / −2.0 | 0.967 / 48.5% | +0.011 / −2.2 |
+| `whu` | 0.958 / 37.2% | +0.017 / −1.5 | 0.978 / 47.5% | +0.010 / −2.3 |
+| `whs` (cast) | 0.940 / 39.1% | +0.019 / −1.6 | 0.979 / 51.7% | +0.011 / −0.6 |
+| `whd` (cast) | 0.943 / 34.6% | +0.024 / −0.2 | 0.978 / 47.8% | +0.009 / −2.2 |
+| `whb` | 0.946 / 36.8% | +0.015 / −2.8 | 0.966 / 46.9% | +0.011 / −2.4 |
+| `wha` (cast) | 0.952 / 39.8% | — | 0.975 / 49.6% | +0.009 / −1.8 |
+| `whm` (cast) | 0.954 / 41.8% | +0.014 / −0.6 | 0.979 / 51.0% | +0.006 / −1.5 |
+| `whh` (cast) | 0.957 / 36.6% | +0.011 / −2.3 | 0.971 / 44.0% | +0.009 / −1.9 |
+| `wht` | 0.958 / 41.0% | +0.014 / −0.9 | 0.974 / 48.6% | +0.010 / −3.3 |
+
+- **Every outline gains,** in all 109 dungeon and 52 town animations with an October model: 0.014
+  and 0.010 of IoU on average, 0.003 to 0.034. The heavy armor's swords gain most (`whd` and `whs`),
+  as the keyed outlines did for them, and the casts least (0.007).
+- **The model's own colors lose 1.9 points** of exact pixels in the dungeon and 1.3 in town, what
+  the keyed outlines, the cuts and the outline's variation each cost. The sheets use them only where
+  no original sees.
+- **The in-betweens are cleaner:** over those animations, in all 16 directions, they draw 23% fewer
+  pixels where neither frame beside them has one, and leave out 18% fewer where both have one.
+- **Half the Gaussians:** 12,100 in a dungeon model on average, against 22,500.
+- **What's left:** the axes' swing still comes apart between frames (`wha` at 6.5 and 8.5, `wma`
+  at 4.5 to 6.5, `wla` at 8.5): the 25 in-betweens with the most pixels where neither frame has one
+  are all attacks, most of them the axes'. And the sheets keep the game's frames, 96 or 128 pixels
+  wide, whose edges a few new directions and in-betweens reach, a sword's tip in some walks, as the
+  originals do in places.
 
 ## Higher resolution
 
