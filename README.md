@@ -70,3 +70,29 @@ own pixels in the directions it draws, and elsewhere the blades of each frame fi
 ![The zealot: three walk cycles, then a blade attack](examples/starcraft/zealot-walk-attack-4x.gif)
 
 </details>
+
+<details>
+<summary>Diablo</summary>
+
+Diablo draws its characters and monsters in 8 directions. Here glisomorph fills in the 8 between them and
+the frames between the game's, at 2× the resolution: walking, then an attack.
+
+- **Top row:** the game's own frames, each pixel a 2×2 block, above their directions (gray where it
+  draws none).
+- **Bottom row:** glisomorph's, in all 16 directions (the new ones in blue) at twice the frame rate. Every
+  one is drawn from one 3D model of the character, fitted to all its animations' frames, in the game's
+  palette.
+
+They play at the game's speed: a frame a tick (50 ms), ours two. They were made with the
+[proof of concept](poc/README.md)'s fitted models, drawn again at 2×, through an adapter that isn't in
+the repo.
+
+**Warrior** with a sword: three walk cycles, then an attack.
+
+![The warrior with a sword: three walk cycles, then an attack](examples/diablo1/warrior-walk-attack-2x.gif)
+
+**Zombie**: its walk cycle is three of the warrior's long, so one, then an attack.
+
+![The zombie: a walk cycle, then an attack](examples/diablo1/zombie-walk-attack-2x.gif)
+
+</details>
