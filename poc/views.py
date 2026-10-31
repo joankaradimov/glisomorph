@@ -120,10 +120,24 @@ PRESETS = Presets({
     "warrior-magic": Preset("plrgfx/warrior/wls/wlsqm.cl2", 96, "sheet", shadows=True),
     "warrior-cast": Preset("plrgfx/warrior/wls/wls{}.cl2", 96, "casts", shadows=True),
     "rogue": Preset("plrgfx/rogue/rls/rlsas.cl2", 96, "sheet", shadows=True),
+    # Monsters, by the folder of their graphics (monsters/<folder>/<name><letter>.cl2, the letter n for the
+    # stand, w the walk, a the attack, h the hit, d the death, s the special), which the monster types that
+    # differ only by color share (DevilutionX's monstdat.tsv)
     "zombie": Preset("monsters/zombie/zombien.cl2", 128, "sheet", shadows=True),
+    "zombie-stand": Preset("monsters/zombie/zombien.cl2", 128, "sheet", shadows=True),  # 11 frames
     "zombie-walk": Preset("monsters/zombie/zombiew.cl2", 128, "sheet", shadows=True),  # 24 frames
     "zombie-attack": Preset("monsters/zombie/zombiea.cl2", 128, "sheet", shadows=True),  # 12 frames
+    "zombie-hit": Preset("monsters/zombie/zombieh.cl2", 128, "sheet", shadows=True),  # 6 frames
     "skeleton": Preset("monsters/skelaxe/sklaxn.cl2", 128, "sheet", shadows=True),
+    "skelaxe-stand": Preset("monsters/skelaxe/sklaxn.cl2", 128, "sheet", shadows=True),  # 12 frames
+    "skelaxe-walk": Preset("monsters/skelaxe/sklaxw.cl2", 128, "sheet", shadows=True),  # 8 frames
+    "skelaxe-attack": Preset("monsters/skelaxe/sklaxa.cl2", 128, "sheet", shadows=True),  # 13 frames
+    "skelaxe-hit": Preset("monsters/skelaxe/sklaxh.cl2", 128, "sheet", shadows=True),  # 6 frames
+    # The Fallen One with a spear
+    "falspear-stand": Preset("monsters/falspear/phalln.cl2", 128, "sheet", shadows=True),  # 11 frames
+    "falspear-walk": Preset("monsters/falspear/phallw.cl2", 128, "sheet", shadows=True),  # 11 frames
+    "falspear-attack": Preset("monsters/falspear/phalla.cl2", 128, "sheet", shadows=True),  # 13 frames
+    "falspear-hit": Preset("monsters/falspear/phallh.cl2", 128, "sheet", shadows=True),  # 11 frames
 })
 
 
